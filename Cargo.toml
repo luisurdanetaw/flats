@@ -1,0 +1,22 @@
+[package]
+name = "flats"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror = "2"
+memmap2 = "0.9"
+# WAL checksum + record (de)serialization. Pulled in deliberately for now;
+# slated to be replaced with hand-rolled impls once new devs onboard (see
+# CLAUDE.md §2 — these are the sanctioned temporary exceptions to zero-dep).
+crc32fast = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Custom bench harness — no `criterion` dep (see CLAUDE.md §2, §11).
+[[bench]]
+name = "simd"
+harness = false
