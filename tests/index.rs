@@ -31,14 +31,15 @@ fn second_handle_sees_writer_data_after_sync() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("idx.bin");
 
-    let mut writer = FlatIndex::create(&path, dim(4), 16).unwrap();
+    let (mut writer, _wr) = FlatIndex::create(&path, dim(4), 16).unwrap();
     writer.insert(&[1.0, 0.0, 0.0, 0.0]).unwrap();
     writer.insert(&[0.0, 1.0, 0.0, 0.0]).unwrap();
     writer.sync().unwrap();
 
-    // Writer handle is still alive and mapped — this is not a "reopen after
-    // close" test.
-    let reader = FlatIndex::open(&path).unwrap();
+    // A second, independent handle on the same file (we use only its reader and
+    // ignore its writer). The first writer is still alive and mapped — this is
+    // not a "reopen after close" test.
+    let (_w2, reader) = FlatIndex::open(&path).unwrap();
     assert_eq!(reader.len(), 2);
     let results = reader.search(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
     assert_eq!(results[0].id, Ordinal(0));
@@ -58,7 +59,7 @@ fn second_handle_sees_writer_data_after_sync() {
     );
 
     // A fresh handle opened after the second sync sees everything.
-    let reader2 = FlatIndex::open(&path).unwrap();
+    let (_w3, reader2) = FlatIndex::open(&path).unwrap();
     assert_eq!(reader2.len(), 3);
 }
 
@@ -97,12 +98,12 @@ fn random_search_matches_naive_reference() {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("idx.bin");
-        let mut idx = FlatIndex::create(&path, dim(dim_n), count).unwrap();
+        let (mut w, r) = FlatIndex::create(&path, dim(dim_n), count).unwrap();
         for v in &vectors {
-            idx.insert(v).unwrap();
+            w.insert(v).unwrap();
         }
 
-        let got = idx.search(&query, k).unwrap();
+        let got = r.search(&query, k).unwrap();
 
         // In-memory reference: brute-force every vector, full sort.
         let mut reference: Vec<(usize, f32)> = vectors

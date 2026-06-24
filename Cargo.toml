@@ -12,11 +12,19 @@ memmap2 = "0.9"
 crc32fast = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
+roaring = "0.11.4"
 
 [dev-dependencies]
 tempfile = "3"
+# Compile-time trait assertions (header-only, no proc-macros, test-only). Used to
+# pin `Writer: !Clone`, the type-level half of the single-writer invariant.
+static_assertions = "1"
 
-# Custom bench harness — no `criterion` dep (see CLAUDE.md §2, §11).
+# Custom bench harnesses — no `criterion` dep (see CLAUDE.md §2, §11).
 [[bench]]
 name = "simd"
+harness = false
+
+[[bench]]
+name = "parallel_search"
 harness = false

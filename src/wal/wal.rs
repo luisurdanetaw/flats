@@ -31,6 +31,10 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
@@ -97,6 +101,17 @@ impl Record {
 
 pub trait Apply {
     fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<()>;
+
+    /// Make all applied state durable and return the LSN through which the log
+    /// may now be truncated (the minimum durable watermark), or `None` if there
+    /// is nothing to truncate.
+    ///
+    /// This runs ON THE COMMIT THREAD, the same thread as `apply`. That is the
+    /// whole point under the SWMR index: the index's single `Writer` lives in
+    /// the applier, so checkpointing (which mutates the index header) must
+    /// happen here, not on a separate flusher thread that would need a second
+    /// mutator. The commit thread truncates the WAL up to the returned LSN.
+    fn checkpoint(&mut self) -> io::Result<Option<u64>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -117,9 +132,9 @@ const CRC_BYTES: usize = 4;
 const LSN_BYTES: usize = 8;
 const HEADER_BYTES: usize = LEN_BYTES + CRC_BYTES + LSN_BYTES;
 
-/// First LSN ever assigned. LSNs are 1-based so 0 can serve as the "nothing
-/// durable" watermark sentinel (see `recover`).
-const FIRST_LSN: u64 = 1;
+// LSNs are 1-based: LSN 0 is never assigned, so a durable watermark of 0 means
+// "nothing checkpointed yet" and the recovery skip never swallows a real record
+// (see `recover`, where the counter resumes at `skip_through + 1`).
 
 fn crc32(bytes: &[u8]) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
@@ -147,10 +162,10 @@ fn write_frame(out: &mut impl Write, lsn: Lsn, payload: &[u8]) -> io::Result<()>
 // Writer-facing handle
 // ---------------------------------------------------------------------------
 
-/// A message to the WAL thread. Appends and truncations share one channel so
-/// the thread that owns the file is the only one that ever touches it, and so
-/// ordering between the two is well-defined (a truncate is processed only
-/// between append batches, never interleaved with one).
+/// A message to the WAL thread. Everything that touches the log file flows
+/// through this one channel, so the commit thread is the sole file owner and
+/// control ops are well-ordered against append batches (processed only between
+/// batches, never interleaved with one).
 ///
 /// (std mpsc's reply channels are used as one-shots; swap for crossbeam/tokio
 /// oneshot later if the per-call alloc shows up in a profile.)
@@ -160,10 +175,16 @@ enum Command {
         record: Record,
         ack: Sender<io::Result<Lsn>>,
     },
-    /// Drop every frame with `lsn <= up_to` from the front of the log. Issued by
-    /// the flusher AFTER the corresponding index watermark is durable.
+    /// Drop every frame with `lsn <= up_to` from the front of the log. Used by
+    /// callers that manage durability themselves (e.g. tests).
     Truncate {
         up_to: u64,
+        ack: Sender<io::Result<()>>,
+    },
+    /// Run `Apply::checkpoint` on the commit thread (making the index durable),
+    /// then truncate the log up to the watermark it returns. This keeps all
+    /// index mutation on the single writer thread.
+    Checkpoint {
         ack: Sender<io::Result<()>>,
     },
 }
@@ -192,9 +213,9 @@ impl WalHandle {
     }
 
     /// Ask the WAL thread to drop all frames with `lsn <= up_to` and BLOCK until
-    /// done. Safe only once the index is durable up to `up_to` (the flusher
-    /// guarantees this ordering); recovery's LSN-skip makes the truncation
-    /// itself purely a space optimization, not a correctness dependency.
+    /// done. Safe only once the index is durable up to `up_to`; recovery's
+    /// LSN-skip makes the truncation itself purely a space optimization, not a
+    /// correctness dependency.
     pub fn truncate(&self, up_to: u64) -> io::Result<()> {
         let (ack_tx, ack_rx) = mpsc::channel();
         self.tx
@@ -202,6 +223,19 @@ impl WalHandle {
                 up_to,
                 ack: ack_tx,
             })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wal thread gone"))?;
+        ack_rx
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wal thread dropped ack"))?
+    }
+
+    /// Run a checkpoint on the commit thread (`Apply::checkpoint` + truncate) and
+    /// BLOCK until done. This is how the flusher and `Db::checkpoint` make the
+    /// index durable, since the index's sole `Writer` lives on that thread.
+    pub fn checkpoint(&self) -> io::Result<()> {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        self.tx
+            .send(Command::Checkpoint { ack: ack_tx })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wal thread gone"))?;
         ack_rx
             .recv()
@@ -219,6 +253,12 @@ impl WalHandle {
 pub struct Wal {
     handle: WalHandle,
     join: JoinHandle<()>,
+    /// Test-only fault-injection point: when set, the next commit batch fails as
+    /// if its fsync errored, exercising callers' durability-failure paths. The
+    /// flag is shared with the commit thread; it is never consulted in non-test
+    /// builds (the check in `commit_batch` is `#[cfg(test)]`).
+    #[allow(dead_code)]
+    fail_next: Arc<AtomicBool>,
 }
 
 impl Wal {
@@ -251,15 +291,18 @@ impl Wal {
 
         let (tx, rx) = mpsc::channel::<Command>();
 
+        let fail_next = Arc::new(AtomicBool::new(false));
+        let loop_fail = fail_next.clone();
         let loop_path = path.clone();
         let join = std::thread::Builder::new()
             .name("wal-commit".into())
-            .spawn(move || commit_loop(file, loop_path, rx, applier, next_lsn))
+            .spawn(move || commit_loop(file, loop_path, rx, applier, next_lsn, loop_fail))
             .expect("spawn wal thread");
 
         Ok(Wal {
             handle: WalHandle { tx },
             join,
+            fail_next,
         })
     }
 
@@ -273,6 +316,13 @@ impl Wal {
         drop(self.handle); // close the channel
         let _ = self.join.join();
     }
+
+    /// Test-only: make the next committed batch fail as though its fsync errored.
+    /// Consumed by that batch (one-shot).
+    #[cfg(test)]
+    pub fn fail_next_append(&self) {
+        self.fail_next.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Max records folded into one fsync. A ceiling so a flood can't starve the
@@ -282,12 +332,25 @@ const MAX_BATCH: usize = 1024;
 /// One queued append awaiting commit: the record and the waiter to ack.
 type Pending = (Record, Sender<io::Result<Lsn>>);
 
+/// A control op pulled off the command stream, deferred until the current append
+/// batch has been committed.
+enum Control {
+    Truncate {
+        up_to: u64,
+        ack: Sender<io::Result<()>>,
+    },
+    Checkpoint {
+        ack: Sender<io::Result<()>>,
+    },
+}
+
 fn commit_loop<A: Apply>(
     mut file: File,
     path: PathBuf,
     rx: Receiver<Command>,
     mut applier: A,
     mut next_lsn: u64,
+    fail_next: Arc<AtomicBool>,
 ) {
     let mut batch: Vec<Pending> = Vec::with_capacity(MAX_BATCH);
     let mut frame_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
@@ -301,20 +364,28 @@ fn commit_loop<A: Apply>(
             Err(_) => break,
         };
 
-        // A truncate is processed only between append batches, never folded into
-        // one. If the first command is a truncate, save it; otherwise start a
-        // batch and keep draining until we hit a truncate, the cap, or empty.
-        let mut pending_truncate: Option<(u64, Sender<io::Result<()>>)> = None;
+        // A control op (truncate / checkpoint) is processed only between append
+        // batches, never folded into one. If the first command is a control op,
+        // save it; otherwise start a batch and keep draining until we hit a
+        // control op, the cap, or empty.
+        let mut pending_control: Option<Control> = None;
         match first {
             Command::Append { record, ack } => batch.push((record, ack)),
-            Command::Truncate { up_to, ack } => pending_truncate = Some((up_to, ack)),
+            Command::Truncate { up_to, ack } => {
+                pending_control = Some(Control::Truncate { up_to, ack })
+            }
+            Command::Checkpoint { ack } => pending_control = Some(Control::Checkpoint { ack }),
         }
-        if pending_truncate.is_none() {
+        if pending_control.is_none() {
             while batch.len() < MAX_BATCH {
                 match rx.try_recv() {
                     Ok(Command::Append { record, ack }) => batch.push((record, ack)),
                     Ok(Command::Truncate { up_to, ack }) => {
-                        pending_truncate = Some((up_to, ack));
+                        pending_control = Some(Control::Truncate { up_to, ack });
+                        break;
+                    }
+                    Ok(Command::Checkpoint { ack }) => {
+                        pending_control = Some(Control::Checkpoint { ack });
                         break;
                     }
                     Err(_) => break, // empty or disconnected; flush what we have
@@ -322,8 +393,8 @@ fn commit_loop<A: Apply>(
             }
         }
 
-        // Commit the batch (group fsync) first, so any truncate that follows
-        // only ever runs against an already-durable log.
+        // Commit the batch (group fsync) first, so any control op that follows
+        // only ever runs against an already-durable, fully-applied log.
         if !batch.is_empty() {
             commit_batch(
                 &mut file,
@@ -332,14 +403,28 @@ fn commit_loop<A: Apply>(
                 &mut batch,
                 &mut frame_buf,
                 &mut payload,
+                &fail_next,
             );
         }
 
-        if let Some((up_to, ack)) = pending_truncate {
-            // Recovery's LSN-skip already makes truncation a no-op for
-            // correctness, so a failure here is not durability-critical — just
-            // report it; the next checkpoint retries.
-            let _ = ack.send(truncate_wal(&mut file, &path, up_to));
+        match pending_control {
+            Some(Control::Truncate { up_to, ack }) => {
+                // Recovery's LSN-skip already makes truncation a no-op for
+                // correctness, so a failure here is not durability-critical —
+                // just report it; the next checkpoint retries.
+                let _ = ack.send(truncate_wal(&mut file, &path, up_to));
+            }
+            Some(Control::Checkpoint { ack }) => {
+                // Make the index durable, then shed the now-redundant prefix.
+                // Both steps run here on the single writer thread.
+                let res = match applier.checkpoint() {
+                    Ok(Some(up_to)) => truncate_wal(&mut file, &path, up_to),
+                    Ok(None) => Ok(()),
+                    Err(e) => Err(e),
+                };
+                let _ = ack.send(res);
+            }
+            None => {}
         }
     }
 
@@ -357,7 +442,18 @@ fn commit_batch<A: Apply>(
     batch: &mut Vec<Pending>,
     frame_buf: &mut Vec<u8>,
     payload: &mut Vec<u8>,
+    fail_next: &AtomicBool,
 ) {
+    // Test fault point: pretend this batch's fsync failed. Placed before any
+    // LSN/IO work so it models "the durable write never happened". Compiled out
+    // of non-test builds entirely.
+    #[cfg(test)]
+    if fail_next.swap(false, Ordering::SeqCst) {
+        fail_batch(batch, &io::Error::other("injected WAL failure (test fault point)"));
+        return;
+    }
+    let _ = fail_next; // unused in non-test builds
+
     frame_buf.clear();
     let mut assigned: Vec<Lsn> = Vec::with_capacity(batch.len());
     let batch_start_lsn = *next_lsn;
@@ -479,17 +575,32 @@ fn truncate_wal(file: &mut File, path: &Path, up_to: u64) -> io::Result<()> {
 /// are NOT re-applied — but they still advance the LSN counter, since the log
 /// may not have been truncated up to the watermark yet. Idempotent apply makes
 /// over-replay harmless; skipping is just cheaper and avoids redundant work.
+///
+/// MULTI-COLLECTION CAUTION: `skip_through` is a single scalar here. With more
+/// than one collection sharing this WAL, the caller MUST pass the *minimum*
+/// durable watermark across collections (so this never skips a frame a lagging
+/// collection still needs), and the real fix is a per-collection watermark keyed
+/// on each frame's collection id. Never pass a global `max(last_lsn)` — that
+/// silently drops records for collections that haven't caught up. See
+/// `engine::Db::open`.
 fn recover<A: Apply>(path: &Path, applier: &mut A, skip_through: u64) -> io::Result<u64> {
+    // The LSN counter must never resume at or below the checkpoint watermark.
+    // A checkpoint can truncate the WAL down to EMPTY (everything <= watermark
+    // was folded into the index and dropped), so the surviving frames alone
+    // can't tell us how far the counter had advanced — `skip_through` can. If we
+    // restarted from 1 here, the next appends would be assigned LSNs <=
+    // skip_through and the *following* recovery would skip them as "already
+    // durable", silently losing them. So seed the counter past the watermark and
+    // only ever ratchet it upward. (skip_through == 0 for a fresh db => 1.)
+    let resume_floor = skip_through + 1;
+
     let file = match File::open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(FIRST_LSN), // fresh db
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(resume_floor), // fresh db
         Err(e) => return Err(e),
     };
     let mut reader = BufReader::new(file);
-    // LSNs are 1-based: LSN 0 is never assigned, so a durable watermark of 0
-    // unambiguously means "nothing checkpointed yet" and the recovery skip
-    // (`lsn <= skip_through`) never swallows a real record.
-    let mut next_lsn = FIRST_LSN;
+    let mut next_lsn = resume_floor;
 
     loop {
         // Read the fixed header. A short read here == clean EOF (no partial
@@ -521,9 +632,10 @@ fn recover<A: Apply>(path: &Path, applier: &mut A, skip_through: u64) -> io::Res
             break;
         }
 
-        // Advance the counter past every valid frame we see, even skipped ones,
-        // so LSNs never get reused after a partially-truncated log.
-        next_lsn = lsn + 1;
+        // Ratchet the counter past every valid frame we see, even skipped ones,
+        // so LSNs are never reused. `max` (not assignment) keeps the
+        // `resume_floor` seed intact when surviving frames sit below it.
+        next_lsn = next_lsn.max(lsn + 1);
 
         // Already durable in the index — don't re-apply.
         if lsn <= skip_through {
@@ -563,24 +675,20 @@ fn read_exact_or_eof(r: &mut impl Read, buf: &mut [u8]) -> io::Result<ReadOutcom
 }
 
 // ---------------------------------------------------------------------------
-// Checkpoint / truncation — driven by the flusher thread, not here.
+// Checkpoint / truncation — driven on the commit thread.
 // ---------------------------------------------------------------------------
 //
-// The flusher (separate thread, every X seconds) does:
-//   1. msync both index mmaps  -> index state on disk is now durable up to LSN C
-//   2. record checkpoint LSN C
-//   3. truncate the WAL up to C
+// A `Command::Checkpoint` (sent by the engine's flusher on a timer, or by
+// `Db::checkpoint`) is handled between append batches by the commit loop:
+//   1. `Apply::checkpoint` makes the index durable (msync data, then advance the
+//      durable header watermark) -> returns the LSN `C` it is now durable up to.
+//   2. the commit thread truncates the WAL up to `C`.
 //
-// Ordering matters: msync the indexes BEFORE truncating the WAL. If you
-// truncate first and crash before the msync lands, you've thrown away records
-// the indexes hadn't durably absorbed -> data loss. msync, THEN truncate.
-//
-// TODO: expose a `Checkpoint` channel/handle so the flusher can tell the WAL
-// thread "safe to truncate up to C" and the WAL thread performs the truncation
-// itself (it owns the file). Don't truncate the file from another thread.
-pub struct Checkpoint {
-    pub lsn: Lsn,
-}
+// Ordering matters: msync the index BEFORE truncating the WAL. If you truncated
+// first and crashed before the msync landed, you'd throw away records the index
+// hadn't durably absorbed -> data loss. The applier syncs, THEN we truncate.
+// Both steps run here on the file-owning thread; no other thread touches the
+// file or the index.
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -625,6 +733,10 @@ mod tests {
                 .expect("lock not poisoned")
                 .push((lsn.0, record.clone()));
             Ok(())
+        }
+        fn checkpoint(&mut self) -> io::Result<Option<u64>> {
+            // These WAL tests never checkpoint; nothing to make durable.
+            Ok(None)
         }
     }
 

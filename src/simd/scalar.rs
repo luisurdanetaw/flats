@@ -49,6 +49,51 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// Auto-vectorizable scalar dot product. Plain `*` and `+` instead of
+/// `mul_add`, giving the compiler permission to use packed SIMD FMA
+/// (`vfmadd231ps ymm`) and reorder for throughput.
+///
+/// NOT bit-exact with the SIMD kernels — the rounding chain differs
+/// because hardware packed FMA may use a different reduction order than
+/// the strict left-fold the parity tests pin. Use [`dot`] for the
+/// bit-exact reference; use this for performance comparison against
+/// hand-rolled SIMD.
+///
+/// Panics on length mismatch.
+pub fn dot_relaxed(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "scalar::dot_relaxed: length mismatch");
+    let n = a.len();
+    let main = n - n % LANES;
+
+    let mut lanes = [0.0f32; LANES];
+    let mut i = 0;
+    while i < main {
+        // Plain `+=` with `*` instead of `mul_add`. The compiler is free to:
+        //   - Use hardware FMA (one rounding) or split into mul+add (two
+        //     roundings) — either is allowed.
+        //   - Vectorize the 8 lanes into a single 256-bit SIMD register.
+        for k in 0..LANES {
+            lanes[k] += a[i + k] * b[i + k];
+        }
+        i += LANES;
+    }
+
+    // Same fold structure as `dot` so the two stay structurally similar.
+    let mut sum = lanes[0];
+    for &v in &lanes[1..] {
+        sum += v;
+    }
+
+    // Tail uses plain `*` and `+` too — matching the main loop's relaxed
+    // rounding contract.
+    while i < n {
+        sum += a[i] * b[i];
+        i += 1;
+    }
+
+    sum
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
