@@ -1,8 +1,10 @@
 //! Chaos / property harness.
 //!
-//! Drives a `Db` through a long random sequence of inserts, deletes,
-//! checkpoints, and full reopens, checking after every step (and especially
-//! after every reopen) that the engine agrees with an in-memory reference model.
+//! Drives a `Db` through a long random sequence of inserts (with metadata),
+//! deletes, checkpoints, and full reopens, checking after every step (and
+//! especially after every reopen) that the engine agrees with an in-memory
+//! reference model — across ALL THREE subsystems: flat vector index,
+//! metadata index, and tuple store.
 //!
 //! Why reopen is the interesting bit: every `insert`/`delete` blocks until the
 //! WAL has fsynced it, so every acked op is durable. A reopen therefore MUST
@@ -17,7 +19,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flats::{CollectionConfig, Db, DbOptions};
+use flats::index::index::Ordinal;
+use flats::metadata::tuples::RowGet;
+use flats::{ColumnType, CollectionConfig, Db, DbOptions, RangeOp, Row, Schema, Value};
 
 /// xorshift64* — tiny, deterministic, good enough to drive the op stream.
 struct Rng(u64);
@@ -43,10 +47,33 @@ impl Rng {
     }
 }
 
+const TEXTS: [&str; 4] = ["red", "green", "blue", "teal"];
+
+/// One row of ground truth: the vector plus the metadata values.
+#[derive(Clone)]
+struct ModelRow {
+    vector: Vec<f32>,
+    a: i64,
+    b: f64,
+    c: &'static str,
+}
+
+impl ModelRow {
+    fn row(&self) -> Row {
+        vec![
+            (0, Value::Int(self.a)),
+            (1, Value::Float(self.b)),
+            (2, Value::Text(self.c.into())),
+        ]
+    }
+}
+
 /// Reference model: the ground truth the engine must match.
 struct Model {
-    /// Live (non-tombstoned) ordinal -> vector.
-    live: BTreeMap<u64, Vec<f32>>,
+    /// Live (non-tombstoned) ordinal -> row.
+    live: BTreeMap<u64, ModelRow>,
+    /// Ordinals that were inserted then deleted (tuple store must say Deleted).
+    deleted: BTreeSet<u64>,
     /// Next ordinal the allocator will hand out == the high-water mark.
     next_ordinal: u64,
     capacity: u64,
@@ -58,6 +85,7 @@ impl Model {
     fn new(capacity: u64) -> Self {
         Model {
             live: BTreeMap::new(),
+            deleted: BTreeSet::new(),
             next_ordinal: 0,
             capacity,
             history: std::collections::VecDeque::new(),
@@ -81,11 +109,31 @@ fn random_vector(rng: &mut Rng) -> Vec<f32> {
     (0..DIM).map(|_| rng.coord()).collect()
 }
 
+fn random_row(rng: &mut Rng, vector: Vec<f32>) -> ModelRow {
+    ModelRow {
+        vector,
+        a: rng.below(8) as i64,
+        b: rng.coord() as f64, // exactly representable; compares bit-for-bit
+        c: TEXTS[rng.below(TEXTS.len() as u64) as usize],
+    }
+}
+
+fn schema() -> Schema {
+    Schema::new(vec![
+        ("a".into(), ColumnType::Int),
+        ("b".into(), ColumnType::Float),
+        ("c".into(), ColumnType::Text),
+    ])
+    .unwrap()
+}
+
 fn cfgs() -> Vec<CollectionConfig> {
     vec![CollectionConfig {
         id: 0,
+        name: "chaos".into(),
         dim: std::num::NonZeroUsize::new(DIM).unwrap(),
         capacity: CAPACITY as usize,
+        schema: schema(),
     }]
 }
 
@@ -116,12 +164,104 @@ fn verify(db: &Db, model: &Model, query: &[f32]) {
     }
 
     for h in &hits {
-        let v = &model.live[&(h.id.0 as u64)];
+        let v = &model.live[&(h.id.0 as u64)].vector;
         assert_eq!(
             h.score,
             flats::dot(query, v),
             "score mismatch for ordinal {}",
             h.id.0
+        );
+    }
+}
+
+/// The metadata half of the invariant: the metadata index's bitmaps and the
+/// tuple store's values must match the model exactly — including tombstone
+/// masking and Deleted markers.
+fn verify_metadata(db: &Db, model: &Model, rng: &mut Rng) {
+    let meta = db.metadata_reader(0).expect("metadata reader");
+    let tuples = db.tuple_reader(0).expect("tuple reader");
+
+    assert_eq!(meta.live_count(), model.live.len() as u64, "live_count");
+    let live: BTreeSet<u64> = meta.live().iter().map(u64::from).collect();
+    let want: BTreeSet<u64> = model.live.keys().copied().collect();
+    assert_eq!(live, want, "live bitmap diverged");
+
+    // lookup_eq on a random INT value and a random TEXT value.
+    let a = rng.below(8) as i64;
+    let got: BTreeSet<u64> = meta
+        .lookup_eq(0, &Value::Int(a))
+        .expect("lookup_eq int")
+        .iter()
+        .map(u64::from)
+        .collect();
+    let want: BTreeSet<u64> = model
+        .live
+        .iter()
+        .filter(|(_, r)| r.a == a)
+        .map(|(&o, _)| o)
+        .collect();
+    assert_eq!(got, want, "lookup_eq a={a}");
+
+    let c = TEXTS[rng.below(TEXTS.len() as u64) as usize];
+    let got: BTreeSet<u64> = meta
+        .lookup_eq(2, &Value::Text(c.into()))
+        .expect("lookup_eq text")
+        .iter()
+        .map(u64::from)
+        .collect();
+    let want: BTreeSet<u64> = model
+        .live
+        .iter()
+        .filter(|(_, r)| r.c == c)
+        .map(|(&o, _)| o)
+        .collect();
+    assert_eq!(got, want, "lookup_eq c={c}");
+
+    // lookup_range with a random op on the INT column.
+    let bound = rng.below(9) as i64 - 1; // sometimes outside the value range
+    let op = [RangeOp::Lt, RangeOp::Le, RangeOp::Gt, RangeOp::Ge][rng.below(4) as usize];
+    let got: BTreeSet<u64> = meta
+        .lookup_range(0, op, &Value::Int(bound))
+        .expect("lookup_range")
+        .iter()
+        .map(u64::from)
+        .collect();
+    let keep = |a: i64| match op {
+        RangeOp::Lt => a < bound,
+        RangeOp::Le => a <= bound,
+        RangeOp::Gt => a > bound,
+        RangeOp::Ge => a >= bound,
+    };
+    let want: BTreeSet<u64> = model
+        .live
+        .iter()
+        .filter(|(_, r)| keep(r.a))
+        .map(|(&o, _)| o)
+        .collect();
+    assert_eq!(got, want, "lookup_range a {op:?} {bound}");
+
+    // Tuple store: a random live ordinal round-trips its full row…
+    if !model.live.is_empty() {
+        let pick = rng.below(model.live.len() as u64) as usize;
+        let (&ord, row) = model.live.iter().nth(pick).unwrap();
+        assert_eq!(
+            tuples.get(Ordinal(ord as u32), &[0, 1, 2]).expect("get live"),
+            RowGet::Live(vec![
+                Value::Int(row.a),
+                Value::Float(row.b),
+                Value::Text(row.c.into()),
+            ]),
+            "tuple values for ordinal {ord}"
+        );
+    }
+    // …and a random deleted ordinal reports the deleted-marker.
+    if !model.deleted.is_empty() {
+        let pick = rng.below(model.deleted.len() as u64) as usize;
+        let &ord = model.deleted.iter().nth(pick).unwrap();
+        assert_eq!(
+            tuples.get(Ordinal(ord as u32), &[0]).expect("get deleted"),
+            RowGet::Deleted,
+            "deleted marker for ordinal {ord}"
         );
     }
 }
@@ -138,10 +278,11 @@ fn run(seed: u64, iters: u64) {
 
     for _ in 0..iters {
         match rng.below(100) {
-            // ~50% insert
+            // ~50% insert (vector + metadata row, one durable record)
             0..=49 => {
-                let v = random_vector(&mut rng);
-                let res = db.as_ref().unwrap().insert(0, &v);
+                let vector = random_vector(&mut rng);
+                let row = random_row(&mut rng, vector);
+                let res = db.as_ref().unwrap().insert(0, &row.vector, row.row());
                 if model.at_capacity() {
                     assert!(
                         matches!(res, Err(flats::Error::CapacityExceeded { .. })),
@@ -151,7 +292,7 @@ fn run(seed: u64, iters: u64) {
                 } else {
                     let ord = res.expect("insert below capacity").0 as u64;
                     assert_eq!(ord, model.next_ordinal, "engine/model ordinal drift");
-                    model.live.insert(ord, v);
+                    model.live.insert(ord, row);
                     model.next_ordinal += 1;
                     model.log(format!("insert ord={ord}"));
                 }
@@ -164,22 +305,26 @@ fn run(seed: u64, iters: u64) {
                     let ord = *model.live.keys().nth(pick).unwrap();
                     db.as_ref().unwrap().delete(0, ord).expect("delete");
                     model.live.remove(&ord);
+                    model.deleted.insert(ord);
                     model.log(format!("delete ord={ord}"));
                 }
             }
-            // ~15% verify against the model
-            70..=84 => verify(db.as_ref().unwrap(), &model, &query),
+            // ~8% verify vectors against the model
+            70..=77 => verify(db.as_ref().unwrap(), &model, &query),
+            // ~7% verify metadata + tuples against the model
+            78..=84 => verify_metadata(db.as_ref().unwrap(), &model, &mut rng),
             // ~10% checkpoint (advance index watermark + truncate WAL)
             85..=94 => {
                 db.as_ref().unwrap().checkpoint().expect("checkpoint");
                 model.log("checkpoint".into());
             }
-            // ~5% crash & recover, then verify the reconciled state
+            // ~5% crash & recover, then verify the reconciled state everywhere
             _ => {
                 drop(db.take()); // fully drop old instance: joins WAL thread, frees files
                 db = Some(Db::open(&path, &cfgs, opts()).unwrap());
                 model.log("REOPEN".into());
                 verify(db.as_ref().unwrap(), &model, &query);
+                verify_metadata(db.as_ref().unwrap(), &model, &mut rng);
             }
         }
     }
@@ -188,6 +333,7 @@ fn run(seed: u64, iters: u64) {
     drop(db.take());
     let reopened = Db::open(&path, &cfgs, opts()).unwrap();
     verify(&reopened, &model, &query);
+    verify_metadata(&reopened, &model, &mut rng);
     reopened.close().unwrap();
 }
 

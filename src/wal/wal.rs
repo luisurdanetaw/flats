@@ -25,7 +25,9 @@
 //!   write survived once it actually did.
 //!
 //! Dependency direction: this module knows NOTHING about the vector or metadata
-//! index. The engine injects an `Apply` impl. WAL depends on nobody.
+//! index. The engine injects an `Apply` impl. WAL depends only on the plain
+//! data types in `metadata::common` (`Record::Insert` carries the metadata
+//! row); the stores themselves are never imported here.
 
 
 use std::fs::{File, OpenOptions};
@@ -39,6 +41,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
 use serde::{Deserialize, Serialize};
+
+use crate::metadata::common::{CollectionConfig, ColumnId, Value};
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -71,11 +75,21 @@ pub enum Record {
         collection: u32,
         ordinal: u64,
         vector: Vec<f32>,
+        /// The metadata row, exactly as validated against the schema on the
+        /// logging side. Applied to MetadataIndex (insert_row) and TupleStore
+        /// (write_row). == `metadata::common::Row`.
+        metadata: Vec<(ColumnId, Value)>,
     },
     Delete {
         collection: u32,
         ordinal: u64,
-    }
+    },
+    /// DDL is a mutation too (Phase 6): CREATE COLLECTION rides the same
+    /// durable path as inserts. The record carries the FULL config (id
+    /// assigned on the logging side, like ordinals) so a dumb replay loop can
+    /// materialize the collection with no catalog to consult. Apply is
+    /// idempotent: if the id/name already exists, it's a no-op.
+    CreateCollection { config: CollectionConfig },
 }
 
 impl Record {
@@ -118,7 +132,18 @@ pub trait Apply {
 // On-disk framing
 // ---------------------------------------------------------------------------
 //
-// Each frame:
+// The file opens with a fixed 8-byte header:
+//   [ magic: b"FWAL" ][ version: u32 LE ]
+//
+// Frames carry no version of their own (bincode tags positionally), so the
+// header is the ONLY thing that lets recovery refuse an incompatible log
+// cleanly instead of misdecoding it as a torn tail. Version 2 = the
+// metadata-carrying `Record::Insert` (Phase 4c). Version 1 logs predate the
+// header entirely and surface as "bad magic": the upgrade path is a clean
+// shutdown on the old build (its final checkpoint folds everything into the
+// indexes and truncates the WAL), then start the new build.
+//
+// Each frame after the header:
 //   [ len: u32 ][ crc32: u32 ][ lsn: u64 ][ payload: len bytes ]
 //
 // crc32 covers lsn + payload. Recovery walks frames in order and STOPS at the
@@ -126,6 +151,24 @@ pub trait Apply {
 // bad frame is the valid log; the torn tail was mid-fsync, never acked, and is
 // discarded. This is non-negotiable — every crash-during-fsync leaves a torn
 // tail, and without the checksum recovery would try to replay garbage.
+
+const WAL_MAGIC: &[u8; 4] = b"FWAL";
+/// Version written to new logs. 2 = metadata-carrying Insert (Phase 4c);
+/// 3 = + CreateCollection (Phase 6).
+const WAL_VERSION: u32 = 3;
+/// Oldest version this build still reads. v2 logs are a strict subset of v3
+/// (CreateCollection was APPENDED to the Record enum — bincode's positional
+/// tags for the old variants are unchanged), so reading them is safe; an old
+/// build reading a v3 log is not, which is why the written version bumped.
+const WAL_MIN_VERSION: u32 = 2;
+const WAL_HEADER_BYTES: usize = 8;
+
+fn wal_header() -> [u8; WAL_HEADER_BYTES] {
+    let mut h = [0u8; WAL_HEADER_BYTES];
+    h[0..4].copy_from_slice(WAL_MAGIC);
+    h[4..8].copy_from_slice(&WAL_VERSION.to_le_bytes());
+    h
+}
 
 const LEN_BYTES: usize = 4;
 const CRC_BYTES: usize = 4;
@@ -283,11 +326,18 @@ impl Wal {
 
         // 2. Open the log for appending. We keep the File for fsync; the batched
         //    frames are buffered in memory and written in one shot per batch.
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .create(true)
             .append(true) // appends only (implies write); truncation is in-thread
             .open(&path)?;
+
+        // Fresh (or crash-emptied) file: stamp the header before any frame.
+        // Recovery already validated it on non-empty files.
+        if file.metadata()?.len() == 0 {
+            file.write_all(&wal_header())?;
+            file.sync_data()?;
+        }
 
         let (tx, rx) = mpsc::channel::<Command>();
 
@@ -520,6 +570,13 @@ fn truncate_wal(file: &mut File, path: &Path, up_to: u64) -> io::Result<()> {
     let mut kept: Vec<u8> = Vec::new();
     {
         let mut reader = BufReader::new(File::open(path)?);
+        // Skip the file header (recovery validated it when this file was
+        // opened); the temp file below gets a fresh copy.
+        let mut file_header = [0u8; WAL_HEADER_BYTES];
+        match read_exact_or_eof(&mut reader, &mut file_header)? {
+            ReadOutcome::Full => {}
+            _ => {} // empty/short file: no frames to keep
+        }
         loop {
             let mut header = [0u8; HEADER_BYTES];
             match read_exact_or_eof(&mut reader, &mut header)? {
@@ -548,6 +605,7 @@ fn truncate_wal(file: &mut File, path: &Path, up_to: u64) -> io::Result<()> {
             .create(true)
             .truncate(true)
             .open(&tmp)?;
+        tf.write_all(&wal_header())?; // the rewritten log keeps its header
         tf.write_all(&kept)?;
         tf.sync_all()?;
     }
@@ -600,6 +658,45 @@ fn recover<A: Apply>(path: &Path, applier: &mut A, skip_through: u64) -> io::Res
         Err(e) => return Err(e),
     };
     let mut reader = BufReader::new(file);
+
+    // File header first. Refusing here must be LOUD: without the check, an
+    // incompatible log would misdecode as a torn tail and recovery would
+    // silently stop early — worse than an error.
+    let mut file_header = [0u8; WAL_HEADER_BYTES];
+    match read_exact_or_eof(&mut reader, &mut file_header)? {
+        // Zero bytes: created-then-crashed before the header landed. Nothing
+        // was ever acked from it; treat as fresh (start() stamps the header).
+        ReadOutcome::Eof => return Ok(resume_floor),
+        ReadOutcome::Torn => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "wal file shorter than its header and not empty — not a flats v2 WAL",
+            ));
+        }
+        ReadOutcome::Full => {}
+    }
+    if &file_header[0..4] != WAL_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "wal has no FWAL header — pre-4c log or foreign file; upgrade path: \
+             clean shutdown on the previous build (final checkpoint folds the log \
+             into the indexes), then start this build",
+        ));
+    }
+    let version = u32::from_le_bytes(
+        file_header[4..8]
+            .try_into()
+            .expect("slice of fixed len 4"),
+    );
+    if !(WAL_MIN_VERSION..=WAL_VERSION).contains(&version) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported wal version {version} (this build reads {WAL_MIN_VERSION}..={WAL_VERSION})"
+            ),
+        ));
+    }
+
     let mut next_lsn = resume_floor;
 
     loop {
@@ -704,6 +801,7 @@ mod tests {
             collection,
             ordinal,
             vector: vector.to_vec(),
+            metadata: vec![],
         }
     }
 
@@ -745,9 +843,33 @@ mod tests {
         for record in [
             insert(0, 0, &[]),
             insert(7, 42, &[1.0, -2.5, 3.25, f32::MIN, f32::MAX]),
+            // Metadata-carrying inserts: empty row and a multi-type row.
+            Record::Insert {
+                collection: 1,
+                ordinal: 5,
+                vector: vec![0.5],
+                metadata: vec![
+                    (0, Value::Int(-7)),
+                    (1, Value::Float(2.25)),
+                    (2, Value::Text("héllo wörld".into())),
+                ],
+            },
             Record::Delete {
                 collection: 3,
                 ordinal: 99,
+            },
+            Record::CreateCollection {
+                config: CollectionConfig {
+                    id: 4,
+                    name: "docs".into(),
+                    dim: std::num::NonZeroUsize::new(768).unwrap(),
+                    capacity: 1_000_000,
+                    schema: crate::metadata::common::Schema::new(vec![
+                        ("author".into(), crate::metadata::common::ColumnType::Text),
+                        ("year".into(), crate::metadata::common::ColumnType::Int),
+                    ])
+                    .unwrap(),
+                },
             },
         ] {
             let mut buf = Vec::new();
@@ -821,6 +943,68 @@ mod tests {
             assert_eq!(next.0, records.len() as u64 + 1);
             wal.shutdown();
         }
+    }
+
+    #[test]
+    fn header_round_trips_and_survives_truncate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+
+        {
+            let wal = Wal::start(&path, CollectingApplier::new(), 0).unwrap();
+            let h = wal.handle();
+            h.append(insert(0, 0, &[1.0])).unwrap();
+            h.append(insert(0, 1, &[2.0])).unwrap();
+            // Truncate rewrites the whole file — the header must be re-emitted.
+            h.truncate(1).unwrap();
+            drop(h);
+            wal.shutdown();
+        }
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[0..4], WAL_MAGIC);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            WAL_VERSION
+        );
+
+        // And the truncated log still recovers: only LSN 2 survives.
+        let recovered = CollectingApplier::new();
+        let wal = Wal::start(&path, recovered.clone(), 0).unwrap();
+        let seen = recovered.snapshot();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, 2);
+        wal.shutdown();
+    }
+
+    #[test]
+    fn recovery_refuses_bad_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        // A pre-header (or foreign) file: no FWAL magic.
+        std::fs::write(&path, b"not a wal at all, definitely long enough").unwrap();
+        let err = match Wal::start(&path, CollectingApplier::new(), 0) {
+            Err(e) => e,
+            Ok(_) => panic!("bad magic must refuse, not misdecode"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("FWAL"), "error names the header: {err}");
+    }
+
+    #[test]
+    fn recovery_refuses_future_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(WAL_MAGIC);
+        bytes.extend_from_slice(&99u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let err = match Wal::start(&path, CollectingApplier::new(), 0) {
+            Err(e) => e,
+            Ok(_) => panic!("future version must refuse cleanly"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("99"), "error names the version: {err}");
     }
 
     #[test]
