@@ -125,7 +125,7 @@ Concurrency: single writer, multiple readers. Please refer to ARCHITECTURE.md fo
 ## 5. Coding Conventions
 
 - **No `unwrap()` in library code.** Bubble errors with `Result<T, Error>`. Tests can `unwrap`.
-- **One error type** (`crate::Error`) with variants. No `anyhow`, no `thiserror`. Hand-roll `Display` and `Error`.
+- **One error type per layer.** The storage engine has exactly one: `crate::Error` (in `error.rs`), with variants covering all engine/IO/durability failures. The **query pipeline** (lexer → parser → plan → compiler → VM) may define its own stage-local error types — e.g. `lexer::LexError` — because they carry frontend-only concerns (source `pos`, `line_col` diagnostics) that must not bleed into the engine's error enum, and an engine `Error` can never surface from lexing (nor vice versa). Each stage's error stays local; the top-level API wraps them at the boundary rather than flattening every stage into one enum. No `anyhow`. Hand-roll `Display` and `Error` (the `thiserror` derive on `crate::Error` is a sanctioned temporary exception — see §2 / `Cargo.toml`).
 - **`unsafe` is allowed but quarantined.** Only in `simd/*` and `platform/*`. Every `unsafe` block has a `// SAFETY:` comment naming the preconditions.
 - **No `Box<dyn Error>` in public API.**
 - **`#![forbid(unsafe_op_in_unsafe_fn)]`** at crate root. Be explicit about unsafe scopes.
