@@ -13,7 +13,9 @@ pub mod error;
 pub mod index;
 pub mod simd;
 pub mod wal;
+pub mod metadata;
 
 pub use crate::engine::{CollectionConfig, Db, DbOptions};
 pub use crate::error::{Error, Result};
+pub use crate::metadata::{ColumnType, RangeOp, Row, Schema, Value};
 pub use simd::dot;

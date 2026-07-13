@@ -37,6 +37,7 @@ fn insert_rec(ordinal: u64) -> Record {
         collection: 0,
         ordinal,
         vector: vec![ordinal as f32, 1.0],
+        metadata: vec![],
     }
 }
 
@@ -65,6 +66,9 @@ impl Apply for WriterApplier {
                 ordinal, vector, ..
             } => self.writer.write_at(*ordinal, vector).map_err(to_io)?,
             Record::Delete { ordinal, .. } => self.writer.delete(*ordinal).map_err(to_io)?,
+            Record::CreateCollection { .. } => {
+                unreachable!("this test never logs CreateCollection records")
+            }
         }
         self.writer.advance_applied_lsn(lsn.0);
         self.applied.fetch_add(1, Ordering::SeqCst);
@@ -85,6 +89,9 @@ fn log_and_apply(h: &WalHandle, w: &mut Writer, rec: Record) {
             ordinal, vector, ..
         } => w.write_at(*ordinal, vector).expect("write_at"),
         Record::Delete { ordinal, .. } => w.delete(*ordinal).expect("delete"),
+        Record::CreateCollection { .. } => {
+            unreachable!("this test never logs CreateCollection records")
+        }
     }
     w.advance_applied_lsn(lsn.0);
 }
