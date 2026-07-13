@@ -196,7 +196,6 @@ pub enum LexErrorKind {
 /// which are deliberately NOT keywords (design decision (1)).
 ///
 /// EXTEND: this table is the single place to add a future reserved keyword.
-#[allow(dead_code)] // wired into `next_token` in phase 7b
 fn keyword(word: &str) -> Option<Token> {
     match word.to_ascii_lowercase().as_str() {
         "create" => Some(Token::Create),
@@ -217,7 +216,6 @@ fn keyword(word: &str) -> Option<Token> {
 /// Construct with [`Lexer::new`], then either drain the whole stream with
 /// [`tokenize`](Self::tokenize) or pull one token at a time with
 /// [`next_token`](Self::next_token).
-#[allow(dead_code)] // fields are consumed by the scanner in phase 7b
 pub struct Lexer<'a> {
     /// The full source, retained for slicing spans and reporting positions.
     src: &'a str,
@@ -233,30 +231,194 @@ impl<'a> Lexer<'a> {
 
     /// Consume the whole input, returning every token up to and including a
     /// trailing [`Token::Eof`]. Errors on the first malformed token.
-    pub fn tokenize(self) -> Result<Vec<SpannedToken>, LexError> {
-        unimplemented!("phase 7b: scanner logic")
+    pub fn tokenize(mut self) -> Result<Vec<SpannedToken>, LexError> {
+        let mut out = Vec::new();
+        loop {
+            let st = self.next_token()?;
+            let done = st.token == Token::Eof;
+            out.push(st);
+            if done {
+                return Ok(out);
+            }
+        }
     }
 
-    /// Scan and return the next token. Returns [`Token::Eof`] once (with a
-    /// zero-width span at end of input) and every subsequent call thereafter.
+    /// Scan and return the next token. Returns [`Token::Eof`] once the input is
+    /// exhausted (with a zero-width span at end of input) and on every
+    /// subsequent call.
+    ///
+    /// Scanning is byte-driven: every delimiter is single-byte ASCII and `'`
+    /// (0x27) can never occur inside a UTF-8 multibyte sequence, so token
+    /// boundaries are found by byte without ever splitting a character.
     pub fn next_token(&mut self) -> Result<SpannedToken, LexError> {
-        unimplemented!("phase 7b: scanner logic")
+        self.skip_trivia();
+        let start = self.pos;
+        let b = match self.src.as_bytes().get(start) {
+            None => {
+                return Ok(SpannedToken {
+                    token: Token::Eof,
+                    span: Span { start, end: start },
+                });
+            }
+            Some(&b) => b,
+        };
+        match b {
+            b'(' => Ok(self.single(Token::LParen, start)),
+            b')' => Ok(self.single(Token::RParen, start)),
+            b'[' => Ok(self.single(Token::LBracket, start)),
+            b']' => Ok(self.single(Token::RBracket, start)),
+            b',' => Ok(self.single(Token::Comma, start)),
+            b';' => Ok(self.single(Token::Semicolon, start)),
+            b'=' => Ok(self.single(Token::Eq, start)),
+            // A `-` that reaches here is a genuine Minus: maximal munch means a
+            // `--` line comment was already eaten by `skip_trivia`. Sign is the
+            // parser's job (design decision 2).
+            b'-' => Ok(self.single(Token::Minus, start)),
+            // EXTEND: new single-char operators (Star `*`, Lt `<`, Gt `>`, …)
+            // get a match arm here plus a `Token` variant.
+            b'\'' => self.scan_string(start),
+            _ if b.is_ascii_digit() => self.scan_number(start),
+            _ if b == b'_' || b.is_ascii_alphabetic() => Ok(self.scan_ident(start)),
+            _ => {
+                // Report the whole offending character, not a stray byte, so a
+                // non-ASCII intruder is named correctly.
+                let ch = self.src[start..].chars().next().unwrap_or(b as char);
+                Err(LexError {
+                    kind: LexErrorKind::UnexpectedChar(ch),
+                    pos: start,
+                })
+            }
+        }
     }
 
-    // -- private scanner helpers (implemented in phase 7b) ------------------
-    //
-    // The intended shape, so 7b fills bodies without churning the public API:
-    //
-    //   fn skip_trivia(&mut self)                     — whitespace (extend here
-    //                                                   for comments if ever)
-    //   fn peek(&self) -> Option<char>
-    //   fn bump(&mut self) -> Option<char>
-    //   fn scan_ident(&mut self, start) -> SpannedToken            (keyword())
-    //   fn scan_number(&mut self, start) -> Result<SpannedToken>   (int/float)
-    //   fn scan_string(&mut self, start) -> Result<SpannedToken>   ('' escape)
-    //
-    // EXTEND: single-char operators are matched inline in `next_token`; adding
-    // one is a new match arm there plus a `Token` variant above.
+    // -- private scanner helpers -------------------------------------------
+
+    /// Advance past a single-byte token and span it `[start, pos)`.
+    fn single(&mut self, token: Token, start: usize) -> SpannedToken {
+        self.pos += 1;
+        SpannedToken {
+            token,
+            span: Span { start, end: self.pos },
+        }
+    }
+
+    /// Skip whitespace and `-- …` line comments (to end of line). Loops so runs
+    /// of mixed trivia are consumed in one call.
+    fn skip_trivia(&mut self) {
+        let bytes = self.src.as_bytes();
+        loop {
+            match bytes.get(self.pos) {
+                Some(b' ' | b'\t' | b'\r' | b'\n') => self.pos += 1,
+                // `--` beats a lone `-` (maximal munch): a line comment runs to
+                // the newline (or EOF).
+                Some(b'-') if bytes.get(self.pos + 1) == Some(&b'-') => {
+                    self.pos += 2;
+                    while let Some(&c) = bytes.get(self.pos) {
+                        if c == b'\n' {
+                            break;
+                        }
+                        self.pos += 1;
+                    }
+                    // EXTEND: other trivia (block comments, …) go here.
+                }
+                _ => break,
+            }
+        }
+    }
+
+    /// Scan `[A-Za-z_][A-Za-z0-9_]*`, then resolve it against the reserved
+    /// keyword set case-insensitively. A miss is an [`Token::Ident`] carrying
+    /// the original source case — so type names (`VECTOR`/`INT`/…) stay idents
+    /// (design decision 1).
+    fn scan_ident(&mut self, start: usize) -> SpannedToken {
+        let bytes = self.src.as_bytes();
+        while let Some(&c) = bytes.get(self.pos) {
+            if c == b'_' || c.is_ascii_alphanumeric() {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        let text = &self.src[start..self.pos];
+        let token = keyword(text).unwrap_or_else(|| Token::Ident(text.to_string()));
+        SpannedToken {
+            token,
+            span: Span { start, end: self.pos },
+        }
+    }
+
+    /// Scan a maximal digit run; a `.` joins the number ONLY if a digit follows
+    /// (so `768.` is `IntLit(768)` and leaves the dot). Parse failure — e.g. an
+    /// `i64` overflow — becomes [`LexErrorKind::InvalidNumber`].
+    fn scan_number(&mut self, start: usize) -> Result<SpannedToken, LexError> {
+        let bytes = self.src.as_bytes();
+        while matches!(bytes.get(self.pos), Some(c) if c.is_ascii_digit()) {
+            self.pos += 1;
+        }
+        let mut is_float = false;
+        if bytes.get(self.pos) == Some(&b'.')
+            && matches!(bytes.get(self.pos + 1), Some(c) if c.is_ascii_digit())
+        {
+            is_float = true;
+            self.pos += 1; // consume '.'
+            while matches!(bytes.get(self.pos), Some(c) if c.is_ascii_digit()) {
+                self.pos += 1;
+            }
+        }
+        let text = &self.src[start..self.pos];
+        // The two parses have different error types; normalize both to
+        // InvalidNumber(text) here rather than trying to unify them.
+        let invalid = || LexError {
+            kind: LexErrorKind::InvalidNumber(text.to_string()),
+            pos: start,
+        };
+        let token = if is_float {
+            Token::FloatLit(text.parse::<f64>().map_err(|_| invalid())?)
+        } else {
+            Token::IntLit(text.parse::<i64>().map_err(|_| invalid())?)
+        };
+        Ok(SpannedToken {
+            token,
+            span: Span { start, end: self.pos },
+        })
+    }
+
+    /// Scan a `'`-quoted string. A doubled `''` unescapes to one `'` and the
+    /// string continues; EOF before the closing quote is
+    /// [`LexErrorKind::UnterminatedString`]. Content is copied as whole
+    /// byte-segments between quotes — each break is on the ASCII byte `'`, never
+    /// inside a multibyte char, so UTF-8 round-trips.
+    fn scan_string(&mut self, start: usize) -> Result<SpannedToken, LexError> {
+        let bytes = self.src.as_bytes();
+        self.pos += 1; // opening quote
+        let mut value = String::new();
+        let mut segment_start = self.pos;
+        loop {
+            match bytes.get(self.pos) {
+                None => {
+                    return Err(LexError {
+                        kind: LexErrorKind::UnterminatedString,
+                        pos: start,
+                    });
+                }
+                Some(&b'\'') => {
+                    value.push_str(&self.src[segment_start..self.pos]);
+                    if bytes.get(self.pos + 1) == Some(&b'\'') {
+                        value.push('\''); // escaped quote; string continues
+                        self.pos += 2;
+                        segment_start = self.pos;
+                    } else {
+                        self.pos += 1; // closing quote
+                        return Ok(SpannedToken {
+                            token: Token::StrLit(value),
+                            span: Span { start, end: self.pos },
+                        });
+                    }
+                }
+                Some(_) => self.pos += 1,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
