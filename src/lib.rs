@@ -16,7 +16,6 @@ pub mod wal;
 pub mod metadata;
 pub mod sql;
 pub mod vm;
-pub mod planner;
 pub mod compiler;
 
 pub use crate::engine::{CollectionConfig, Db, DbOptions};
