@@ -96,7 +96,10 @@ pub enum Token {
     Eq,
     /// `-` (a standalone token; sign is a parser concern — decision (2)).
     Minus,
-    // EXTEND: future operators (Star, Lt, Gt, Le, Ge, Ne, …) get a variant
+    /// `*` — the `SELECT *` wildcard. Core V-SQL, so it is a real token even
+    /// though none of the three bootstrap statements use it.
+    Star,
+    // EXTEND: future operators (Lt, Gt, Le, Ge, Ne, …) get a variant
     // here AND a match arm in `next_token` — nothing else changes.
 
     /// End of input. Always the final token in a successful stream.
@@ -274,7 +277,8 @@ impl<'a> Lexer<'a> {
             // `--` line comment was already eaten by `skip_trivia`. Sign is the
             // parser's job (design decision 2).
             b'-' => Ok(self.single(Token::Minus, start)),
-            // EXTEND: new single-char operators (Star `*`, Lt `<`, Gt `>`, …)
+            b'*' => Ok(self.single(Token::Star, start)),
+            // EXTEND: new single-char operators (Lt `<`, Gt `>`, …)
             // get a match arm here plus a `Token` variant.
             b'\'' => self.scan_string(start),
             _ if b.is_ascii_digit() => self.scan_number(start),
@@ -491,6 +495,11 @@ mod tests {
     }
 
     #[test]
+    fn star_is_a_token() {
+        assert_eq!(lex("*"), vec![Token::Star]);
+    }
+
+    #[test]
     fn integers_versus_floats() {
         assert_eq!(lex("768"), vec![Token::IntLit(768)]);
         assert_eq!(lex("1700000000"), vec![Token::IntLit(1700000000)]);
@@ -598,6 +607,20 @@ mod tests {
                 ident("x"),
                 Token::Comma,
                 ident("y"),
+                Token::From,
+                ident("docs"),
+                Token::Semicolon,
+            ]
+        );
+    }
+
+    #[test]
+    fn select_star_statement() {
+        assert_eq!(
+            lex("SELECT * FROM docs;"),
+            vec![
+                Token::Select,
+                Token::Star,
                 Token::From,
                 ident("docs"),
                 Token::Semicolon,

@@ -14,7 +14,10 @@ pub mod index;
 pub mod simd;
 pub mod wal;
 pub mod metadata;
-pub mod lexer;
+pub mod sql;
+pub mod vm;
+pub mod planner;
+pub mod compiler;
 
 pub use crate::engine::{CollectionConfig, Db, DbOptions};
 pub use crate::error::{Error, Result};

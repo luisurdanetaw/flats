@@ -1,0 +1,83 @@
+name: CI
+
+# Build, test, and bench every pull request (and pushes to main).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref so a force-push doesn't queue duplicates.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Fast, non-blocking style feedback ──────────────────────────────────────
+  # Kept OFF the critical path for now: `cargo fmt --check` currently flags
+  # benches/simd.rs and clippy has 6 known lints (module-inception, etc.).
+  # Flip `continue-on-error` to false once those are cleared to make them gates.
+  lint:
+    name: fmt + clippy (non-blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustc --version && cargo --version
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+        continue-on-error: true
+      - name: clippy
+        run: cargo clippy --all-targets --locked
+        continue-on-error: true
+
+  # ── Build → test → bench (the blocking pipeline) ───────────────────────────
+  build-test-bench:
+    name: build · test · bench
+    runs-on: ubuntu-latest
+    # chaos harness (~45s) + timed SWMR loops + release-mode benches. 25m is
+    # generous headroom; bump if the chaos iteration count grows.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustc --version && cargo --version
+
+      # Caches ~/.cargo and ./target keyed on Cargo.lock — big speedup on reruns.
+      # Purely a convenience; remove this step if you'd rather stay action-free.
+      - uses: Swatinem/rust-cache@v2
+
+      # 1. BUILD — compile the lib and *every* target (tests, benches) up front,
+      #    so a compile break surfaces before we spend time running anything.
+      #    --locked fails if Cargo.lock is stale (reproducible deps).
+      - name: Build (all targets)
+        run: cargo build --all-targets --locked
+
+      # 2. TEST — unit tests + all integration suites, auto-discovered from
+      #    tests/: chaos, reconciliation, swmr, index, simd_parity. Debug profile
+      #    (keeps debug_assert! live). Doctests run separately: --all-targets
+      #    deliberately excludes them, so cover them explicitly below.
+      - name: Test
+        run: cargo test --locked
+      - name: Doc tests
+        run: cargo test --doc --locked
+
+      # 3. BENCH — run the custom (harness = false) benches: simd + parallel_search.
+      #    On shared CI runners the throughput NUMBERS are noise; this is a smoke
+      #    run that proves the kernels + parallel search compile in release and
+      #    execute without panicking. Not a performance gate.
+      - name: Benches (smoke run)
+        run: cargo bench --locked
