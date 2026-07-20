@@ -121,91 +121,323 @@ pub fn parse(src: &str) -> Result<Statement, ParseError> {
     Ok(statement)
 }
 
-// The cursor primitives and one-per-rule functions. Bodies land in phase 7d;
-// `#[allow(dead_code)]` covers the helpers that nothing calls until then.
-#[allow(dead_code)]
 impl Parser {
     // -- cursor primitives -------------------------------------------------
 
-    /// The current token without consuming it. At/after end of input this is
-    /// `Token::Eof` (the stream always ends in one).
+    /// The current token without consuming it. The stream always ends in
+    /// `Token::Eof`, and the cursor never advances past it, so this is always
+    /// a valid token.
     fn peek(&self) -> &Token {
-        unimplemented!("phase 7d: parser logic")
+        &self.tokens[self.pos].token
     }
 
-    /// Consume and return the current spanned token, advancing the cursor.
+    /// Consume and return the current spanned token, advancing the cursor
+    /// (which stays pinned on the trailing `Eof` once reached).
     fn advance(&mut self) -> &SpannedToken {
-        unimplemented!("phase 7d: parser logic")
+        let i = self.pos;
+        if self.pos + 1 < self.tokens.len() {
+            self.pos += 1;
+        }
+        &self.tokens[i]
     }
 
-    /// Consume the current token, requiring it to equal `t`; error otherwise.
+    /// Build an error carrying the current token's span.
+    fn error(&self, kind: ParseErrorKind) -> ParseError {
+        ParseError {
+            kind,
+            span: self.tokens[self.pos].span,
+        }
+    }
+
+    /// Consume the current token, requiring it to equal `t`. Reaching `Eof`
+    /// while expecting something is [`ParseErrorKind::UnexpectedEof`]; a
+    /// different token present is [`ParseErrorKind::UnexpectedToken`].
     fn expect(&mut self, t: Token) -> Result<&SpannedToken, ParseError> {
-        unimplemented!("phase 7d: parser logic — expect {t:?}")
+        if *self.peek() == t {
+            Ok(self.advance())
+        } else if *self.peek() == Token::Eof {
+            Err(self.error(ParseErrorKind::UnexpectedEof))
+        } else {
+            let found = format!("{:?}", self.peek());
+            Err(self.error(ParseErrorKind::UnexpectedToken {
+                expected: format!("{t:?}"),
+                found,
+            }))
+        }
     }
 
     /// Consume an identifier token, returning its (source-case) text.
     fn expect_ident(&mut self) -> Result<String, ParseError> {
-        unimplemented!("phase 7d: parser logic")
+        let name = match self.peek() {
+            Token::Ident(s) => s.clone(),
+            Token::Eof => return Err(self.error(ParseErrorKind::UnexpectedEof)),
+            other => {
+                let found = format!("{other:?}");
+                return Err(self.error(ParseErrorKind::UnexpectedToken {
+                    expected: "identifier".to_string(),
+                    found,
+                }));
+            }
+        };
+        self.advance();
+        Ok(name)
+    }
+
+    /// Consume an integer-literal token, returning its value.
+    fn expect_int(&mut self) -> Result<i64, ParseError> {
+        let n = match self.peek() {
+            Token::IntLit(n) => *n,
+            Token::Eof => return Err(self.error(ParseErrorKind::UnexpectedEof)),
+            other => {
+                let found = format!("{other:?}");
+                return Err(self.error(ParseErrorKind::UnexpectedToken {
+                    expected: "integer literal".to_string(),
+                    found,
+                }));
+            }
+        };
+        self.advance();
+        Ok(n)
+    }
+
+    /// Consume a string-literal token, returning its (unescaped) contents.
+    fn expect_str(&mut self) -> Result<String, ParseError> {
+        let s = match self.peek() {
+            Token::StrLit(s) => s.clone(),
+            Token::Eof => return Err(self.error(ParseErrorKind::UnexpectedEof)),
+            other => {
+                let found = format!("{other:?}");
+                return Err(self.error(ParseErrorKind::UnexpectedToken {
+                    expected: "string literal".to_string(),
+                    found,
+                }));
+            }
+        };
+        self.advance();
+        Ok(s)
     }
 
     // -- one function per grammar rule -------------------------------------
 
     /// `statement := (select | insert | create) ';'`
     pub fn parse_statement(&mut self) -> Result<Statement, ParseError> {
-        unimplemented!("phase 7d: parser logic")
+        let stmt = match self.peek() {
+            Token::Select => Statement::Select(self.parse_select()?),
+            Token::Insert => Statement::Insert(self.parse_insert()?),
+            Token::Create => Statement::CreateCollection(self.parse_create()?),
+            // EXTEND: dispatch Search/Delete/Update on their leading keyword.
+            Token::Eof => return Err(self.error(ParseErrorKind::UnexpectedEof)),
+            _ => {
+                let found = format!("{:?}", self.peek());
+                return Err(self.error(ParseErrorKind::UnexpectedToken {
+                    expected: "SELECT, INSERT, or CREATE".to_string(),
+                    found,
+                }));
+            }
+        };
+        self.expect(Token::Semicolon)?;
+        Ok(stmt)
     }
 
     /// `select := SELECT projection FROM ident`
     fn parse_select(&mut self) -> Result<SelectStmt, ParseError> {
-        unimplemented!("phase 7d: parser logic")
+        self.expect(Token::Select)?;
+        let projection = self.parse_projection()?;
+        self.expect(Token::From)?;
+        let from = self.expect_ident()?;
+        Ok(SelectStmt { projection, from })
     }
 
     /// `projection := '*' | ident (',' ident)*`
     fn parse_projection(&mut self) -> Result<Projection, ParseError> {
-        unimplemented!("phase 7d: parser logic")
+        // `*` is left UNEXPANDED here — expanding it needs the catalog (and must
+        // honor "SELECT * does not return the embedding"), which is the planner's
+        // job, not the parser's.
+        if *self.peek() == Token::Star {
+            self.advance();
+            return Ok(Projection::Star);
+        }
+        let mut columns = vec![self.expect_ident()?];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            columns.push(self.expect_ident()?);
+        }
+        Ok(Projection::Columns(columns))
     }
 
     /// `create := CREATE COLLECTION ident '(' col_def (',' col_def)* ')' WITH '(' opt (',' opt)* ')'`
     fn parse_create(&mut self) -> Result<CreateStmt, ParseError> {
-        unimplemented!("phase 7d: parser logic")
+        self.expect(Token::Create)?;
+        self.expect(Token::Collection)?;
+        let name = self.expect_ident()?;
+
+        self.expect(Token::LParen)?;
+        let mut columns = vec![self.parse_col_def()?];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            columns.push(self.parse_col_def()?);
+        }
+        self.expect(Token::RParen)?;
+
+        self.expect(Token::With)?;
+        self.expect(Token::LParen)?;
+        let mut options = vec![self.parse_opt()?];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            options.push(self.parse_opt()?);
+        }
+        self.expect(Token::RParen)?;
+
+        Ok(CreateStmt {
+            name,
+            columns,
+            options,
+        })
     }
 
     /// `col_def := ident type`
     fn parse_col_def(&mut self) -> Result<ColumnDef, ParseError> {
-        unimplemented!("phase 7d: parser logic")
+        let name = self.expect_ident()?;
+        let ty = self.parse_type()?;
+        Ok(ColumnDef { name, ty })
     }
 
     /// `type := VECTOR '(' int_lit ')' | TEXT | INT | FLOAT`.
     /// Type names arrive as `Ident` (not keywords); resolved here BY POSITION,
     /// case-insensitively. An unknown word => [`ParseErrorKind::UnknownType`].
     fn parse_type(&mut self) -> Result<ColumnType, ParseError> {
-        unimplemented!("phase 7d: parser logic")
+        // Capture the type word's span before consuming it, so an UnknownType
+        // error points at the word rather than the token after it.
+        let span = self.tokens[self.pos].span;
+        let word = self.expect_ident()?;
+        match word.to_ascii_uppercase().as_str() {
+            "VECTOR" => {
+                self.expect(Token::LParen)?;
+                let dim = self.expect_int()?;
+                self.expect(Token::RParen)?;
+                match usize::try_from(dim) {
+                    Ok(d) => Ok(ColumnType::Vector(d)),
+                    Err(_) => Err(ParseError {
+                        kind: ParseErrorKind::UnknownType(word),
+                        span,
+                    }),
+                }
+            }
+            "TEXT" => Ok(ColumnType::Text),
+            "INT" => Ok(ColumnType::Int),
+            "FLOAT" => Ok(ColumnType::Float),
+            _ => Err(ParseError {
+                kind: ParseErrorKind::UnknownType(word),
+                span,
+            }),
+        }
     }
 
     /// `opt := ident '=' int_lit`
     fn parse_opt(&mut self) -> Result<CollectionOption, ParseError> {
-        unimplemented!("phase 7d: parser logic")
+        let name = self.expect_ident()?;
+        self.expect(Token::Eq)?;
+        let value = self.expect_int()?;
+        Ok(CollectionOption { name, value })
     }
 
     /// `insert := INSERT INTO ident '(' ident (',' ident)* ')' VALUES '(' literal (',' literal)* ')'`
     fn parse_insert(&mut self) -> Result<InsertStmt, ParseError> {
-        unimplemented!("phase 7d: parser logic")
+        self.expect(Token::Insert)?;
+        self.expect(Token::Into)?;
+        let collection = self.expect_ident()?;
+
+        self.expect(Token::LParen)?;
+        let mut columns = vec![self.expect_ident()?];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            columns.push(self.expect_ident()?);
+        }
+        self.expect(Token::RParen)?;
+
+        self.expect(Token::Values)?;
+        self.expect(Token::LParen)?;
+        let mut values = vec![self.parse_literal()?];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            values.push(self.parse_literal()?);
+        }
+        self.expect(Token::RParen)?;
+
+        // NOTE: no check that columns.len() == values.len() — a count mismatch
+        // is a semantic error the planner catches, not a syntax error.
+        Ok(InsertStmt {
+            collection,
+            columns,
+            values,
+        })
     }
 
     /// `literal := vector_lit | str_lit | number`
     fn parse_literal(&mut self) -> Result<Literal, ParseError> {
-        unimplemented!("phase 7d: parser logic")
+        match self.peek() {
+            Token::LBracket => Ok(Literal::Vector(self.parse_vector_lit()?)),
+            Token::StrLit(_) => Ok(Literal::Str(self.expect_str()?)),
+            Token::Minus | Token::IntLit(_) | Token::FloatLit(_) => self.parse_number(),
+            Token::Eof => Err(self.error(ParseErrorKind::UnexpectedEof)),
+            _ => {
+                let found = format!("{:?}", self.peek());
+                Err(self.error(ParseErrorKind::UnexpectedToken {
+                    expected: "literal".to_string(),
+                    found,
+                }))
+            }
+        }
     }
 
     /// `vector_lit := '[' number (',' number)* ']'` — elements coerced to `f32`.
     fn parse_vector_lit(&mut self) -> Result<Vec<f32>, ParseError> {
-        unimplemented!("phase 7d: parser logic")
+        self.expect(Token::LBracket)?;
+        let mut elems = vec![self.parse_vector_elem()?];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            elems.push(self.parse_vector_elem()?);
+        }
+        self.expect(Token::RBracket)?;
+        Ok(elems)
+    }
+
+    /// A single vector element: a `number` coerced to `f32`.
+    fn parse_vector_elem(&mut self) -> Result<f32, ParseError> {
+        match self.parse_number()? {
+            Literal::Int(n) => Ok(n as f32),
+            Literal::Float(f) => Ok(f as f32),
+            // parse_number only ever yields Int or Float; stay exhaustive
+            // without panicking.
+            Literal::Vector(_) | Literal::Str(_) => Err(self.error(ParseErrorKind::UnexpectedToken {
+                expected: "number".to_string(),
+                found: "non-numeric literal".to_string(),
+            })),
+        }
     }
 
     /// `number := '-'? (int_lit | float_lit)` — the parser applies the sign
-    /// (the lexer emits `-` as a separate `Minus` token).
+    /// (the lexer emits `-` as a separate `Minus` token). The lexed magnitude
+    /// always fits, so negation cannot overflow.
     fn parse_number(&mut self) -> Result<Literal, ParseError> {
-        unimplemented!("phase 7d: parser logic")
+        let negative = *self.peek() == Token::Minus;
+        if negative {
+            self.advance();
+        }
+        let lit = match self.peek() {
+            Token::IntLit(n) => Literal::Int(if negative { -*n } else { *n }),
+            Token::FloatLit(f) => Literal::Float(if negative { -*f } else { *f }),
+            Token::Eof => return Err(self.error(ParseErrorKind::UnexpectedEof)),
+            other => {
+                let found = format!("{other:?}");
+                return Err(self.error(ParseErrorKind::UnexpectedToken {
+                    expected: "number".to_string(),
+                    found,
+                }));
+            }
+        };
+        self.advance();
+        Ok(lit)
     }
 
     // EXTEND: `fn parse_expr(&mut self) -> Result<Expr, ParseError>` (WHERE)
