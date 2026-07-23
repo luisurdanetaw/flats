@@ -38,7 +38,38 @@ pub use crate::wal::wal::Lsn;
 /// Stable identifier for a column within a collection's schema.
 /// Using an id instead of a String on the hot path avoids hashing strings
 /// on every insert. The schema owns the name→id mapping.
+///
+/// This is the SCALAR-ONLY numbering (dense `0..N`, vector excluded) that the
+/// tuple store and metadata index address by — distinct from a
+/// [`DeclarationOrdinal`], which is vector-inclusive.
 pub type ColumnId = u32;
+
+/// A column's position in the VECTOR-INCLUSIVE declaration numbering — the
+/// numbering the query binder/plan speak, where the vector is "just a column."
+///
+/// A distinct newtype (not a bare `usize`) so a declaration ordinal can never be
+/// silently passed where a scalar [`ColumnId`] is expected, or vice versa: the
+/// two ordinal spaces do not interconvert by positional arithmetic (a vector
+/// anywhere but last shifts them apart), so the type system must keep them
+/// apart. Serde-transparent: a newtype struct serializes as its inner `usize`,
+/// so persisting these fields is wire-identical to the old raw `usize` — no
+/// format bump.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct DeclarationOrdinal(usize);
+
+impl DeclarationOrdinal {
+    /// Wrap a raw declaration-order index (e.g. a plan-supplied ordinal).
+    pub fn new(ordinal: usize) -> Self {
+        DeclarationOrdinal(ordinal)
+    }
+
+    /// The underlying declaration-order index.
+    pub fn get(self) -> usize {
+        self.0
+    }
+}
 
 /// The three primitive column types Phase 4 supports.
 /// NULL, arrays, etc. are explicit non-goals.
@@ -143,7 +174,7 @@ pub struct ColumnDef {
     /// Declaration ordinal in the VECTOR-INCLUSIVE numbering — this column's
     /// position among ALL columns (vector included), the numbering the query
     /// binder/plan use. ADDITIONAL to `id`, never a replacement.
-    pub ordinal: usize,
+    pub ordinal: DeclarationOrdinal,
 }
 
 /// The single vector column's persisted layout. The embedding lives in the flat
@@ -156,7 +187,7 @@ pub struct VectorColumn {
     /// Column name (e.g. `vector`).
     pub name: String,
     /// Declaration ordinal in the VECTOR-INCLUSIVE numbering.
-    pub ordinal: usize,
+    pub ordinal: DeclarationOrdinal,
     /// Embedding dimension (≥ 1 by construction).
     pub dim: NonZeroUsize,
 }
@@ -178,6 +209,28 @@ pub enum ColumnSpec {
         /// Column name.
         name: String,
         /// Embedding dimension.
+        dim: NonZeroUsize,
+    },
+}
+
+/// Where a [`DeclarationOrdinal`] resolves to in physical storage — the single,
+/// indivisible answer to "is this column the vector, and if not, which
+/// [`ColumnId`]?". Returned by [`Schema::locate`].
+///
+/// One enum (rather than paired `is_vector` / `column_id` accessors) so a caller
+/// cannot check "is it the vector?" and forget "which ColumnId?" — the match
+/// forces both to be handled together. The two arms are the two disjoint
+/// storage locations: scalars live in the tuple store / metadata index (by
+/// `ColumnId`); the embedding lives in the flat vector index (by `dim`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnLocation {
+    /// A scalar column, addressed by this `ColumnId` in the tuple store and
+    /// metadata index. Read straight from the schema — never recomputed.
+    Scalar(ColumnId),
+    /// The vector column, whose embedding lives in the flat vector index. Carries
+    /// the dimension from the total [`Schema::vector`].
+    Vector {
+        /// Embedding dimension (≥ 1 by construction).
         dim: NonZeroUsize,
     },
 }
@@ -211,6 +264,7 @@ impl Schema {
         let mut seen = std::collections::HashSet::new();
         let mut vector = None;
         for (ordinal, spec) in cols.into_iter().enumerate() {
+            let ordinal = DeclarationOrdinal::new(ordinal);
             match spec {
                 ColumnSpec::Scalar { name, ty } => {
                     if !seen.insert(name.clone()) {
@@ -268,6 +322,32 @@ impl Schema {
     pub fn column(&self, id: ColumnId) -> Option<&ColumnDef> {
         // columns[i].id == i by construction, so the id IS the index.
         self.columns.get(id as usize)
+    }
+
+    /// Resolve a PLAN DECLARATION ORDINAL to its physical storage location.
+    ///
+    /// This is the compiler's one lookup from the vector-inclusive numbering the
+    /// plan speaks to the physical addresses the engine speaks: a scalar's stored
+    /// [`ColumnId`] (tuple store / metadata index) or the vector's `dim` (flat
+    /// index). It only READS what [`from_columns`](Self::from_columns) already
+    /// assigned — it does no counting, filtering, or positional arithmetic to
+    /// derive a `ColumnId` (the vector may sit anywhere, so the two spaces do not
+    /// interconvert positionally; the stored `id` is the sole source).
+    ///
+    /// Total over the valid domain: every declaration ordinal `0..N` resolves to
+    /// exactly one column. An out-of-range or otherwise unknown ordinal returns
+    /// `None` rather than panicking — the compiler feeds plan-supplied ordinals
+    /// across a boundary and maps the `None` to its own error.
+    pub fn locate(&self, ordinal: DeclarationOrdinal) -> Option<ColumnLocation> {
+        if self.vector.ordinal == ordinal {
+            return Some(ColumnLocation::Vector {
+                dim: self.vector.dim,
+            });
+        }
+        self.columns
+            .iter()
+            .find(|def| def.ordinal == ordinal)
+            .map(|def| ColumnLocation::Scalar(def.id))
     }
 
     /// Validate a full row against this schema. Shared by MetadataIndex
@@ -352,10 +432,10 @@ mod tests {
         assert!(s.column(3).is_none());
         // Declaration ordinals are vector-inclusive: vector@0 shifts scalars to 1..
         assert_eq!(s.vector().name, "v");
-        assert_eq!(s.vector().ordinal, 0);
-        assert_eq!(s.column(0).unwrap().ordinal, 1); // a
-        assert_eq!(s.column(1).unwrap().ordinal, 2); // b
-        assert_eq!(s.column(2).unwrap().ordinal, 3); // c
+        assert_eq!(s.vector().ordinal.get(), 0);
+        assert_eq!(s.column(0).unwrap().ordinal.get(), 1); // a
+        assert_eq!(s.column(1).unwrap().ordinal.get(), 2); // b
+        assert_eq!(s.column(2).unwrap().ordinal.get(), 3); // c
     }
 
     #[test]
@@ -421,11 +501,96 @@ mod tests {
             },
         ])
         .unwrap();
-        assert_eq!(s.vector().ordinal, 1);
+        assert_eq!(s.vector().ordinal.get(), 1);
         assert_eq!(s.column(0).unwrap().name, "author");
-        assert_eq!(s.column(0).unwrap().ordinal, 0);
+        assert_eq!(s.column(0).unwrap().ordinal.get(), 0);
         assert_eq!(s.column(1).unwrap().name, "title");
-        assert_eq!(s.column(1).unwrap().ordinal, 2);
+        assert_eq!(s.column(1).unwrap().ordinal.get(), 2);
+    }
+
+    // -- locate(): plan declaration ordinal -> physical storage location ----
+
+    fn ord(n: usize) -> DeclarationOrdinal {
+        DeclarationOrdinal::new(n)
+    }
+
+    #[test]
+    fn locate_maps_each_declaration_ordinal_to_its_stored_location() {
+        // schema(): v@0 (dim 4), a@1 (id 0), b@2 (id 1), c@3 (id 2).
+        let s = schema();
+        let dim4 = NonZeroUsize::new(4).unwrap();
+        // The vector's declaration ordinal returns the Vector variant WITH dim,
+        // never a ColumnId.
+        assert_eq!(s.locate(ord(0)), Some(ColumnLocation::Vector { dim: dim4 }));
+        // Each scalar's declaration ordinal returns the ColumnId the schema
+        // STORED (read from def.id, not recomputed).
+        assert_eq!(s.locate(ord(1)), Some(ColumnLocation::Scalar(0)));
+        assert_eq!(s.locate(ord(2)), Some(ColumnLocation::Scalar(1)));
+        assert_eq!(s.locate(ord(3)), Some(ColumnLocation::Scalar(2)));
+    }
+
+    #[test]
+    fn locate_skips_the_vector_when_it_is_not_first() {
+        // [author, vector, title]: author id 0 @ decl 0, vector @ decl 1,
+        // title id 1 @ decl 2. Scalar ColumnIds are contiguous 0..N over the
+        // scalars ONLY and skip the vector; locate returns the right answer for
+        // each declaration ordinal.
+        let s = Schema::from_columns(vec![
+            ColumnSpec::Scalar {
+                name: "author".into(),
+                ty: ColumnType::Text,
+            },
+            ColumnSpec::Vector {
+                name: "vector".into(),
+                dim: NonZeroUsize::new(8).unwrap(),
+            },
+            ColumnSpec::Scalar {
+                name: "title".into(),
+                ty: ColumnType::Text,
+            },
+        ])
+        .unwrap();
+        let dim8 = NonZeroUsize::new(8).unwrap();
+        assert_eq!(s.locate(ord(0)), Some(ColumnLocation::Scalar(0))); // author
+        assert_eq!(s.locate(ord(1)), Some(ColumnLocation::Vector { dim: dim8 }));
+        assert_eq!(s.locate(ord(2)), Some(ColumnLocation::Scalar(1))); // title
+    }
+
+    #[test]
+    fn locate_out_of_range_ordinal_is_none() {
+        // schema() has declaration ordinals 0..=3; anything beyond is None —
+        // no panic, no wrong column.
+        let s = schema();
+        assert_eq!(s.locate(ord(4)), None);
+        assert_eq!(s.locate(ord(99)), None);
+    }
+
+    #[test]
+    fn scalar_column_ids_are_dense_over_scalars_only() {
+        // Contiguity guard: with the vector in the MIDDLE, scalar ColumnIds are
+        // still dense 0..N over the scalars alone, the vector excluded.
+        let s = Schema::from_columns(vec![
+            ColumnSpec::Scalar {
+                name: "a".into(),
+                ty: ColumnType::Int,
+            },
+            ColumnSpec::Vector {
+                name: "v".into(),
+                dim: NonZeroUsize::new(3).unwrap(),
+            },
+            ColumnSpec::Scalar {
+                name: "b".into(),
+                ty: ColumnType::Text,
+            },
+            ColumnSpec::Scalar {
+                name: "c".into(),
+                ty: ColumnType::Float,
+            },
+        ])
+        .unwrap();
+        let ids: Vec<ColumnId> = s.columns.iter().map(|d| d.id).collect();
+        assert_eq!(ids, vec![0, 1, 2]);
+        assert_eq!(s.columns.len(), 3); // vector is not among the scalar columns
     }
 
     #[test]
