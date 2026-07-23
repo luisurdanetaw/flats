@@ -21,7 +21,9 @@ pub mod common;
 pub mod index;
 pub mod tuples;
 
-pub use common::{ColumnId, ColumnType, Lsn, Ordinal, RangeOp, Row, Schema, Value};
+pub use common::{
+    ColumnId, ColumnSpec, ColumnType, Lsn, Ordinal, RangeOp, Row, Schema, Value, VectorColumn,
+};
 pub use index::MetadataIndex;
 pub use tuples::TupleStore;
 

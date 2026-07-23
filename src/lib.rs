@@ -16,10 +16,9 @@ pub mod wal;
 pub mod metadata;
 pub mod sql;
 pub mod vm;
-pub mod planner;
 pub mod compiler;
 
 pub use crate::engine::{CollectionConfig, Db, DbOptions};
 pub use crate::error::{Error, Result};
-pub use crate::metadata::{ColumnType, RangeOp, Row, Schema, Value};
+pub use crate::metadata::{ColumnSpec, ColumnType, RangeOp, Row, Schema, Value};
 pub use simd::dot;

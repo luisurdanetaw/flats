@@ -759,14 +759,28 @@ fn decode_snapshot(bytes: &[u8]) -> Result<(MetadataInner, Lsn)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::common::ColumnType;
+    use crate::metadata::common::{ColumnSpec, ColumnType};
+    use std::num::NonZeroUsize;
 
-    /// Schema used across tests: (a INT, b FLOAT, c TEXT).
+    /// Schema used across tests: (a INT, b FLOAT, c TEXT) alongside the vector.
     fn test_schema() -> Schema {
-        Schema::new(vec![
-            ("a".into(), ColumnType::Int),
-            ("b".into(), ColumnType::Float),
-            ("c".into(), ColumnType::Text),
+        Schema::from_columns(vec![
+            ColumnSpec::Vector {
+                name: "vector".into(),
+                dim: NonZeroUsize::new(1).unwrap(),
+            },
+            ColumnSpec::Scalar {
+                name: "a".into(),
+                ty: ColumnType::Int,
+            },
+            ColumnSpec::Scalar {
+                name: "b".into(),
+                ty: ColumnType::Float,
+            },
+            ColumnSpec::Scalar {
+                name: "c".into(),
+                ty: ColumnType::Text,
+            },
         ])
         .unwrap()
     }
@@ -1048,10 +1062,30 @@ mod tests {
     fn schema_mismatch_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let schema = Schema::new(vec![("a".into(), ColumnType::Int)]).unwrap();
+            let schema = Schema::from_columns(vec![
+                ColumnSpec::Vector {
+                    name: "vector".into(),
+                    dim: NonZeroUsize::new(1).unwrap(),
+                },
+                ColumnSpec::Scalar {
+                    name: "a".into(),
+                    ty: ColumnType::Int,
+                },
+            ])
+            .unwrap();
             let (_w, _r) = MetadataIndex::create(dir.path(), schema).unwrap();
         }
-        let other = Schema::new(vec![("a".into(), ColumnType::Text)]).unwrap();
+        let other = Schema::from_columns(vec![
+            ColumnSpec::Vector {
+                name: "vector".into(),
+                dim: NonZeroUsize::new(1).unwrap(),
+            },
+            ColumnSpec::Scalar {
+                name: "a".into(),
+                ty: ColumnType::Text,
+            },
+        ])
+        .unwrap();
         assert!(matches!(
             MetadataIndex::open(dir.path(), other),
             Err(Error::SchemaMismatch)

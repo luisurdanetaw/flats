@@ -377,13 +377,27 @@ fn decode_snapshot(bytes: &[u8]) -> Result<(TupleInner, Lsn)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::common::ColumnType;
+    use crate::metadata::common::{ColumnSpec, ColumnType};
+    use std::num::NonZeroUsize;
 
     fn test_schema() -> Schema {
-        Schema::new(vec![
-            ("a".into(), ColumnType::Int),
-            ("b".into(), ColumnType::Float),
-            ("c".into(), ColumnType::Text),
+        Schema::from_columns(vec![
+            ColumnSpec::Vector {
+                name: "vector".into(),
+                dim: NonZeroUsize::new(1).unwrap(),
+            },
+            ColumnSpec::Scalar {
+                name: "a".into(),
+                ty: ColumnType::Int,
+            },
+            ColumnSpec::Scalar {
+                name: "b".into(),
+                ty: ColumnType::Float,
+            },
+            ColumnSpec::Scalar {
+                name: "c".into(),
+                ty: ColumnType::Text,
+            },
         ])
         .unwrap()
     }
