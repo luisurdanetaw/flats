@@ -45,7 +45,6 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -155,7 +154,7 @@ fn open_collection(dir: &Path, cfg: &CollectionConfig) -> Result<(CollectionWrit
     let (flat_w, flat_r) = if idx_path.exists() {
         FlatIndex::open(&idx_path)?
     } else {
-        FlatIndex::create(&idx_path, cfg.dim, cfg.capacity)?
+        FlatIndex::create(&idx_path, cfg.schema.vector().dim, cfg.capacity)?
     };
     // The metadata stores' open() treats a corrupt snapshot as "empty at
     // Lsn(0)" — the WAL replays them back to life. A corrupt store's 0 drags
@@ -709,9 +708,9 @@ impl Db {
         // never reach the durable WAL, or it would fail apply forever on every
         // replay. (The applier's own validation then never fires except on
         // version-skew/corruption.)
-        if vector.len() != coll.config.dim.get() {
+        if vector.len() != coll.config.schema.vector().dim.get() {
             return Err(Error::DimensionMismatch {
-                expected: coll.config.dim.get(),
+                expected: coll.config.schema.vector().dim.get(),
                 got: vector.len(),
             });
         }
@@ -784,13 +783,7 @@ impl Db {
     /// catalog). A *user*-repeated create errs here with `CollectionExists` —
     /// validation happens before anything reaches the WAL, like every other
     /// record.
-    pub fn create_collection(
-        &self,
-        name: &str,
-        dim: NonZeroUsize,
-        capacity: usize,
-        schema: Schema,
-    ) -> Result<u32> {
+    pub fn create_collection(&self, name: &str, capacity: usize, schema: Schema) -> Result<u32> {
         // Serialize DDL: the id assignment and name check below must not race
         // another create (creates are rare; a mutex is fine).
         let _ddl = self.ddl.lock().unwrap_or_else(|e| e.into_inner());
@@ -801,16 +794,11 @@ impl Db {
         if capacity == 0 {
             return Err(Error::InvalidCapacity);
         }
-        // Re-canonicalize the schema through its one sane constructor: this
-        // re-checks duplicate columns and normalizes ids/by_name even if the
-        // caller hand-assembled the struct.
-        let schema = Schema::new(
-            schema
-                .columns
-                .iter()
-                .map(|c| (c.name.clone(), c.ty))
-                .collect(),
-        )?;
+        // The schema carries the vector (name + declaration ordinal + dim) and
+        // every scalar, and is invalid-by-construction impossible via
+        // `Schema::from_columns`. Re-check in case the caller hand-assembled one
+        // and bypassed the constructor.
+        schema.validate()?;
         // `id` is the ordinal pseudo-column SEARCH returns — a stored column
         // by that name would collide with it in RETURNING.
         for col in &schema.columns {
@@ -829,7 +817,6 @@ impl Db {
         let config = CollectionConfig {
             id,
             name: name.to_string(),
-            dim,
             capacity,
             schema,
         };
@@ -927,6 +914,57 @@ impl Drop for Db {
 }
 
 // ---------------------------------------------------------------------------
+// Query frontend integration: the binder's catalog read path
+// ---------------------------------------------------------------------------
+
+/// Reconstruct the binder-shaped, VECTOR-INCLUSIVE schema from a collection's
+/// persisted metadata schema. The binder needs every column — the vector plus
+/// the scalars — in one ordinal space; this maps the storage schema (scalar
+/// `ColumnId` space + the separate vector) into it. The binder is unchanged;
+/// this adapter does all the conversion.
+fn bind_schema(schema: &Schema) -> crate::sql::bind::Schema {
+    use crate::metadata::common::ColumnType;
+    use crate::sql::ast::ColumnType as AstType;
+    use crate::sql::bind::ColumnSchema;
+
+    let v = schema.vector();
+    let mut columns = Vec::with_capacity(schema.columns.len() + 1);
+    columns.push(ColumnSchema {
+        name: v.name.clone(),
+        ty: AstType::Vector(v.dim.get()),
+        ordinal: v.ordinal,
+        is_vector: true,
+    });
+    for def in &schema.columns {
+        columns.push(ColumnSchema {
+            name: def.name.clone(),
+            ty: match def.ty {
+                ColumnType::Int => AstType::Int,
+                ColumnType::Float => AstType::Float,
+                ColumnType::Text => AstType::Text,
+            },
+            ordinal: def.ordinal,
+            is_vector: false,
+        });
+    }
+    // Declaration order — the binder indexes projections by these ordinals.
+    columns.sort_by_key(|c| c.ordinal);
+    crate::sql::bind::Schema { columns }
+}
+
+/// The engine IS the binder's catalog: resolve a collection name to its
+/// binder-shaped [`Schema`](crate::sql::bind::Schema). This is the real read
+/// path that replaces the test-only fixture — the binder consumes it unchanged.
+impl crate::sql::bind::Catalog for Db {
+    fn get_collection(&self, name: &str) -> Option<crate::sql::bind::Schema> {
+        catalog_snapshot(&self.catalog)
+            .values()
+            .find(|c| c.config.name == name)
+            .map(|c| bind_schema(&c.config.schema))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 
@@ -940,33 +978,55 @@ fn to_io(e: Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::common::{ColumnDef, ColumnType, RangeOp, Value};
+    use crate::metadata::common::{ColumnDef, ColumnSpec, ColumnType, RangeOp, Value};
     use crate::metadata::tuples::RowGet;
+    use std::num::NonZeroUsize;
 
     /// Vector-only collection: empty schema, inserts pass an empty row.
     fn cfg(id: u32, dim: usize, capacity: usize) -> CollectionConfig {
         CollectionConfig {
             id,
             name: format!("c{id}"),
-            dim: NonZeroUsize::new(dim).unwrap(),
             capacity,
-            schema: Schema::new(vec![]).unwrap(),
+            schema: Schema::from_columns(vec![ColumnSpec::Vector {
+                name: "vector".into(),
+                dim: NonZeroUsize::new(dim).unwrap(),
+            }])
+            .unwrap(),
         }
     }
 
-    /// Collection with a metadata schema: (a INT, c TEXT).
+    /// Collection with a metadata schema: (a INT, c TEXT) alongside the vector.
     fn cfg_meta(id: u32, dim: usize, capacity: usize) -> CollectionConfig {
         CollectionConfig {
             id,
             name: format!("c{id}"),
-            dim: NonZeroUsize::new(dim).unwrap(),
             capacity,
-            schema: Schema::new(vec![
-                ("a".into(), ColumnType::Int),
-                ("c".into(), ColumnType::Text),
+            schema: Schema::from_columns(vec![
+                ColumnSpec::Vector {
+                    name: "vector".into(),
+                    dim: NonZeroUsize::new(dim).unwrap(),
+                },
+                ColumnSpec::Scalar {
+                    name: "a".into(),
+                    ty: ColumnType::Int,
+                },
+                ColumnSpec::Scalar {
+                    name: "c".into(),
+                    ty: ColumnType::Text,
+                },
             ])
             .unwrap(),
         }
+    }
+
+    /// A vector-only schema (no scalar columns), embedding dim `dim`.
+    fn vec_only(dim: usize) -> Schema {
+        Schema::from_columns(vec![ColumnSpec::Vector {
+            name: "vector".into(),
+            dim: NonZeroUsize::new(dim).unwrap(),
+        }])
+        .unwrap()
     }
 
     fn meta_row(a: i64, c: &str) -> Row {
@@ -1424,10 +1484,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(dir.path(), &[], manual_opts()).unwrap();
 
-        let schema = Schema::new(vec![("a".into(), ColumnType::Int)]).unwrap();
-        let id = db
-            .create_collection("docs", NonZeroUsize::new(3).unwrap(), 16, schema)
-            .unwrap();
+        let schema = Schema::from_columns(vec![
+            ColumnSpec::Vector {
+                name: "vector".into(),
+                dim: NonZeroUsize::new(3).unwrap(),
+            },
+            ColumnSpec::Scalar {
+                name: "a".into(),
+                ty: ColumnType::Int,
+            },
+        ])
+        .unwrap();
+        let id = db.create_collection("docs", 16, schema).unwrap();
         assert_eq!(id, 0, "first collection gets id 0");
 
         db.insert(id, &[1.0, 0.0, 0.0], vec![(0, Value::Int(7))]).unwrap();
@@ -1459,9 +1527,18 @@ mod tests {
         let config = CollectionConfig {
             id: 0,
             name: "docs".into(),
-            dim: NonZeroUsize::new(2).unwrap(),
             capacity: 8,
-            schema: Schema::new(vec![("a".into(), ColumnType::Int)]).unwrap(),
+            schema: Schema::from_columns(vec![
+                ColumnSpec::Vector {
+                    name: "vector".into(),
+                    dim: NonZeroUsize::new(2).unwrap(),
+                },
+                ColumnSpec::Scalar {
+                    name: "a".into(),
+                    ty: ColumnType::Int,
+                },
+            ])
+            .unwrap(),
         };
         {
             let wal = Wal::start(&wal_path, LogOnly, 0).unwrap();
@@ -1486,14 +1563,12 @@ mod tests {
     fn duplicate_create_is_a_noop_on_replay() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(dir.path(), &[], manual_opts()).unwrap();
-        let id = db
-            .create_collection("docs", NonZeroUsize::new(2).unwrap(), 8, Schema::new(vec![]).unwrap())
-            .unwrap();
+        let id = db.create_collection("docs", 8, vec_only(2)).unwrap();
         db.insert(id, &[1.0, 0.0], vec![]).unwrap();
 
         // User-level repeat: caught before it ever reaches the WAL.
         assert!(matches!(
-            db.create_collection("docs", NonZeroUsize::new(2).unwrap(), 8, Schema::new(vec![]).unwrap()),
+            db.create_collection("docs", 8, vec_only(2)),
             Err(Error::CollectionExists { .. })
         ));
 
@@ -1521,33 +1596,53 @@ mod tests {
         let db = Db::open(dir.path(), &[], manual_opts()).unwrap();
 
         assert!(matches!(
-            db.create_collection("", NonZeroUsize::new(2).unwrap(), 8, Schema::new(vec![]).unwrap()),
+            db.create_collection("", 8, vec_only(2)),
             Err(Error::InvalidCollectionName)
         ));
         assert!(matches!(
-            db.create_collection("x", NonZeroUsize::new(2).unwrap(), 0, Schema::new(vec![]).unwrap()),
+            db.create_collection("x", 0, vec_only(2)),
             Err(Error::InvalidCapacity)
         ));
         // The `id` pseudo-column collides with SEARCH's ordinal column.
         assert!(matches!(
             db.create_collection(
                 "x",
-                NonZeroUsize::new(2).unwrap(),
                 8,
-                Schema::new(vec![("id".into(), ColumnType::Int)]).unwrap(),
+                Schema::from_columns(vec![
+                    ColumnSpec::Vector {
+                        name: "vector".into(),
+                        dim: NonZeroUsize::new(2).unwrap(),
+                    },
+                    ColumnSpec::Scalar {
+                        name: "id".into(),
+                        ty: ColumnType::Int,
+                    },
+                ])
+                .unwrap(),
             ),
             Err(Error::ReservedColumn(_))
         ));
-        // A hand-built Schema bypassing the `Schema::new` constructor still
-        // gets caught — create_collection re-canonicalizes it.
-        let mut sneaky = Schema::new(vec![("a".into(), ColumnType::Int)]).unwrap();
+        // A hand-built Schema bypassing the `Schema::from_columns` constructor
+        // still gets caught — create_collection re-validates it.
+        let mut sneaky = Schema::from_columns(vec![
+            ColumnSpec::Vector {
+                name: "vector".into(),
+                dim: NonZeroUsize::new(2).unwrap(),
+            },
+            ColumnSpec::Scalar {
+                name: "a".into(),
+                ty: ColumnType::Int,
+            },
+        ])
+        .unwrap();
         sneaky.columns.push(ColumnDef {
             id: 1,
             name: "a".into(),
             ty: ColumnType::Text,
+            ordinal: 2,
         });
         assert!(matches!(
-            db.create_collection("x", NonZeroUsize::new(2).unwrap(), 8, sneaky),
+            db.create_collection("x", 8, sneaky),
             Err(Error::DuplicateColumn(_))
         ));
 
@@ -1555,10 +1650,144 @@ mod tests {
 
         // No id was burned by the failed attempts: the first real create
         // still gets id 0.
-        let id = db
-            .create_collection("real", NonZeroUsize::new(2).unwrap(), 8, Schema::new(vec![]).unwrap())
-            .unwrap();
+        let id = db.create_collection("real", 8, vec_only(2)).unwrap();
         assert_eq!(id, 0);
+        db.close().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 7g.1: full schema on disk + the binder's real catalog read path
+    // -----------------------------------------------------------------------
+
+    /// The full schema — vector name/ordinal/dim + every scalar
+    /// name/id/ordinal/type — survives persist + reopen, reconstructed from
+    /// disk alone. The scalar ColumnId space stays dense 0..N (vector excluded);
+    /// declaration ordinals are vector-inclusive.
+    #[test]
+    fn full_schema_round_trips_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        // Vector deliberately NOT first: [author@0, embedding@1, year@2].
+        let schema = Schema::from_columns(vec![
+            ColumnSpec::Scalar {
+                name: "author".into(),
+                ty: ColumnType::Text,
+            },
+            ColumnSpec::Vector {
+                name: "embedding".into(),
+                dim: NonZeroUsize::new(16).unwrap(),
+            },
+            ColumnSpec::Scalar {
+                name: "year".into(),
+                ty: ColumnType::Int,
+            },
+        ])
+        .unwrap();
+        let cfg0 = CollectionConfig {
+            id: 0,
+            name: "docs".into(),
+            capacity: 8,
+            schema,
+        };
+        {
+            let db = Db::open(dir.path(), std::slice::from_ref(&cfg0), manual_opts()).unwrap();
+            db.close().unwrap();
+        }
+        // Reopen with NO configs: the collection re-emerges from catalog.snap.
+        let db = Db::open(dir.path(), &[], manual_opts()).unwrap();
+        assert_eq!(db.collections(), vec![cfg0]);
+        let s = &db.collections()[0].schema;
+        // Vector: name + declaration ordinal + dim.
+        assert_eq!(s.vector().name, "embedding");
+        assert_eq!(s.vector().ordinal, 1);
+        assert_eq!(s.vector().dim.get(), 16);
+        // Scalars: ColumnId dense 0..N (vector excluded); ordinals vector-inclusive.
+        assert_eq!(s.columns.len(), 2);
+        assert_eq!(
+            (s.columns[0].id, s.columns[0].name.as_str(), s.columns[0].ordinal),
+            (0, "author", 0)
+        );
+        assert_eq!(
+            (s.columns[1].id, s.columns[1].name.as_str(), s.columns[1].ordinal),
+            (1, "year", 2)
+        );
+        db.close().unwrap();
+    }
+
+    /// The engine satisfies the binder's `Catalog` trait, and the binder
+    /// consumes the REAL schema with zero binder changes.
+    #[test]
+    fn engine_is_a_binder_catalog_and_binder_consumes_it() {
+        use crate::sql::bind::{BoundStatement, Catalog, analyze};
+        use crate::sql::parse;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[], manual_opts()).unwrap();
+        // docs: vector VECTOR(768) @0, author TEXT @1, title TEXT @2.
+        let schema = Schema::from_columns(vec![
+            ColumnSpec::Vector {
+                name: "vector".into(),
+                dim: NonZeroUsize::new(768).unwrap(),
+            },
+            ColumnSpec::Scalar {
+                name: "author".into(),
+                ty: ColumnType::Text,
+            },
+            ColumnSpec::Scalar {
+                name: "title".into(),
+                ty: ColumnType::Text,
+            },
+        ])
+        .unwrap();
+        db.create_collection("docs", 1_000_000, schema).unwrap();
+
+        // Read the binder-shaped schema back through the trait.
+        let bound = Catalog::get_collection(&db, "docs").expect("collection exists");
+        assert_eq!(bound.columns.len(), 3);
+        assert!(bound.columns[0].is_vector);
+        assert_eq!(
+            bound
+                .columns
+                .iter()
+                .map(|c| (c.name.as_str(), c.ordinal, c.is_vector))
+                .collect::<Vec<_>>(),
+            vec![
+                ("vector", 0, true),
+                ("author", 1, false),
+                ("title", 2, false),
+            ]
+        );
+        assert!(Catalog::get_collection(&db, "ghost").is_none());
+
+        // The binder resolves queries against the REAL engine catalog.
+        match analyze(parse("SELECT author, title FROM docs;").unwrap(), &db).unwrap() {
+            BoundStatement::Select(sel) => {
+                assert_eq!(sel.from, "docs");
+                assert_eq!(
+                    sel.projection
+                        .iter()
+                        .map(|c| (c.name.as_str(), c.ordinal))
+                        .collect::<Vec<_>>(),
+                    vec![("author", 1), ("title", 2)]
+                );
+                assert!(!sel.include_vector);
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+        // SELECT * excludes the embedding; naming the vector includes it.
+        match analyze(parse("SELECT * FROM docs;").unwrap(), &db).unwrap() {
+            BoundStatement::Select(sel) => {
+                assert_eq!(
+                    sel.projection.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                    vec!["author".to_string(), "title".to_string()]
+                );
+                assert!(!sel.include_vector);
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+        match analyze(parse("SELECT vector FROM docs;").unwrap(), &db).unwrap() {
+            BoundStatement::Select(sel) => assert!(sel.include_vector),
+            other => panic!("expected Select, got {other:?}"),
+        }
         db.close().unwrap();
     }
 }

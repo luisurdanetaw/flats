@@ -862,11 +862,20 @@ mod tests {
                 config: CollectionConfig {
                     id: 4,
                     name: "docs".into(),
-                    dim: std::num::NonZeroUsize::new(768).unwrap(),
                     capacity: 1_000_000,
-                    schema: crate::metadata::common::Schema::new(vec![
-                        ("author".into(), crate::metadata::common::ColumnType::Text),
-                        ("year".into(), crate::metadata::common::ColumnType::Int),
+                    schema: crate::metadata::common::Schema::from_columns(vec![
+                        crate::metadata::common::ColumnSpec::Vector {
+                            name: "vector".into(),
+                            dim: std::num::NonZeroUsize::new(768).unwrap(),
+                        },
+                        crate::metadata::common::ColumnSpec::Scalar {
+                            name: "author".into(),
+                            ty: crate::metadata::common::ColumnType::Text,
+                        },
+                        crate::metadata::common::ColumnSpec::Scalar {
+                            name: "year".into(),
+                            ty: crate::metadata::common::ColumnType::Int,
+                        },
                     ])
                     .unwrap(),
                 },

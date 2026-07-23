@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flats::index::index::Ordinal;
 use flats::metadata::tuples::RowGet;
-use flats::{ColumnType, CollectionConfig, Db, DbOptions, RangeOp, Row, Schema, Value};
+use flats::{ColumnSpec, ColumnType, CollectionConfig, Db, DbOptions, RangeOp, Row, Schema, Value};
 
 /// xorshift64* — tiny, deterministic, good enough to drive the op stream.
 struct Rng(u64);
@@ -119,10 +119,23 @@ fn random_row(rng: &mut Rng, vector: Vec<f32>) -> ModelRow {
 }
 
 fn schema() -> Schema {
-    Schema::new(vec![
-        ("a".into(), ColumnType::Int),
-        ("b".into(), ColumnType::Float),
-        ("c".into(), ColumnType::Text),
+    Schema::from_columns(vec![
+        ColumnSpec::Vector {
+            name: "vector".into(),
+            dim: std::num::NonZeroUsize::new(DIM).unwrap(),
+        },
+        ColumnSpec::Scalar {
+            name: "a".into(),
+            ty: ColumnType::Int,
+        },
+        ColumnSpec::Scalar {
+            name: "b".into(),
+            ty: ColumnType::Float,
+        },
+        ColumnSpec::Scalar {
+            name: "c".into(),
+            ty: ColumnType::Text,
+        },
     ])
     .unwrap()
 }
@@ -131,7 +144,6 @@ fn cfgs() -> Vec<CollectionConfig> {
     vec![CollectionConfig {
         id: 0,
         name: "chaos".into(),
-        dim: std::num::NonZeroUsize::new(DIM).unwrap(),
         capacity: CAPACITY as usize,
         schema: schema(),
     }]

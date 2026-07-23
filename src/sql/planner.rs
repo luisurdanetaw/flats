@@ -26,39 +26,53 @@
 //! signature here is stable.
 
 use crate::sql::bind::{BoundCreate, BoundInsert, BoundSelect, BoundStatement};
-use crate::sql::plan::LogicalPlan;
+use crate::sql::plan::{CreateCollection, Insert, LogicalPlan, Project, Scan};
 
 /// Build the [`LogicalPlan`] for an already-bound statement. Infallible: the
 /// binder validated everything, so this only reshapes statement-shaped IR into
 /// the algebra tree.
-pub fn plan(_bound: BoundStatement) -> LogicalPlan {
-    // 7g: dispatch on `_bound` to plan_select / plan_insert / plan_create and
-    // build the tree. A single unimplemented site keeps the RED failure reason
-    // uniform across every planner test.
-    unimplemented!("phase 7g: planner logic")
+pub fn plan(bound: BoundStatement) -> LogicalPlan {
+    match bound {
+        BoundStatement::Select(s) => plan_select(s),
+        BoundStatement::Insert(i) => plan_insert(i),
+        BoundStatement::CreateCollection(c) => plan_create(c),
+        // EXTEND: Search -> Knn, Delete/Update -> their own nodes.
+    }
 }
 
-// Per-variant helpers, stubbed for 7g (uncalled until the dispatch lands, hence
-// `#[allow(dead_code)]`). Signatures are stable.
+// Per-variant shape transforms. Each carries the binder's resolved fields
+// through unchanged — no catalog, no re-checks, no reordering.
 
 /// `BoundSelect` → `Project` wrapping a `Scan`, carrying the bound projection
 /// and `include_vector` through unchanged.
-#[allow(dead_code)]
 fn plan_select(bound: BoundSelect) -> LogicalPlan {
-    unimplemented!("phase 7g: plan SELECT {bound:?}")
+    LogicalPlan::Project(Project {
+        input: Box::new(LogicalPlan::Scan(Scan {
+            collection: bound.from,
+            schema: bound.schema,
+        })),
+        columns: bound.projection,
+        include_vector: bound.include_vector,
+    })
 }
 
 /// `BoundInsert` → `Insert`, carrying collection/schema/row through (the row is
 /// already in schema order from the binder; the planner does not reorder).
-#[allow(dead_code)]
 fn plan_insert(bound: BoundInsert) -> LogicalPlan {
-    unimplemented!("phase 7g: plan INSERT {bound:?}")
+    LogicalPlan::Insert(Insert {
+        collection: bound.collection,
+        schema: bound.schema,
+        row: bound.row,
+    })
 }
 
 /// `BoundCreate` → `CreateCollection`, carrying name/schema/capacity through.
-#[allow(dead_code)]
 fn plan_create(bound: BoundCreate) -> LogicalPlan {
-    unimplemented!("phase 7g: plan CREATE {bound:?}")
+    LogicalPlan::CreateCollection(CreateCollection {
+        name: bound.name,
+        schema: bound.schema,
+        capacity: bound.capacity,
+    })
 }
 
 #[cfg(test)]

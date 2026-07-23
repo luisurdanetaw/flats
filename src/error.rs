@@ -78,6 +78,11 @@ pub enum Error {
     #[error("duplicate column in schema: {0}")]
     DuplicateColumn(String),
 
+    /// A schema must declare exactly one VECTOR column — every collection is
+    /// provisioned with exactly one flat vector index.
+    #[error("schema must have exactly one vector column, found {found}")]
+    VectorColumnCount { found: usize },
+
     /// Snapshot file exists but failed magic/version/CRC checks.
     /// Phase 4a/4b policy: `open()` swallows this internally ("start empty at
     /// lsn 0, WAL replay rebuilds") — the variant exists for the cases that

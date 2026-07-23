@@ -103,11 +103,11 @@ pub struct CollectionConfig {
     pub id: u32,
     /// Human-facing name — what V-SQL will key on. Unique across the catalog.
     pub name: String,
-    pub dim: NonZeroUsize,
     pub capacity: usize,
-    /// The metadata schema. Every insert's row is validated against it BEFORE
-    /// logging. Vector-only collections use an empty schema
-    /// (`Schema::new(vec![])`) and insert with an empty row.
+    /// The full schema — the single vector column (name + declaration ordinal +
+    /// dim) AND every scalar. The vector's dim lives here (`schema.vector().dim`),
+    /// the single source of truth; there is no separate `dim` field. Every
+    /// insert's row is validated against the scalar columns BEFORE logging.
     pub schema: Schema,
 }
 
@@ -121,34 +121,148 @@ pub struct CollectionConfig {
 // it is simpler and the schema is tiny, so we just persist it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Schema {
-    /// ColumnId is the index into this Vec — i.e. columns[3].id == 3.
-    /// Keeping that invariant makes (de)serialization trivial.
+    /// The SCALAR columns. `ColumnId` is the index into this Vec — i.e.
+    /// columns[3].id == 3 — the scalar-only numbering the tuple store and
+    /// metadata index address by. The vector is NOT here (it has no `ColumnId`);
+    /// it lives in `vector`.
     pub columns: Vec<ColumnDef>,
-    /// name → id, built from `columns` at construction time.
+    /// The single vector column: name + declaration ordinal + dim. Every
+    /// collection has exactly one (one flat index), guaranteed at construction.
+    pub vector: VectorColumn,
+    /// scalar name → ColumnId, built from `columns` at construction time.
     pub by_name: HashMap<String, ColumnId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnDef {
+    /// Scalar-only ordinal — the tuple store / metadata index address (dense,
+    /// 0-based, in scalar declaration order). Its index in [`Schema::columns`].
     pub id: ColumnId,
     pub name: String,
     pub ty: ColumnType,
+    /// Declaration ordinal in the VECTOR-INCLUSIVE numbering — this column's
+    /// position among ALL columns (vector included), the numbering the query
+    /// binder/plan use. ADDITIONAL to `id`, never a replacement.
+    pub ordinal: usize,
+}
+
+/// The single vector column's persisted layout. The embedding lives in the flat
+/// vector index — not the tuple store / metadata index — so the vector has NO
+/// `ColumnId` (the scalar-only numbering those stores address by). It still
+/// records a NAME and a DECLARATION ORDINAL, so the vector-inclusive schema the
+/// query binder needs is reconstructable from disk alone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VectorColumn {
+    /// Column name (e.g. `vector`).
+    pub name: String,
+    /// Declaration ordinal in the VECTOR-INCLUSIVE numbering.
+    pub ordinal: usize,
+    /// Embedding dimension (≥ 1 by construction).
+    pub dim: NonZeroUsize,
+}
+
+/// One column of a [`Schema::from_columns`] declaration, in source order. A
+/// column's declaration ordinal is simply its index in the list passed to the
+/// constructor — the vector is "just a column that happens to be a vector."
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColumnSpec {
+    /// A scalar column (gets a dense scalar `ColumnId`).
+    Scalar {
+        /// Column name.
+        name: String,
+        /// Scalar type.
+        ty: ColumnType,
+    },
+    /// The vector column (gets NO `ColumnId`; the embedding is in the flat index).
+    Vector {
+        /// Column name.
+        name: String,
+        /// Embedding dimension.
+        dim: NonZeroUsize,
+    },
 }
 
 impl Schema {
-    /// Assign ids 0..n in declaration order and build the name→id map.
-    /// Duplicate names → Err(Error::DuplicateColumn).
-    pub fn new(defs: Vec<(String, ColumnType)>) -> Result<Self> {
-        let mut columns = Vec::with_capacity(defs.len());
-        let mut by_name = HashMap::with_capacity(defs.len());
-        for (id, (name, ty)) in defs.into_iter().enumerate() {
-            let id = id as ColumnId;
-            if by_name.insert(name.clone(), id).is_some() {
-                return Err(Error::DuplicateColumn(name));
-            }
-            columns.push(ColumnDef { id, name, ty });
+    /// Build a schema from its columns in DECLARATION ORDER. Derives both
+    /// numberings in a single pass:
+    ///
+    ///  * **declaration ordinal** = the column's index in `cols`
+    ///    (vector-inclusive; the numbering the query binder/plan use);
+    ///  * **scalar `ColumnId`** = a dense counter that advances ONLY on scalar
+    ///    columns, so scalars stay contiguous `0..N` and the vector receives no
+    ///    `ColumnId` (the tuple store / metadata index numbering is unperturbed).
+    ///
+    /// The storage invariant is enforced HERE, so an invalid schema is
+    /// unconstructable: exactly one vector column (else
+    /// [`Error::VectorColumnCount`]) and no duplicate names (else
+    /// [`Error::DuplicateColumn`]). `dim ≥ 1` is already guaranteed by
+    /// `NonZeroUsize` in [`ColumnSpec::Vector`].
+    pub fn from_columns(cols: Vec<ColumnSpec>) -> Result<Self> {
+        let vector_count = cols
+            .iter()
+            .filter(|c| matches!(c, ColumnSpec::Vector { .. }))
+            .count();
+        if vector_count != 1 {
+            return Err(Error::VectorColumnCount { found: vector_count });
         }
-        Ok(Schema { columns, by_name })
+
+        let mut columns = Vec::new();
+        let mut by_name = HashMap::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut vector = None;
+        for (ordinal, spec) in cols.into_iter().enumerate() {
+            match spec {
+                ColumnSpec::Scalar { name, ty } => {
+                    if !seen.insert(name.clone()) {
+                        return Err(Error::DuplicateColumn(name));
+                    }
+                    // ColumnId counts scalars only → contiguous, vector excluded.
+                    let id = columns.len() as ColumnId;
+                    by_name.insert(name.clone(), id);
+                    columns.push(ColumnDef {
+                        id,
+                        name,
+                        ty,
+                        ordinal,
+                    });
+                }
+                ColumnSpec::Vector { name, dim } => {
+                    if !seen.insert(name.clone()) {
+                        return Err(Error::DuplicateColumn(name));
+                    }
+                    vector = Some(VectorColumn { name, ordinal, dim });
+                }
+            }
+        }
+        // `vector_count == 1` above guarantees this is Some.
+        let vector = vector.ok_or(Error::VectorColumnCount { found: 0 })?;
+        Ok(Schema {
+            columns,
+            vector,
+            by_name,
+        })
+    }
+
+    /// The single vector column. Total — construction guaranteed exactly one
+    /// exists, so callers (e.g. the flat index reading `.dim`) never handle a
+    /// missing case.
+    pub fn vector(&self) -> &VectorColumn {
+        &self.vector
+    }
+
+    /// Re-check the no-duplicate-names invariant on a schema that may have been
+    /// hand-assembled (the fields are public). [`from_columns`](Self::from_columns)
+    /// already guarantees it; `create_collection` calls this to reject a caller
+    /// that bypassed the constructor.
+    pub fn validate(&self) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(self.vector.name.as_str());
+        for def in &self.columns {
+            if !seen.insert(def.name.as_str()) {
+                return Err(Error::DuplicateColumn(def.name.clone()));
+            }
+        }
+        Ok(())
     }
 
     pub fn column(&self, id: ColumnId) -> Option<&ColumnDef> {
@@ -201,12 +315,26 @@ impl Schema {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroUsize;
 
     fn schema() -> Schema {
-        Schema::new(vec![
-            ("a".into(), ColumnType::Int),
-            ("b".into(), ColumnType::Float),
-            ("c".into(), ColumnType::Text),
+        Schema::from_columns(vec![
+            ColumnSpec::Vector {
+                name: "v".into(),
+                dim: NonZeroUsize::new(4).unwrap(),
+            },
+            ColumnSpec::Scalar {
+                name: "a".into(),
+                ty: ColumnType::Int,
+            },
+            ColumnSpec::Scalar {
+                name: "b".into(),
+                ty: ColumnType::Float,
+            },
+            ColumnSpec::Scalar {
+                name: "c".into(),
+                ty: ColumnType::Text,
+            },
         ])
         .unwrap()
     }
@@ -215,22 +343,89 @@ mod tests {
     fn new_assigns_ids_in_declaration_order() {
         let s = schema();
         assert_eq!(s.columns.len(), 3);
+        // Scalar ColumnId space unchanged: dense 0..N in scalar declaration order.
         for (i, def) in s.columns.iter().enumerate() {
             assert_eq!(def.id, i as ColumnId);
         }
         assert_eq!(s.by_name["b"], 1);
         assert_eq!(s.column(2).unwrap().name, "c");
         assert!(s.column(3).is_none());
+        // Declaration ordinals are vector-inclusive: vector@0 shifts scalars to 1..
+        assert_eq!(s.vector().name, "v");
+        assert_eq!(s.vector().ordinal, 0);
+        assert_eq!(s.column(0).unwrap().ordinal, 1); // a
+        assert_eq!(s.column(1).unwrap().ordinal, 2); // b
+        assert_eq!(s.column(2).unwrap().ordinal, 3); // c
     }
 
     #[test]
     fn new_rejects_duplicate_names() {
-        let err = Schema::new(vec![
-            ("a".into(), ColumnType::Int),
-            ("a".into(), ColumnType::Text),
+        let err = Schema::from_columns(vec![
+            ColumnSpec::Vector {
+                name: "v".into(),
+                dim: NonZeroUsize::new(2).unwrap(),
+            },
+            ColumnSpec::Scalar {
+                name: "a".into(),
+                ty: ColumnType::Int,
+            },
+            ColumnSpec::Scalar {
+                name: "a".into(),
+                ty: ColumnType::Text,
+            },
         ])
         .unwrap_err();
         assert!(matches!(err, Error::DuplicateColumn(name) if name == "a"));
+    }
+
+    #[test]
+    fn from_columns_requires_exactly_one_vector() {
+        assert!(matches!(
+            Schema::from_columns(vec![ColumnSpec::Scalar {
+                name: "a".into(),
+                ty: ColumnType::Int,
+            }]),
+            Err(Error::VectorColumnCount { found: 0 })
+        ));
+        assert!(matches!(
+            Schema::from_columns(vec![
+                ColumnSpec::Vector {
+                    name: "u".into(),
+                    dim: NonZeroUsize::new(2).unwrap(),
+                },
+                ColumnSpec::Vector {
+                    name: "w".into(),
+                    dim: NonZeroUsize::new(2).unwrap(),
+                },
+            ]),
+            Err(Error::VectorColumnCount { found: 2 })
+        ));
+    }
+
+    #[test]
+    fn vector_after_scalars_shifts_only_later_ordinals() {
+        // [author, vector, title]: scalar ColumnIds stay 0,1; declaration
+        // ordinals are author@0, vector@1, title@2.
+        let s = Schema::from_columns(vec![
+            ColumnSpec::Scalar {
+                name: "author".into(),
+                ty: ColumnType::Text,
+            },
+            ColumnSpec::Vector {
+                name: "vector".into(),
+                dim: NonZeroUsize::new(8).unwrap(),
+            },
+            ColumnSpec::Scalar {
+                name: "title".into(),
+                ty: ColumnType::Text,
+            },
+        ])
+        .unwrap();
+        assert_eq!(s.vector().ordinal, 1);
+        assert_eq!(s.column(0).unwrap().name, "author");
+        assert_eq!(s.column(0).unwrap().ordinal, 0);
+        assert_eq!(s.column(1).unwrap().name, "title");
+        assert_eq!(s.column(1).unwrap().ordinal, 2);
     }
 
     #[test]
