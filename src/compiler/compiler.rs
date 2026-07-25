@@ -42,8 +42,9 @@
 //! Phase 7j fills the bodies in; the signatures here are stable.
 
 use crate::compiler::bytecode::{Addr, Cursor, Op, Program, Reg};
-use crate::compiler::constants::ConstPool;
-use crate::metadata::common::Schema;
+use crate::compiler::constants::{Const, ConstPool};
+use crate::metadata::common::{ColumnLocation, DeclarationOrdinal, Schema};
+use crate::sql::ast::Literal;
 use crate::sql::plan::LogicalPlan;
 
 /// Compile a resolved [`LogicalPlan`] into a [`Program`].
@@ -56,9 +57,11 @@ pub fn compile(plan: LogicalPlan, schema: &Schema) -> Program {
     let mut compiler = Compiler::new(schema);
     // The plan root emits itself. Wrapper nodes (Scan) thread a per-row body
     // DOWN into their loop; the root therefore receives an empty top-level body
-    // (a Scan reached as the root scans with no projection above it, and the
-    // leaf nodes ignore the body entirely).
+    // (the leaf nodes ignore the body entirely).
     compiler.emit_node(&plan, &mut |_| {});
+    // Every program halts once the root's code is done — a Scan's loop has
+    // already fallen through to here, an Insert/Create has finished its op.
+    compiler.emit(Op::Halt);
     compiler.finish()
 }
 
@@ -70,9 +73,6 @@ pub fn compile(plan: LogicalPlan, schema: &Schema) -> Program {
 /// Borrows the storage [`Schema`] for the duration of the compile so
 /// [`emit_node`](Compiler::emit_node) can call [`Schema::locate`] without
 /// re-plumbing it through every helper.
-// Fields are written by `new` and consumed by the emission bodies, which land
-// in 7j; until then they read as dead.
-#[allow(dead_code)]
 struct Compiler<'a> {
     /// The instruction stream being built.
     ops: Vec<Op>,
@@ -90,10 +90,6 @@ struct Compiler<'a> {
     schema: &'a Schema,
 }
 
-// The emission bodies (everything but `new`) arrive in 7j; until then their
-// `unimplemented!()` stubs leave parameters unread, and the primitive helpers —
-// reached only from the stubbed `emit_node` — read as uncalled.
-#[allow(unused_variables, dead_code)]
 impl<'a> Compiler<'a> {
     /// A fresh compiler for a plan compiled against `schema`.
     fn new(schema: &'a Schema) -> Self {
@@ -109,7 +105,16 @@ impl<'a> Compiler<'a> {
 
     /// Push `op`, returning its instruction index (used as a backpatch handle).
     fn emit(&mut self, op: Op) -> usize {
-        unimplemented!()
+        let at = self.ops.len();
+        self.ops.push(op);
+        at
+    }
+
+    /// The address of the NEXT instruction to be emitted — i.e. the current end
+    /// of the stream. Used to capture a loop's top and to compute a forward
+    /// jump's target.
+    fn here(&self) -> Addr {
+        Addr(self.ops.len() as u32)
     }
 
     /// Emit a forward jump whose target is not yet known: `make` builds the op
@@ -117,24 +122,45 @@ impl<'a> Compiler<'a> {
     /// [`patch`](Self::patch). Every forward jump routes through here so no
     /// patch site has to re-match the opcode.
     fn emit_jump_placeholder(&mut self, make: impl FnOnce(Addr) -> Op) -> usize {
-        unimplemented!()
+        self.emit(make(Addr::PLACEHOLDER))
     }
 
     /// Backpatch the jump at instruction index `at` to point at `target`.
     fn patch(&mut self, at: usize, target: Addr) {
-        unimplemented!()
+        match &mut self.ops[at] {
+            Op::SeekFirst { end, .. } => *end = target,
+            Op::Next { body, .. } => *body = target,
+            // EXTEND: Goto / JumpIfFalse / DecrJumpIfZero once WHERE and LIMIT
+            // land. Only a jump-bearing op is a valid patch target.
+            other => unreachable!("patch target at {at} is not a jump: {other:?}"),
+        }
     }
 
     /// Allocate the next register (monotonic; no reuse). Bumps [`next_reg`],
     /// which becomes [`Program::n_regs`].
     fn alloc_reg(&mut self) -> Reg {
-        unimplemented!()
+        let r = Reg(self.next_reg);
+        self.next_reg += 1;
+        r
     }
 
-    /// Allocate the next cursor slot (monotonic; no reuse). Bumps
-    /// [`next_cursor`], which becomes [`Program::n_cursors`].
+    /// Allocate the next cursor slot (monotonic; no reuse). Bumps [`next_cursor`],
+    /// which becomes [`Program::n_cursors`].
     fn alloc_cursor(&mut self) -> Cursor {
-        unimplemented!()
+        let c = Cursor(self.next_cursor);
+        self.next_cursor += 1;
+        c
+    }
+
+    /// The cursor in scope. Set while emitting inside a `Scan`'s loop, so the
+    /// body's `Column` / `VectorFetch` reference the cursor `Scan` allocated
+    /// rather than a hardcoded slot. Reached only from within a loop body, where
+    /// it is always set.
+    fn current_cursor(&self) -> Cursor {
+        match self.cursor {
+            Some(cur) => cur,
+            None => unreachable!("Column/VectorFetch emitted outside a Scan loop"),
+        }
     }
 
     /// Emit `node`. WRAPPER nodes (`Scan`; later `Limit`) emit a loop top, then
@@ -146,12 +172,142 @@ impl<'a> Compiler<'a> {
     /// `body` carries the enclosing node's per-row code down so it lands INSIDE
     /// this node's loop — the inversion that makes emission recursive.
     fn emit_node(&mut self, node: &LogicalPlan, body: &mut dyn FnMut(&mut Self)) {
-        unimplemented!()
+        match node {
+            LogicalPlan::Scan(scan) => {
+                // WRAPPER: owns the read loop. SeekFirst is the entry guard
+                // (empty collection -> skip the body), Next the back-edge.
+                let cur = self.alloc_cursor();
+                self.emit(Op::OpenRead {
+                    cur,
+                    collection: scan.collection.clone(),
+                });
+                // Forward jump out of an empty collection — target not known
+                // until the loop body has been emitted, so backpatch it.
+                let seek = self.emit_jump_placeholder(|end| Op::SeekFirst { cur, end });
+                let loop_top = self.here();
+
+                // Thread this cursor into the body, restoring the prior one
+                // afterwards (there is only one level in the bootstrap subset,
+                // but nesting stays correct this way).
+                let prev = self.cursor.replace(cur);
+                body(self);
+                self.cursor = prev;
+
+                self.emit(Op::Next {
+                    cur,
+                    body: loop_top,
+                });
+                // SeekFirst lands just past the loop's back-edge.
+                let after = self.here();
+                self.patch(seek, after);
+            }
+
+            LogicalPlan::Project(project) => {
+                // MIDDLE: owns no loop. Its per-row code is handed DOWN to the
+                // child (a Scan) so it runs inside that loop.
+                // `c` is annotated `Compiler<'a>` (not a fresh inference): `&mut`
+                // is invariant over the schema lifetime, so the body handed down
+                // must speak the SAME `'a` the outer `body` expects.
+                let mut row_body = |c: &mut Compiler<'a>| {
+                    let base = c.next_reg;
+                    for col in &project.columns {
+                        // THE ordinal translation: ask the schema where this
+                        // declaration ordinal lives — never compute it here.
+                        match c.schema.locate(DeclarationOrdinal::new(col.ordinal)) {
+                            Some(ColumnLocation::Scalar(id)) => {
+                                let dst = c.alloc_reg();
+                                let cur = c.current_cursor();
+                                c.emit(Op::Column { cur, col: id, dst });
+                            }
+                            Some(ColumnLocation::Vector { .. }) => {
+                                // The embedding is fetched from the flat index,
+                                // never read as a Column — and only when the
+                                // projection asked for it.
+                                if project.include_vector {
+                                    let dst = c.alloc_reg();
+                                    let cur = c.current_cursor();
+                                    c.emit(Op::VectorFetch { cur, dst });
+                                }
+                            }
+                            // The plan is already validated, so every ordinal
+                            // resolves; a miss is a compiler/schema-pairing bug.
+                            None => {
+                                unreachable!("plan ordinal {} not in schema", col.ordinal)
+                            }
+                        }
+                    }
+                    // Emit the columns produced this row as one output row.
+                    let count = c.next_reg - base;
+                    c.emit(Op::ResultRow {
+                        start: Reg(base),
+                        count,
+                    });
+                    // Anything ABOVE the projection (e.g. a future Limit).
+                    body(c);
+                };
+                self.emit_node(&project.input, &mut row_body);
+            }
+
+            LogicalPlan::Insert(insert) => {
+                // LEAF: no loop, no body. Load each value, pack, write.
+                let cur = self.alloc_cursor();
+                self.emit(Op::OpenWrite {
+                    cur,
+                    collection: insert.collection.clone(),
+                });
+                let base = self.next_reg;
+                for value in &insert.row {
+                    let dst = self.alloc_reg();
+                    // Large payloads (vector, string) go to the constant pool
+                    // and the instruction carries the handle; small scalars load
+                    // inline.
+                    let op = match &value.value {
+                        Literal::Vector(v) => {
+                            let id = self.consts.add(Const::Vector(v.clone()));
+                            Op::VectorConst { id, dst }
+                        }
+                        Literal::Str(s) => {
+                            let id = self.consts.add(Const::Str(s.clone()));
+                            Op::String { id, dst }
+                        }
+                        Literal::Int(n) => Op::Integer { value: *n, dst },
+                        Literal::Float(f) => Op::Real { value: *f, dst },
+                    };
+                    self.emit(op);
+                }
+                let count = self.next_reg - base;
+                let rec = self.alloc_reg();
+                self.emit(Op::MakeRecord {
+                    start: Reg(base),
+                    count,
+                    dst: rec,
+                });
+                self.emit(Op::Insert { cur, rec });
+            }
+
+            LogicalPlan::CreateCollection(create) => {
+                // LEAF: one fat op. The interned schema is the STORAGE schema the
+                // caller built from the DDL and handed to `compile` — the single
+                // source the VM later persists, never a second build.
+                let schema = self.consts.add(Const::Schema(self.schema.clone()));
+                self.emit(Op::CreateCollection {
+                    name: create.name.clone(),
+                    schema,
+                    capacity: create.capacity,
+                });
+            }
+        }
     }
 
-    /// Finish the compile, moving the accumulated state into a [`Program`].
+    /// Finish the compile, moving the accumulated state into a [`Program`]. The
+    /// allocator counters become the register / cursor counts.
     fn finish(self) -> Program {
-        unimplemented!()
+        Program {
+            ops: self.ops,
+            consts: self.consts,
+            n_regs: self.next_reg,
+            n_cursors: self.next_cursor,
+        }
     }
 }
 
