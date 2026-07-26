@@ -932,7 +932,7 @@ fn bind_schema(schema: &Schema) -> crate::sql::bind::Schema {
     columns.push(ColumnSchema {
         name: v.name.clone(),
         ty: AstType::Vector(v.dim.get()),
-        ordinal: v.ordinal,
+        ordinal: v.ordinal.get(),
         is_vector: true,
     });
     for def in &schema.columns {
@@ -943,7 +943,7 @@ fn bind_schema(schema: &Schema) -> crate::sql::bind::Schema {
                 ColumnType::Float => AstType::Float,
                 ColumnType::Text => AstType::Text,
             },
-            ordinal: def.ordinal,
+            ordinal: def.ordinal.get(),
             is_vector: false,
         });
     }
@@ -978,7 +978,9 @@ fn to_io(e: Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::common::{ColumnDef, ColumnSpec, ColumnType, RangeOp, Value};
+    use crate::metadata::common::{
+        ColumnDef, ColumnSpec, ColumnType, DeclarationOrdinal, RangeOp, Value,
+    };
     use crate::metadata::tuples::RowGet;
     use std::num::NonZeroUsize;
 
@@ -1639,7 +1641,7 @@ mod tests {
             id: 1,
             name: "a".into(),
             ty: ColumnType::Text,
-            ordinal: 2,
+            ordinal: DeclarationOrdinal::new(2),
         });
         assert!(matches!(
             db.create_collection("x", 8, sneaky),
@@ -1698,16 +1700,16 @@ mod tests {
         let s = &db.collections()[0].schema;
         // Vector: name + declaration ordinal + dim.
         assert_eq!(s.vector().name, "embedding");
-        assert_eq!(s.vector().ordinal, 1);
+        assert_eq!(s.vector().ordinal.get(), 1);
         assert_eq!(s.vector().dim.get(), 16);
         // Scalars: ColumnId dense 0..N (vector excluded); ordinals vector-inclusive.
         assert_eq!(s.columns.len(), 2);
         assert_eq!(
-            (s.columns[0].id, s.columns[0].name.as_str(), s.columns[0].ordinal),
+            (s.columns[0].id, s.columns[0].name.as_str(), s.columns[0].ordinal.get()),
             (0, "author", 0)
         );
         assert_eq!(
-            (s.columns[1].id, s.columns[1].name.as_str(), s.columns[1].ordinal),
+            (s.columns[1].id, s.columns[1].name.as_str(), s.columns[1].ordinal.get()),
             (1, "year", 2)
         );
         db.close().unwrap();
