@@ -11,10 +11,10 @@
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use flats::index::index::{FlatIndex, Reader, Writer};
+use flats::index::index::{FlatIndex, Ordinal, Reader, Writer};
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
 // (a) Compile-time: the single-writer invariant is type-enforced. If `Writer`
@@ -144,6 +144,115 @@ fn publication_never_exposes_a_zero_slot() {
         h.join().unwrap();
     }
     assert!(i > 0);
+}
+
+/// A per-ordinal sentinel: every element is `ordinal + 1`, so the value is
+/// non-zero AND uniquely identifies its ordinal.
+///
+/// Stronger than [`pattern`] on purpose. `pattern`'s `% 7` repeats, so it cannot
+/// catch a read that lands 7 slots away; this can. Bounded well under 2^24 by
+/// the caller's capacity, so every value is exact in f32.
+fn sentinel(ordinal: u32, d: usize) -> Vec<f32> {
+    vec![(ordinal + 1) as f32; d]
+}
+
+#[test]
+fn vector_at_never_torn_under_writer() {
+    // The count-before-bytes guard for the BY-ORDINAL read path.
+    //
+    // `publication_never_exposes_a_zero_slot` proves `search` never observes a
+    // published count ahead of its bytes. `vector_at` is designed to inherit
+    // that: it derives its slice from ONE `committed_vectors()` Acquire load,
+    // so the bound it checks and the bytes it returns come from the same
+    // observation of `count`. This test is what turns "designed to" into
+    // "verified under load" — and, more importantly, it is the regression that
+    // trips if anyone later splits that into a check-then-read (load count,
+    // then separately read bytes), or moves the publish before the memcpy.
+    //
+    // The outcome is not in question; the job is to STAY green.
+    let d = 16;
+    // Dense ascending writes, so `cap` bounds the largest ordinal — and thus
+    // keeps every sentinel exactly representable in f32.
+    let cap = 400_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vecat.idx");
+    let (mut writer, reader) = FlatIndex::create(&path, dim(d), cap).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    // Bumped by the writer AFTER each `write_at`, so readers can aim at the
+    // freshly published edge instead of settled middle slots (where `count` and
+    // the bytes can no longer disagree). Same "point at the window" trick the
+    // prober in `tests/concurrent_stores.rs` uses.
+    let frontier = Arc::new(AtomicU32::new(0));
+    let validated = Arc::new(AtomicU64::new(0));
+    let probes = Arc::new(AtomicU64::new(0));
+
+    let mut handles = Vec::new();
+    for _ in 0..readers().max(2) {
+        let r: Reader = reader.clone();
+        let stop = stop.clone();
+        let frontier = frontier.clone();
+        let validated = validated.clone();
+        let probes = probes.clone();
+        handles.push(std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let f = frontier.load(Ordering::Relaxed);
+                // Straddle the edge: `f - 1` is just-published (usually Some),
+                // `f` is being written right now (the race), `f + 1..` is not
+                // published yet (usually None). A None is ALWAYS legal — only a
+                // Some that isn't the exact sentinel is a bug.
+                for o in f.saturating_sub(1)..=f + 2 {
+                    probes.fetch_add(1, Ordering::Relaxed);
+                    let Some(got) = r.vector_at(Ordinal(o)) else {
+                        continue;
+                    };
+                    let want = sentinel(o, d);
+                    assert_eq!(
+                        got,
+                        want.as_slice(),
+                        "TORN READ at ordinal {o}: vector_at returned a published slice that is \
+                         not the sentinel. Either the count was observed ahead of the bytes \
+                         (a zero or partial slice), or the slice came from the wrong slot. \
+                         observed={got:?}"
+                    );
+                    validated.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+
+    // Dense, gapless, ascending — no sparse writes, so the only zeros in the
+    // mapping are slots at or beyond the frontier, which `vector_at` must
+    // report as None. That removes the one legitimate way it can hand back
+    // zeros (the never-written slot below high-water that visibility parity
+    // with `search` forces it to keep), so any zero the reader sees is torn.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut i = 0u32;
+    while (i as usize) < cap && Instant::now() < deadline {
+        let v = sentinel(i, d);
+        writer.write_at(i as u64, &v).expect("write_at");
+        frontier.store(i + 1, Ordering::Release);
+        i += 1;
+    }
+    stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        h.join().expect("reader thread panicked");
+    }
+
+    // Printed, not asserted: how often the readers actually caught a published
+    // frontier slot is host-dependent (thread scheduling, core count), and a
+    // host-sensitive assertion is a flaky test, not a stronger one. The
+    // deterministic "Some returns the right bytes" path is already pinned by
+    // the `vector_at_*` unit tests; this test owns "never torn under a live
+    // writer". A zero here means the run proved nothing — visible, not silent.
+    eprintln!(
+        "[vector_at] writer published {i} ordinals; readers probed {} and validated {} frontier reads",
+        probes.load(Ordering::Relaxed),
+        validated.load(Ordering::Relaxed),
+    );
+    assert!(i > 0, "writer made no progress");
+    assert!(probes.load(Ordering::Relaxed) > 0, "readers never ran");
 }
 
 /// Populate a read-only index and return its reader. The writer is dropped, so

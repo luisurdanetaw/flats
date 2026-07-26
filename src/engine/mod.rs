@@ -52,6 +52,9 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+pub mod cursor;
+
+use crate::engine::cursor::Cursor;
 use crate::error::{Error, Result};
 use crate::index::index::{FlatIndex, Ordinal, Reader, SearchResult, Writer};
 use crate::metadata::common::{Row, Schema};
@@ -847,6 +850,31 @@ impl Db {
         catalog_snapshot(&self.catalog)
             .get(&collection)
             .map(|c| c.tuple.clone())
+    }
+
+    /// A full-scan [`Cursor`] over `collection`'s live rows, projecting every
+    /// scalar column in `ColumnId` order.
+    ///
+    /// The cursor's ordinal source is this collection's `live()` bitmap,
+    /// snapshotted here — so the row SET is fixed for the scan's lifetime, and
+    /// rows inserted after this call are not visited. Rows deleted after it are
+    /// skipped when reached (see [`Cursor`]'s skip policy).
+    ///
+    /// Full scan is only the first customer of that seam: a `WHERE`-filtered
+    /// bitmap or a ranked KNN result builds the same cursor through
+    /// [`Cursor::over`].
+    pub fn scan(&self, collection: u32) -> Result<Cursor<'static>> {
+        let coll = self.collection(collection)?;
+        // Dense and ascending by construction (`Schema::columns` IS the
+        // ColumnId space), which is what makes `Cursor::column`'s position
+        // coincide with the ColumnId for a full scan.
+        let columns = coll.config.schema.columns.iter().map(|c| c.id).collect();
+        let live = coll.meta.live();
+        Ok(Cursor::over(
+            live.into_iter().map(Ordinal),
+            coll.tuple.clone(),
+            columns,
+        ))
     }
 
     /// Every registered collection's config, sorted by id — exactly what the
