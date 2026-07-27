@@ -2,7 +2,8 @@
 //! `Next` / `Column` against.
 //!
 //! Storage ships the two halves of a scan but never composed them: the metadata
-//! index says WHICH ordinals are live ([`meta::Reader::live`]) and the tuple
+//! index says WHICH ordinals are live
+//! ([`meta::Reader::live`](crate::metadata::index::Reader::live)) and the tuple
 //! store fetches columns for ONE KNOWN ordinal ([`tuples::Reader::get`]). This
 //! is the iterator that sweeps the first and feeds the second.
 //!

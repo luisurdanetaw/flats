@@ -69,6 +69,18 @@ use crate::wal::wal::{Apply, Lsn, Record, Wal, WalHandle};
 /// `create_collection` call) and persisted in `catalog.snap` from then on.
 pub use crate::metadata::common::CollectionConfig;
 
+/// A collection's stable numeric identity — what WAL records key on and what
+/// every `Db` method takes. Assigned once (open-time registration or
+/// `create_collection`) and never reused. [`Db::collection_id`] is the bridge
+/// from the NAME compiled bytecode carries to this.
+///
+/// An ALIAS, not a newtype: the id is `u32` in `CollectionConfig` and inside the
+/// bincode-encoded WAL frame, so wrapping it is a change to the persisted
+/// format's type surface, not a local rename. The alias exists so signatures can
+/// SAY collection id where they currently say `u32`; promoting it to a real
+/// newtype is a separate, deliberate change.
+pub type CollectionId = u32;
+
 /// Engine tunables.
 #[derive(Debug, Clone, Copy)]
 pub struct DbOptions {
@@ -877,6 +889,29 @@ impl Db {
         ))
     }
 
+    /// Resolve a collection NAME to the id every other method here is keyed by.
+    ///
+    /// The one public name→id path. Compiled bytecode carries
+    /// `collection: String` (a program is portable — it outlives any particular
+    /// catalog state and must not bake in an id), while `insert`, `search`,
+    /// `scan` and the WAL records all speak [`CollectionId`]. The VM crosses
+    /// that gap exactly once, here, when it opens a cursor.
+    ///
+    /// Matching is EXACT, deliberately: `create_collection` enforces uniqueness
+    /// with the same exact comparison, so a case-insensitive lookup here could
+    /// resolve two names that the catalog considers distinct. It reads the same
+    /// live snapshot as [`Catalog::schema_of`](crate::sql::bind::Catalog) — so a
+    /// name the binder resolved
+    /// against resolves to a real id here, including one created earlier in the
+    /// same session.
+    pub fn collection_id(&self, name: &str) -> Result<CollectionId> {
+        catalog_snapshot(&self.catalog)
+            .values()
+            .find(|c| c.config.name == name)
+            .map(|c| c.config.id)
+            .ok_or_else(|| Error::UnknownCollectionName { name: name.into() })
+    }
+
     /// Every registered collection's config, sorted by id — exactly what the
     /// persisted catalog holds.
     pub fn collections(&self) -> Vec<CollectionConfig> {
@@ -950,7 +985,7 @@ impl Drop for Db {
 /// the scalars — in one ordinal space; this maps the storage schema (scalar
 /// `ColumnId` space + the separate vector) into it. The binder is unchanged;
 /// this adapter does all the conversion.
-fn bind_schema(schema: &Schema) -> crate::sql::bind::Schema {
+pub(crate) fn bind_schema(schema: &Schema) -> crate::sql::bind::Schema {
     use crate::metadata::common::ColumnType;
     use crate::sql::ast::ColumnType as AstType;
     use crate::sql::bind::ColumnSchema;
@@ -1818,6 +1853,58 @@ mod tests {
             BoundStatement::Select(sel) => assert!(sel.include_vector),
             other => panic!("expected Select, got {other:?}"),
         }
+        db.close().unwrap();
+    }
+
+    // -- name → id resolution ------------------------------------------------
+    //
+    // Bytecode carries `collection: String`; every `Db` method is keyed by id.
+    // These pin the one public bridge between the two.
+
+    #[test]
+    fn resolve_known_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two collections, so a lookup that returned "some id" rather than
+        // "this name's id" cannot pass.
+        let db = Db::open(
+            dir.path(),
+            &[cfg(0, 2, 16), cfg_meta(1, 2, 16)],
+            manual_opts(),
+        )
+        .unwrap();
+
+        assert_eq!(db.collection_id("c0").unwrap(), 0);
+        assert_eq!(db.collection_id("c1").unwrap(), 1);
+
+        // A collection created at RUNTIME resolves too — the VM's own path is
+        // CREATE then INSERT in one session, so the id must come back from the
+        // live catalog, not from whatever `open` was handed.
+        let id = db.create_collection("made_later", 16, vec_only(2)).unwrap();
+        assert_eq!(db.collection_id("made_later").unwrap(), id);
+        // ...and it agrees with the id every other `Db` method wants.
+        db.insert(db.collection_id("made_later").unwrap(), &[1.0, 0.0], vec![])
+            .unwrap();
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn resolve_unknown_collection_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 16)], manual_opts()).unwrap();
+
+        // A typed error naming the offender — not a panic, not `UnknownCollection
+        // { id }` (there is no id to report; that is the whole failure).
+        match db.collection_id("nope") {
+            Err(Error::UnknownCollectionName { name }) => assert_eq!(name, "nope"),
+            other => panic!("expected UnknownCollectionName, got {other:?}"),
+        }
+        assert!(db.collection_id("").is_err());
+        // Names are case-SENSITIVE, matching the uniqueness check in
+        // `create_collection`: if "C0" resolved to "c0" here, two names that
+        // `create_collection` considers distinct would collide at execution.
+        assert!(db.collection_id("C0").is_err());
+
         db.close().unwrap();
     }
 }

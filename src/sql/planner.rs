@@ -19,11 +19,6 @@
 //! it cannot fail and has nothing to look up. That infallible, catalog-free
 //! signature is the whole point of splitting analysis from planning.
 //!
-//! # Phase 7f status
-//!
-//! API skeleton + tests. The body is `unimplemented!()`, so the crate compiles
-//! and the planner tests fail *at* `unimplemented!()`. Phase 7g fills it; the
-//! signature here is stable.
 
 use crate::sql::bind::{BoundCreate, BoundInsert, BoundSelect, BoundStatement};
 use crate::sql::plan::{CreateCollection, Insert, LogicalPlan, Project, Scan};
