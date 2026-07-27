@@ -37,8 +37,11 @@ pub enum LogicalPlan {
     Insert(Insert),
     /// Provision a new collection.
     CreateCollection(CreateCollection),
-    // EXTEND: Filter(Filter) for WHERE, Knn(Knn) for SEARCH — a new variant
-    // plus a match arm in the planner, without reworking the core.
+    /// Rank a collection's rows by similarity to a query vector (leaf of a
+    /// ranked read tree).
+    Knn(Knn),
+    // EXTEND: Filter(Filter) for WHERE — a new variant plus a match arm in the
+    // planner, without reworking the core.
 }
 
 /// Read every live row of a collection. The leaf of a read plan.
@@ -51,11 +54,36 @@ pub struct Scan {
     // EXTEND: predicate: Option<Predicate>  // pushed-down WHERE / bitmap mask.
 }
 
+/// Rank a collection's rows by similarity to a query vector, nearest first.
+///
+/// The LEAF of a ranked read, sitting exactly where a [`Scan`] sits under the
+/// same [`Project`]. That is the whole design: a `SEARCH` and a `SELECT` differ
+/// only in WHERE THE ORDINALS COME FROM — `Scan` walks every live row, `Knn`
+/// walks the top `k` in score order — and everything above is identical.
+///
+/// It carries no projection of its own for the same reason: the projection
+/// belongs to the [`Project`] above it, so there is exactly one place that
+/// decides which columns a read returns, shared by both statements.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Knn {
+    /// The collection searched (already confirmed to exist by the binder).
+    pub collection: String,
+    /// Its resolved schema — carried so downstream nodes share its ordinals.
+    pub schema: Schema,
+    /// How many nearest rows to return (validated `>= 1` by the binder).
+    pub k: u64,
+    /// The query vector, already checked against the collection's dimension.
+    pub query: Vec<f32>,
+    // EXTEND: prefilter: Option<Predicate> — the WHERE-mask a `BitmapFrom`
+    // would supply, narrowing the candidate set before ranking.
+}
+
 /// Project a column list out of `input`. Wraps a [`Scan`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Project {
-    /// The plan tree below this node (a [`LogicalPlan::Scan`] in the bootstrap
-    /// subset). Boxed because a plan is recursive.
+    /// The plan tree below this node — a [`LogicalPlan::Scan`] for a `SELECT`,
+    /// a [`LogicalPlan::Knn`] for a `SEARCH`. Boxed because a plan is
+    /// recursive.
     pub input: Box<LogicalPlan>,
     /// The projected columns, bound to schema ordinals — carried through from
     /// the bound projection.

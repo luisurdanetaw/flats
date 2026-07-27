@@ -40,7 +40,7 @@
 use std::fmt;
 
 use crate::sql::ast::{
-    ColumnType, CreateStmt, InsertStmt, Literal, Projection, SelectStmt, Statement,
+    ColumnType, CreateStmt, InsertStmt, Literal, Projection, SearchStmt, SelectStmt, Statement,
 };
 
 // ---------------------------------------------------------------------------
@@ -141,7 +141,9 @@ pub enum BoundStatement {
     Insert(BoundInsert),
     /// A resolved `CREATE COLLECTION`.
     CreateCollection(BoundCreate),
-    // EXTEND: Search(BoundSearch), Delete(BoundDelete), Update(BoundUpdate).
+    /// A resolved `SEARCH`.
+    Search(BoundSearch),
+    // EXTEND: Delete(BoundDelete), Update(BoundUpdate).
 }
 
 /// A resolved `SELECT projection FROM from`.
@@ -171,6 +173,34 @@ pub struct BoundInsert {
     /// `(cols) VALUES (...)` list may be in any order; the three stores want
     /// canonical order).
     pub row: Vec<TypedValue>,
+}
+
+/// A resolved bare `SEARCH` — the ranked read.
+///
+/// Structurally a `SELECT *` with a different ROW SOURCE: same collection, same
+/// schema, same all-scalars projection. Only `k` and `query` are new, and they
+/// decide *which* ordinals the read walks and *in what order* — nothing below
+/// the row source changes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundSearch {
+    /// The collection searched (confirmed to exist).
+    pub from: String,
+    /// Its resolved schema.
+    pub schema: Schema,
+    /// How many nearest rows to return. Validated `>= 1` here, so no later
+    /// stage has to wonder — `Db::search` has its own opinion about `k`, and it
+    /// should never be the one to discover a meaningless one.
+    pub k: u64,
+    /// The query vector, already checked against the collection's declared
+    /// dimension. A bare `Vec<f32>` rather than a `Literal`: the binder has
+    /// proved it is a vector of the right length, so carrying a type that could
+    /// still be a string would throw that proof away — and the compiler interns
+    /// it as `Const::Vector` unchanged.
+    pub query: Vec<f32>,
+    /// The projected columns: every scalar, in schema order — the same default
+    /// `SELECT *` produces. The embedding is excluded for the same reason (it
+    /// lives in the flat index, not the tuple store).
+    pub projection: Vec<ColumnRef>,
 }
 
 /// A resolved `CREATE COLLECTION`.
@@ -229,6 +259,11 @@ pub enum BindError {
         /// How many vector columns were declared (valid schemas have exactly 1).
         found: usize,
     },
+    /// A `SEARCH`'s `TOP k` is not a positive count.
+    InvalidTopK {
+        /// The requested count.
+        k: i64,
+    },
     /// The statement is valid V-SQL, but this layer does not bind it yet.
     ///
     /// Present so a newly-parseable statement cannot reach an unhandled match
@@ -272,6 +307,9 @@ impl fmt::Display for BindError {
                 f,
                 "a collection must have exactly one VECTOR column, found {found}"
             ),
+            BindError::InvalidTopK { k } => {
+                write!(f, "TOP must be at least 1, found {k}")
+            }
             BindError::Unbound { statement } => {
                 write!(f, "{statement} is parsed but not implemented yet")
             }
@@ -294,18 +332,93 @@ pub fn analyze(stmt: Statement, catalog: &impl Catalog) -> Result<BoundStatement
         Statement::CreateCollection(c) => {
             bind_create(c, catalog).map(BoundStatement::CreateCollection)
         }
-        // The SEARCH GRAMMAR exists (commit 1) but its binding does not. An
-        // explicit arm, not a wildcard: when the binding lands, deleting this
-        // line is what forces the real one to be written.
-        Statement::Search(_) => Err(BindError::Unbound {
-            statement: "SEARCH",
-        }),
+        Statement::Search(s) => bind_search(s, catalog).map(BoundStatement::Search),
         // EXTEND: Delete/Update dispatch here as those statements land.
     }
 }
 
 /// `SELECT projection FROM from`. Resolves the collection, binds each projected
 /// column to its schema ordinal, and sets `include_vector` per rule (A).
+/// Bind a bare `SEARCH`.
+///
+/// Three checks, ordered by how fundamental the failure is — the same shape
+/// `bind_select` follows:
+///
+///  1. the collection exists (same lookup, same error as a `SELECT`);
+///  2. `k >= 1` — the parser deliberately let `TOP 0` through as syntax, and
+///     this is where it stops;
+///  3. the query vector's length matches the collection's declared dimension —
+///     the same rule, and the same error, an `INSERT`'s embedding gets.
+///
+/// The projection is not bound from source, because bare `SEARCH` has none: it
+/// defaults to every scalar column, exactly as `SELECT *` expands.
+fn bind_search(stmt: SearchStmt, catalog: &impl Catalog) -> Result<BoundSearch, BindError> {
+    // 1. Collection must exist.
+    let schema = catalog
+        .get_collection(&stmt.collection)
+        .ok_or_else(|| BindError::CollectionNotFound(stmt.collection.clone()))?;
+
+    // 2. `TOP k` must be a real count. `k <= 0` is meaningless, and handing it
+    //    to `Db::search` would just move the discovery somewhere less helpful.
+    if stmt.k < 1 {
+        return Err(BindError::InvalidTopK { k: stmt.k });
+    }
+    let k = stmt.k as u64;
+
+    // 3. The query must match the collection's embedding dimension. Checked
+    //    HERE so a wrong-length query never reaches the SIMD kernel.
+    let vector = schema
+        .columns
+        .iter()
+        .find(|c| c.is_vector)
+        // Every collection has exactly one vector column by construction.
+        .ok_or(BindError::VectorColumnCount { found: 0 })?;
+    let dim = match vector.ty {
+        ColumnType::Vector(dim) => dim,
+        // `is_vector` mirrors `ty`, so this is unreachable; erroring rather than
+        // panicking keeps the invariant checked instead of assumed.
+        _ => return Err(BindError::VectorColumnCount { found: 0 }),
+    };
+    // The parser only ever produces `Literal::Vector` here (it requires a `[`),
+    // so the other arms are unreachable — but a bind must not panic.
+    let query = match stmt.query {
+        Literal::Vector(v) => v,
+        _ => {
+            return Err(BindError::TypeMismatch {
+                column: vector.name.clone(),
+                expected: ColumnType::Vector(dim),
+                found: ColumnType::Text,
+            });
+        }
+    };
+    if query.len() != dim {
+        return Err(BindError::DimensionMismatch {
+            column: vector.name.clone(),
+            expected: dim,
+            found: query.len(),
+        });
+    }
+
+    // Default projection: every scalar, in schema order — `SELECT *`'s rule (A).
+    let projection = schema
+        .columns
+        .iter()
+        .filter(|c| !c.is_vector)
+        .map(|c| ColumnRef {
+            name: c.name.clone(),
+            ordinal: c.ordinal,
+        })
+        .collect();
+
+    Ok(BoundSearch {
+        from: stmt.collection,
+        schema,
+        k,
+        query,
+        projection,
+    })
+}
+
 fn bind_select(stmt: SelectStmt, catalog: &impl Catalog) -> Result<BoundSelect, BindError> {
     // 1. Collection must exist (the most fundamental failure comes first).
     let schema = catalog

@@ -877,16 +877,36 @@ impl Db {
     /// [`Cursor::over`].
     pub fn scan(&self, collection: u32) -> Result<Cursor<'static>> {
         let coll = self.collection(collection)?;
+        let live = coll.meta.live();
+        self.scan_over(collection, live.into_iter().map(Ordinal))
+    }
+
+    /// A [`Cursor`] over an ARBITRARY sequence of ordinals, projecting every
+    /// scalar column in `ColumnId` order.
+    ///
+    /// The general form of [`scan`](Self::scan), and the seam the cursor was
+    /// built around: the ordinal source is a plain iterator, so a full scan
+    /// (`live()`), a ranked KNN result, and a future `WHERE`-filtered bitmap all
+    /// produce the SAME cursor type with no new machinery.
+    ///
+    /// **Order is preserved.** The cursor visits ordinals in the order given and
+    /// imposes none of its own — which is what lets a KNN result stay in SCORE
+    /// order rather than collapsing to ascending. An ordinal with no
+    /// materialized row is skipped, per the cursor's documented policy.
+    ///
+    /// The iterator is `'static` so the returned cursor borrows nothing; pass an
+    /// owned collection's `into_iter()`.
+    pub fn scan_over(
+        &self,
+        collection: u32,
+        ordinals: impl Iterator<Item = Ordinal> + 'static,
+    ) -> Result<Cursor<'static>> {
+        let coll = self.collection(collection)?;
         // Dense and ascending by construction (`Schema::columns` IS the
         // ColumnId space), which is what makes `Cursor::column`'s position
-        // coincide with the ColumnId for a full scan.
+        // coincide with the ColumnId for this projection.
         let columns = coll.config.schema.columns.iter().map(|c| c.id).collect();
-        let live = coll.meta.live();
-        Ok(Cursor::over(
-            live.into_iter().map(Ordinal),
-            coll.tuple.clone(),
-            columns,
-        ))
+        Ok(Cursor::over(ordinals, coll.tuple.clone(), columns))
     }
 
     /// Resolve a collection NAME to the id every other method here is keyed by.

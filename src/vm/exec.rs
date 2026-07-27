@@ -66,7 +66,7 @@ use crate::compiler::constants::Const;
 use crate::engine::cursor::Cursor;
 use crate::engine::{CollectionId, Db};
 use crate::error::Error;
-use crate::metadata::common::Schema;
+use crate::metadata::common::{Ordinal, Schema};
 use crate::vm::record::{Record, SplitError, split_record};
 use crate::vm::value;
 
@@ -172,6 +172,7 @@ fn needs_db(op: &Op) -> bool {
         op,
         Op::OpenRead { .. }
             | Op::OpenWrite { .. }
+            | Op::KnnScan { .. }
             | Op::Insert { .. }
             | Op::CreateCollection { .. }
     )
@@ -193,6 +194,7 @@ fn mnemonic(op: &Op) -> &'static str {
         Op::ResultRow { .. } => "ResultRow",
         Op::MakeRecord { .. } => "MakeRecord",
         Op::Insert { .. } => "Insert",
+        Op::KnnScan { .. } => "KnnScan",
         Op::CreateCollection { .. } => "CreateCollection",
         Op::Halt => "Halt",
     }
@@ -305,17 +307,34 @@ impl Vm {
     /// exist yet: a future statement that opens a cursor mid-stream is rejected
     /// at the boundary instead of surprising a consumer.
     pub fn open_cursors(&mut self, db: &Db) -> Result<(), ExecError> {
-        while self.program.ops.get(self.pc).is_some_and(needs_db) {
-            // None of these ops yield or halt, so the flow is always `Next`.
-            self.exec_one(Some(db))?;
+        // Run until NOTHING AHEAD needs the database — not merely until the
+        // current op stops needing it. A `SEARCH`'s prologue is `VectorConst`
+        // (which does not) followed by `KnnScan` (which does), so stopping at
+        // the first self-sufficient op would detach one instruction too early
+        // and strand the scan.
+        while self.program.ops[self.pc..].iter().any(needs_db) {
+            match self.exec_one(Some(db))? {
+                Flow::Next => {}
+                // Producing a row, or finishing, before the last storage-facing
+                // op means the program interleaves reads with row production —
+                // it cannot be detached, and finding that out HERE is the point:
+                // no row has been handed out yet, so the caller can still report
+                // it as a compile-time failure.
+                Flow::Yield(_) | Flow::Halt => {
+                    let (at, op) = self.program.ops[self.pc..]
+                        .iter()
+                        .enumerate()
+                        .find(|(_, op)| needs_db(op))
+                        // The loop condition just proved one exists.
+                        .ok_or(ExecError::PcOutOfRange { pc: self.pc })?;
+                    return Err(ExecError::CannotDetach {
+                        op: mnemonic(op),
+                        at: self.pc + at,
+                    });
+                }
+            }
         }
-        match self.program.ops[self.pc..].iter().find(|op| needs_db(op)) {
-            Some(op) => Err(ExecError::CannotDetach {
-                op: mnemonic(op),
-                at: self.pc,
-            }),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
     /// The dispatch loop. Exits only at a yield, a halt, or an error.
@@ -419,6 +438,40 @@ impl Vm {
                         self.pc = body.0 as usize;
                         return Ok(Flow::Next);
                     }
+                }
+                Op::KnnScan {
+                    cur,
+                    collection,
+                    query,
+                    k,
+                } => {
+                    let (cur, query, k) = (*cur, *query, *k);
+                    let db = db.ok_or(ExecError::Detached { op: "KnnScan" })?;
+                    let vector = match self.reg(query) {
+                        Some(RegValue::Vector(v)) => v.clone(),
+                        _ => return Err(ExecError::NotAVector { reg: query.0 }),
+                    };
+                    let collection_id = db.collection_id(collection).map_err(ExecError::Engine)?;
+                    let k = usize::try_from(k).map_err(|_| ExecError::TopKOverflow { k })?;
+                    // The one coarse opcode: a whole SIMD top-k pass, not a
+                    // per-element interpreted loop. `search` already returns
+                    // most-similar first and excludes tombstones.
+                    let hits = db
+                        .search(collection_id, &vector, k)
+                        .map_err(ExecError::Engine)?;
+                    // SCORE ORDER IS THE PAYLOAD. Collect in the order `search`
+                    // ranked them and hand that straight to the cursor, which
+                    // imposes no order of its own — sorting here, or routing the
+                    // ordinals through a bitmap, would silently make the result
+                    // ascending and still look entirely plausible.
+                    let ranked: Vec<Ordinal> = hits.into_iter().map(|hit| hit.id).collect();
+                    // Scores are computed and DISCARDED: bare SEARCH returns
+                    // rows. Threading them into registers is what `RETURNING
+                    // score` will do (seam (c)).
+                    let cursor = db
+                        .scan_over(collection_id, ranked.into_iter())
+                        .map_err(ExecError::Engine)?;
+                    self.open(cur, Slot::Read(Box::new(cursor)))?;
                 }
                 Op::Column { cur, col, dst } => {
                     let (cur, col, dst) = (*cur, *col, *dst);
@@ -675,6 +728,16 @@ pub enum ExecError {
         /// Where it sits in the instruction stream.
         at: usize,
     },
+    /// `KnnScan`'s query register does not hold a vector.
+    NotAVector {
+        /// The register.
+        reg: u32,
+    },
+    /// A `TOP k` operand does not fit in a `usize` on this target.
+    TopKOverflow {
+        /// The operand.
+        k: u64,
+    },
     /// A capacity operand does not fit in a `usize` on this target.
     CapacityOverflow {
         /// The operand.
@@ -787,6 +850,10 @@ impl fmt::Display for ExecError {
                 write!(f, "capacity {capacity} does not fit in a usize")
             }
             ExecError::Engine(e) => write!(f, "{e}"),
+            ExecError::NotAVector { reg } => {
+                write!(f, "register r{reg} does not hold a query vector")
+            }
+            ExecError::TopKOverflow { k } => write!(f, "TOP {k} does not fit in a usize"),
             ExecError::Detached { op } => {
                 write!(f, "{op} needs a database, but the program is detached")
             }

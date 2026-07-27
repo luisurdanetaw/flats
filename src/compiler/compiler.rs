@@ -258,7 +258,37 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// Emit `node`. WRAPPER nodes (`Scan`; later `Limit`) emit a loop top, then
+    /// Emit the read loop over an ALREADY-OPEN cursor: the entry guard, the
+    /// body, and the back-edge.
+    ///
+    /// Shared verbatim by `Scan` and `Knn`, which is the point — a `SELECT` and
+    /// a `SEARCH` differ only in the prologue that opens the cursor, so if this
+    /// were written twice the two would drift. `SeekFirst` is the entry guard
+    /// (an empty source skips the body entirely) and `Next` the back-edge;
+    /// neither knows or cares where the ordinals came from.
+    fn emit_read_loop(&mut self, cur: Cursor, body: &mut dyn FnMut(&mut Self)) {
+        // Forward jump out of an empty source — the target is not known until
+        // the body has been emitted, so backpatch it.
+        let seek = self.emit_jump_placeholder(|end| Op::SeekFirst { cur, end });
+        let loop_top = self.here();
+
+        // Thread this cursor into the body, restoring the prior one afterwards
+        // (there is only one level in the bootstrap subset, but nesting stays
+        // correct this way).
+        let prev = self.cursor.replace(cur);
+        body(self);
+        self.cursor = prev;
+
+        self.emit(Op::Next {
+            cur,
+            body: loop_top,
+        });
+        // SeekFirst lands just past the loop's back-edge.
+        let after = self.here();
+        self.patch(seek, after);
+    }
+
+    /// Emit `node`. WRAPPER nodes (`Scan`, `Knn`; later `Limit`) emit a loop top, then
     /// run `body` to fill the loop, then emit the loop bottom. LEAF nodes
     /// (`Insert`, `CreateCollection`) emit directly and ignore `body`. `Project`
     /// is the middle case: it owns no loop and hands its per-row code down to
@@ -269,32 +299,36 @@ impl<'a> Compiler<'a> {
     fn emit_node(&mut self, node: &LogicalPlan, body: &mut dyn FnMut(&mut Self)) {
         match node {
             LogicalPlan::Scan(scan) => {
-                // WRAPPER: owns the read loop. SeekFirst is the entry guard
-                // (empty collection -> skip the body), Next the back-edge.
+                // WRAPPER: owns the read loop. Its PROLOGUE opens a cursor over
+                // every live row; the loop itself is shared with `Knn`.
                 let cur = self.alloc_cursor();
                 self.emit(Op::OpenRead {
                     cur,
                     collection: scan.collection.clone(),
                 });
-                // Forward jump out of an empty collection — target not known
-                // until the loop body has been emitted, so backpatch it.
-                let seek = self.emit_jump_placeholder(|end| Op::SeekFirst { cur, end });
-                let loop_top = self.here();
+                self.emit_read_loop(cur, body);
+            }
 
-                // Thread this cursor into the body, restoring the prior one
-                // afterwards (there is only one level in the bootstrap subset,
-                // but nesting stays correct this way).
-                let prev = self.cursor.replace(cur);
-                body(self);
-                self.cursor = prev;
-
-                self.emit(Op::Next {
+            LogicalPlan::Knn(knn) => {
+                // WRAPPER, exactly like `Scan` — and that is the whole design.
+                // Only the PROLOGUE differs: instead of opening a cursor over
+                // every live row, load the query vector and let `KnnScan` open
+                // one over the top `k` IN SCORE ORDER. The loop below is byte
+                // for byte the one a `SELECT` runs.
+                let cur = self.alloc_cursor();
+                // The embedding is a large payload, so it goes to the constant
+                // pool and the instruction carries a handle — the same rule an
+                // `INSERT`'s vector literal follows.
+                let id = self.consts.add(Const::Vector(knn.query.clone()));
+                let query = self.alloc_reg();
+                self.emit(Op::VectorConst { id, dst: query });
+                self.emit(Op::KnnScan {
                     cur,
-                    body: loop_top,
+                    collection: knn.collection.clone(),
+                    query,
+                    k: knn.k,
                 });
-                // SeekFirst lands just past the loop's back-edge.
-                let after = self.here();
-                self.patch(seek, after);
+                self.emit_read_loop(cur, body);
             }
 
             LogicalPlan::Project(project) => {
