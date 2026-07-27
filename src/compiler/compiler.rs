@@ -5,8 +5,9 @@
 //! a pure *structural* translation of the already-resolved, already-validated
 //! plan into the instruction stream. It does no execution and no catalog
 //! access — everything it needs is the plan plus, for a statement against an
-//! EXISTING collection, that collection's storage [`Schema`], handed in by the
-//! caller. (A `CREATE` supplies its own; see below.)
+//! EXISTING collection, that collection's storage [`Schema`] as held by the
+//! CATALOG, handed in by the caller. (A `CREATE` has no catalog entry and
+//! supplies its own; see below.)
 //!
 //! # The one lookup it performs: declaration ordinal → storage location
 //!
@@ -36,15 +37,26 @@
 //! why emission is recursive and `Project` passes a *body* DOWN into `Scan`
 //! rather than emitting after it returns.
 //!
-//! # Where the CREATE schema comes from
+//! # The catalog is the single source of truth — except for `CREATE`
 //!
-//! Every other statement compiles against an EXISTING collection, so its
-//! storage schema is a catalog lookup the caller performs. A `CREATE` has no
-//! catalog entry yet — the collection is what it is about to make — so its
-//! storage schema can only be derived from the DDL. [`compile`] does that
-//! itself via [`to_metadata_schema`], and interns the result: the
-//! `Const::Schema` a CREATE program carries is lowered from the very statement
-//! being compiled, never echoed back from the caller's `schema` argument.
+//! Every statement against an EXISTING collection compiles against that
+//! collection's schema **as the catalog holds it**. The caller performs the
+//! lookup (the compiler stays catalog-free), against the same catalog the binder
+//! resolved names through, so the ordinals in the plan and the `ColumnId`s in
+//! the emitted code come from one stored schema. Nothing is reconstructed, and
+//! there is no second build to drift from the first.
+//!
+//! A `CREATE` is the sole exception, and necessarily so: the collection does not
+//! exist yet, so there is no catalog entry to read and its storage schema can
+//! only be derived from the DDL. [`compile`] does that itself via
+//! [`to_metadata_schema`] and interns the result — the `Const::Schema` a CREATE
+//! program carries is lowered from the very statement being compiled.
+//!
+//! The `schema` parameter is an `Option` for exactly this reason: `None` means
+//! "no such collection yet", which is a real state of the world rather than a
+//! missing argument. It used to be required, which forced a `CREATE`'s caller to
+//! fabricate a schema for a parameter this module never reads — a fabrication
+//! one refactor away from being read is a silent wrong-column bug.
 
 use crate::compiler::bytecode::{Addr, Cursor, Op, Program, Reg};
 use crate::compiler::constants::{Const, ConstPool};
@@ -56,15 +68,22 @@ use std::fmt;
 
 /// Compile a resolved [`LogicalPlan`] into a [`Program`].
 ///
-/// `schema` is the TARGET COLLECTION'S storage schema (the vector-inclusive
-/// [`Schema`] whose [`locate`](Schema::locate) maps declaration ordinals to
-/// storage locations). The caller looks it up from the same catalog the binder
-/// used and hands it in; the compiler itself stays catalog-free.
+/// `schema` is the TARGET COLLECTION'S storage schema, **as held by the
+/// catalog** — the vector-inclusive [`Schema`] whose [`locate`](Schema::locate)
+/// maps declaration ordinals to storage locations. The caller looks it up from
+/// the same catalog the binder resolved against and hands it in; the compiler
+/// itself stays catalog-free.
 ///
-/// It is **ignored for `CREATE COLLECTION`**, which has no existing collection
-/// to describe — see the module header. Nothing about the emitted program
-/// depends on what a caller passes there.
-pub fn compile(plan: LogicalPlan, schema: &Schema) -> Result<Program, CompileError> {
+/// `None` means THERE IS NO SUCH COLLECTION YET — which is true of exactly one
+/// statement, `CREATE COLLECTION`, whose storage schema can only come from its
+/// own DDL (see the module header). The `Option` is the whole point: a `CREATE`
+/// used to force its caller to fabricate a schema for a parameter this function
+/// never reads, and a fabricated schema one refactor away from being read is a
+/// silent wrong-column bug. Now the type says which statements have a schema and
+/// which cannot.
+///
+/// A non-`CREATE` plan with `None` is [`CompileError::MissingSchema`].
+pub fn compile(plan: LogicalPlan, schema: Option<&Schema>) -> Result<Program, CompileError> {
     // THE one fallible step, hoisted out of emission on purpose: doing it here
     // rather than in the CREATE arm keeps `emit_node` — and the recursive body
     // closures threaded through it — infallible, so the `?` never has to travel
@@ -74,6 +93,13 @@ pub fn compile(plan: LogicalPlan, schema: &Schema) -> Result<Program, CompileErr
         _ => None,
     };
 
+    // Every other statement translates ordinals through the catalog's schema, so
+    // its absence is a caller bug rather than something to paper over.
+    let schema = match (&plan, schema) {
+        (LogicalPlan::CreateCollection(_), _) => None,
+        (_, Some(schema)) => Some(schema),
+        (_, None) => return Err(CompileError::MissingSchema),
+    };
     let mut compiler = Compiler::new(schema, created);
     // The plan root emits itself. Wrapper nodes (Scan) thread a per-row body
     // DOWN into their loop; the root therefore receives an empty top-level body
@@ -96,6 +122,10 @@ pub fn compile(plan: LogicalPlan, schema: &Schema) -> Result<Program, CompileErr
 pub enum CompileError {
     /// A `CREATE COLLECTION`'s schema could not be lowered to storage form.
     Schema(SchemaError),
+    /// A statement against an existing collection was compiled without that
+    /// collection's catalog schema — there is nothing to translate its
+    /// declaration ordinals through.
+    MissingSchema,
 }
 
 impl From<SchemaError> for CompileError {
@@ -108,6 +138,9 @@ impl fmt::Display for CompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CompileError::Schema(e) => write!(f, "cannot compile CREATE COLLECTION: {e}"),
+            CompileError::MissingSchema => {
+                write!(f, "no catalog schema for the target collection")
+            }
         }
     }
 }
@@ -116,6 +149,7 @@ impl std::error::Error for CompileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             CompileError::Schema(e) => Some(e),
+            CompileError::MissingSchema => None,
         }
     }
 }
@@ -140,9 +174,10 @@ struct Compiler<'a> {
     /// The cursor currently in scope (set while emitting inside a `Scan`'s
     /// loop), threaded into the per-row body. `None` outside any loop.
     cursor: Option<Cursor>,
-    /// The target collection's storage schema — the source of the ordinal →
-    /// storage-location translation. Unused when compiling a `CREATE`.
-    schema: &'a Schema,
+    /// The target collection's storage schema, from the catalog — the source of
+    /// the ordinal → storage-location translation. `None` only for a `CREATE`,
+    /// which has no collection to describe and never reads it.
+    schema: Option<&'a Schema>,
     /// For a `CREATE`, the storage schema [`compile`] lowered from the DDL,
     /// waiting to be interned. `None` for every other plan.
     created: Option<Schema>,
@@ -151,7 +186,7 @@ struct Compiler<'a> {
 impl<'a> Compiler<'a> {
     /// A fresh compiler for a plan compiled against `schema`, carrying the
     /// pre-lowered `created` schema when the plan is a `CREATE`.
-    fn new(schema: &'a Schema, created: Option<Schema>) -> Self {
+    fn new(schema: Option<&'a Schema>, created: Option<Schema>) -> Self {
         Compiler {
             ops: Vec::new(),
             consts: ConstPool::new(),
@@ -273,7 +308,13 @@ impl<'a> Compiler<'a> {
                     for col in &project.columns {
                         // THE ordinal translation: ask the schema where this
                         // declaration ordinal lives — never compute it here.
-                        match c.schema.locate(DeclarationOrdinal::new(col.ordinal)) {
+                        // `compile` proved a non-CREATE plan has a schema
+                        // before emission began.
+                        let schema = match c.schema {
+                            Some(schema) => schema,
+                            None => unreachable!("a read compiled without a catalog schema"),
+                        };
+                        match schema.locate(DeclarationOrdinal::new(col.ordinal)) {
                             Some(ColumnLocation::Scalar(id)) => {
                                 let dst = c.alloc_reg();
                                 let cur = c.current_cursor();
@@ -562,7 +603,7 @@ mod tests {
             1,
         );
         assert_eq!(
-            compile(plan, &docs_meta_schema()).expect("compiles"),
+            compile(plan, Some(&docs_meta_schema())).expect("compiles"),
             expected
         );
     }
@@ -618,7 +659,7 @@ mod tests {
             1,
         );
         assert_eq!(
-            compile(plan, &docs_meta_schema()).expect("compiles"),
+            compile(plan, Some(&docs_meta_schema())).expect("compiles"),
             expected
         );
     }
@@ -656,7 +697,7 @@ mod tests {
             1,
         );
         assert_eq!(
-            compile(plan, &docs_meta_schema()).expect("compiles"),
+            compile(plan, Some(&docs_meta_schema())).expect("compiles"),
             expected
         );
     }
@@ -700,7 +741,7 @@ mod tests {
             1,
         );
         assert_eq!(
-            compile(plan, &docs_meta_schema()).expect("compiles"),
+            compile(plan, Some(&docs_meta_schema())).expect("compiles"),
             expected
         );
     }
@@ -738,7 +779,7 @@ mod tests {
             1,
         );
         assert_eq!(
-            compile(plan, &docs_meta_schema()).expect("compiles"),
+            compile(plan, Some(&docs_meta_schema())).expect("compiles"),
             expected
         );
     }
@@ -800,7 +841,7 @@ mod tests {
             1,
         );
         assert_eq!(
-            compile(plan, &docs_meta_schema()).expect("compiles"),
+            compile(plan, Some(&docs_meta_schema())).expect("compiles"),
             expected
         );
     }
@@ -835,7 +876,7 @@ mod tests {
             0,
         );
         assert_eq!(
-            compile(plan, &docs_meta_schema()).expect("compiles"),
+            compile(plan, Some(&docs_meta_schema())).expect("compiles"),
             expected
         );
     }
@@ -867,12 +908,55 @@ mod tests {
         ])
         .expect("valid schema");
 
-        let program = compile(plan, &unrelated).expect("compiles");
+        let program = compile(plan, Some(&unrelated)).expect("compiles");
         assert_eq!(
             program.consts.get(ConstId(0)),
             Some(&Const::Schema(docs_meta_schema())),
             "CREATE must intern the schema lowered from its own DDL"
         );
+    }
+
+    /// A `CREATE` needs NO catalog schema, and the signature says so.
+    ///
+    /// The collection does not exist yet, so there is nothing to look up — the
+    /// storage schema can only come from the DDL. Passing `None` is the honest
+    /// spelling of that; the previous shape forced a caller to fabricate a
+    /// schema for a parameter this arm never reads.
+    #[test]
+    fn create_compiles_without_a_catalog_schema() {
+        let plan = LogicalPlan::CreateCollection(CreateCollection {
+            name: "docs".to_string(),
+            schema: docs_bind_schema(),
+            capacity: 1_000_000,
+        });
+
+        let program = compile(plan, None).expect("a CREATE needs no catalog schema");
+        assert_eq!(
+            program.consts.get(ConstId(0)),
+            Some(&Const::Schema(docs_meta_schema())),
+            "the interned schema is still the one lowered from the DDL"
+        );
+    }
+
+    /// A statement against an EXISTING collection cannot compile without that
+    /// collection's schema — it is the source of every ordinal → `ColumnId`
+    /// translation. A missing one is a caller bug, and it must be an error
+    /// rather than a fabricated stand-in that silently emits wrong columns.
+    #[test]
+    fn a_statement_against_an_existing_collection_requires_its_schema() {
+        let plan = LogicalPlan::Project(Project {
+            input: Box::new(LogicalPlan::Scan(Scan {
+                collection: "docs".to_string(),
+                schema: docs_bind_schema(),
+            })),
+            columns: vec![colref("author", 1)],
+            include_vector: false,
+        });
+
+        assert!(matches!(
+            compile(plan, None).unwrap_err(),
+            CompileError::MissingSchema
+        ));
     }
 
     /// A schema the binder accepts but storage cannot represent fails the
@@ -889,7 +973,7 @@ mod tests {
             capacity: 10,
         });
 
-        let err = compile(plan, &docs_meta_schema()).unwrap_err();
+        let err = compile(plan, Some(&docs_meta_schema())).unwrap_err();
         assert!(matches!(
             err,
             CompileError::Schema(crate::compiler::schema::SchemaError::ZeroDimension { .. })
@@ -946,7 +1030,7 @@ mod tests {
     fn compiled_program_passes_validate() {
         let plan = docs_project(vec![colref("author", 1), colref("title", 2)], false);
         assert!(
-            compile(plan, &docs_meta_schema())
+            compile(plan, Some(&docs_meta_schema()))
                 .expect("compiles")
                 .validate()
                 .is_ok()
