@@ -34,6 +34,14 @@ pub enum Error {
     #[error("unknown collection: {id}")]
     UnknownCollection { id: u32 },
 
+    /// A collection NAME did not resolve to a registered collection. Distinct
+    /// from `UnknownCollection`, which reports an id: here there is no id to
+    /// report — failing to produce one is the error. Raised by
+    /// `Db::collection_id`, the bridge from the name bytecode carries to the id
+    /// every other engine method is keyed by.
+    #[error("unknown collection: {name}")]
+    UnknownCollectionName { name: String },
+
     /// A config supplied to `Db::open` disagrees (dim, capacity, or schema)
     /// with what the persisted catalog has registered under the same id.
     #[error("collection {id}'s config conflicts with the persisted catalog")]

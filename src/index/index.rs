@@ -174,6 +174,12 @@ impl FlatIndexInner {
         //   store, so all `floats` are fully written and are never mutated again
         //   (writes only target ordinals >= the published count). No `&mut` to
         //   this region is ever formed, so this shared slice cannot alias one.
+        //   CAVEAT: `write_at` is positional, so WAL replay CAN rewrite an
+        //   already-published ordinal. Benign today — replay rewrites
+        //   byte-identical data and finishes before any Reader exists (recovery
+        //   runs on the caller's thread before the commit thread spawns) — and
+        //   `tests/swmr.rs::vector_at_never_torn_under_writer` assumes exactly
+        //   that. If replay ever becomes concurrent with reads, revisit here.
         // - The mapping outlives `&self` (held by the Arc); no remap occurs.
         unsafe {
             let p = self.base.add(self.vectors_offset) as *const f32;
@@ -558,6 +564,46 @@ impl Reader {
         Ok(())
     }
 
+    /// The vector stored at `ordinal`, or `None` if it is not visible.
+    ///
+    /// Visibility is **exactly** [`search`](Self::search)'s: an ordinal
+    /// resolves iff it is below the published count AND not tombstoned. Nothing
+    /// `search` would hide is reachable here, and nothing `search` can return
+    /// is unreachable — `assert_visibility_parity` in the tests mechanizes that
+    /// equivalence. In particular a never-written slot BELOW the high-water
+    /// mark reads back as zeros rather than `None`, because that is what
+    /// `search` sees; hiding it here would make the two disagree (the engine's
+    /// defence against those phantom slots is the tombstone, not the reader).
+    ///
+    /// Borrowed, not owned: the slice points straight into the mapping, which
+    /// the `Arc` inside this `Reader` keeps alive, so a caller that only reads
+    /// (a dot product, a comparison) copies nothing. A caller that needs to own
+    /// it — a VM register, a result row — calls `.to_vec()` itself, which is
+    /// the copy it was always going to make.
+    pub fn vector_at(&self, ordinal: Ordinal) -> Option<&[f32]> {
+        let id = ordinal.0 as usize;
+        // ONE Acquire load, via the same accessor `search` uses: the count is
+        // read once and the slice is derived from it, so the bound cannot shift
+        // between the check and the read.
+        let vectors = self.inner.committed_vectors();
+        let dim = self.inner.dim.get();
+        // `vectors` is exactly `count * dim` long, so this bounds-check covers
+        // the published count, the capacity, and any absurd ordinal at once —
+        // `id * dim` is computed only after it passes, and `id < count <=
+        // capacity` makes the product non-overflowing.
+        let start = id.checked_mul(dim)?;
+        let end = start.checked_add(dim)?;
+        if end > vectors.len() {
+            return None;
+        }
+        // Tombstones are checked AFTER the bound: `is_deleted` indexes the
+        // bitset by ordinal and is only in-bounds for ordinals within capacity.
+        if self.inner.is_deleted(id) {
+            return None;
+        }
+        Some(&vectors[start..end])
+    }
+
     /// Brute-force top-`k` search. Tombstoned ordinals are skipped. Results are
     /// most-similar (highest dot product) first.
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
@@ -807,5 +853,153 @@ mod tests {
         let path = temp_path(&dir, "badmagic.bin");
         std::fs::write(&path, vec![0u8; 64]).unwrap();
         assert!(matches!(FlatIndex::open(&path), Err(Error::BadMagic { .. })));
+    }
+
+    // ---- vector_at --------------------------------------------------------
+    //
+    // The governing rule is PARITY: `vector_at` must expose exactly what
+    // `search` can return — no more (nothing search hides is reachable) and no
+    // less (nothing search returns is unreachable). Each test below asserts its
+    // specific case AND that parity, via the helper.
+
+    /// The done-criterion, mechanized: the ordinals `search` can return and the
+    /// ordinals `vector_at` resolves must be the SAME set.
+    fn assert_visibility_parity(r: &Reader, d: usize) {
+        use std::collections::BTreeSet;
+        let query = vec![1.0f32; d];
+        // k = len means "everything not tombstoned", since search skips
+        // tombstones and keeps at most k hits.
+        let searchable: BTreeSet<u32> = if r.is_empty() {
+            BTreeSet::new()
+        } else {
+            r.search(&query, r.len())
+                .expect("search")
+                .iter()
+                .map(|h| h.id.0)
+                .collect()
+        };
+        let reachable: BTreeSet<u32> = (0..r.len() as u32)
+            .filter(|&o| r.vector_at(Ordinal(o)).is_some())
+            .collect();
+        assert_eq!(
+            searchable, reachable,
+            "vector_at and search disagree about which ordinals are visible"
+        );
+    }
+
+    #[test]
+    fn vector_at_returns_inserted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir, "vecat.bin");
+        let (mut w, r) = FlatIndex::create(&path, dim(3), 8).unwrap();
+
+        let vectors = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [-1.0, 0.5, 0.25]];
+        for v in &vectors {
+            w.insert(v).unwrap();
+        }
+
+        // Each ordinal returns its OWN vector — an off-by-one in the offset
+        // arithmetic would still return plausible-looking data, so every slot
+        // is checked, not just one.
+        for (k, want) in vectors.iter().enumerate() {
+            assert_eq!(
+                r.vector_at(Ordinal(k as u32)),
+                Some(want.as_slice()),
+                "ordinal {k}"
+            );
+        }
+        assert_visibility_parity(&r, 3);
+    }
+
+    #[test]
+    fn vector_at_respects_published_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir, "vecpub.bin");
+        let (mut w, r) = FlatIndex::create(&path, dim(2), 64).unwrap();
+
+        // A sparse write publishes the high-water mark, so slots BELOW it that
+        // were never written are visible as zeros — to search, and therefore to
+        // vector_at as well. Pinning this is the point: vector_at must not
+        // invent extra hiding that search does not do (the engine's defence
+        // against these phantom zero-slots is the tombstone, not the reader).
+        w.write_at(3, &[1.0, 1.0]).unwrap();
+        assert_eq!(r.len(), 4);
+        assert_eq!(r.vector_at(Ordinal(3)), Some([1.0, 1.0].as_slice()));
+        assert_eq!(
+            r.vector_at(Ordinal(0)),
+            Some([0.0, 0.0].as_slice()),
+            "a never-written slot below the published count reads as zeros, as search sees it"
+        );
+
+        // Above the high-water mark the slot is mapped and zero-filled, but
+        // UNPUBLISHED — invisible to search, so invisible here.
+        assert_eq!(
+            r.vector_at(Ordinal(4)),
+            None,
+            "ordinal at the published count"
+        );
+        assert_eq!(
+            r.vector_at(Ordinal(40)),
+            None,
+            "well past the count, still in capacity"
+        );
+
+        assert_visibility_parity(&r, 2);
+    }
+
+    #[test]
+    fn vector_at_skips_tombstoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir, "vectomb.bin");
+        let (mut w, r) = FlatIndex::create(&path, dim(2), 8).unwrap();
+        w.write_at(0, &[1.0, 0.0]).unwrap();
+        w.write_at(1, &[2.0, 0.0]).unwrap();
+        w.write_at(2, &[3.0, 0.0]).unwrap();
+
+        w.delete(1).unwrap();
+
+        assert_eq!(
+            r.vector_at(Ordinal(1)),
+            None,
+            "tombstoned ordinal is not reachable"
+        );
+        assert_eq!(r.vector_at(Ordinal(0)), Some([1.0, 0.0].as_slice()));
+        assert_eq!(r.vector_at(Ordinal(2)), Some([3.0, 0.0].as_slice()));
+        assert_visibility_parity(&r, 2);
+
+        // The Reader-side tombstone path (uncommitted-insert cleanup) hides the
+        // ordinal just the same — search and vector_at share one bitset.
+        r.tombstone_uncommitted(2).unwrap();
+        assert_eq!(r.vector_at(Ordinal(2)), None);
+        assert_visibility_parity(&r, 2);
+    }
+
+    #[test]
+    fn vector_at_out_of_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir, "vecoob.bin");
+        let (mut w, r) = FlatIndex::create(&path, dim(2), 4).unwrap();
+        w.insert(&[1.0, 1.0]).unwrap();
+        assert_eq!(r.len(), 1);
+
+        // At the count, past the count, past CAPACITY, and the extreme value —
+        // all None, none of them a panic or an out-of-mapping read.
+        assert_eq!(r.vector_at(Ordinal(1)), None);
+        assert_eq!(r.vector_at(Ordinal(4)), None, "at capacity");
+        assert_eq!(r.vector_at(Ordinal(9_999)), None, "far past capacity");
+        assert_eq!(
+            r.vector_at(Ordinal(u32::MAX)),
+            None,
+            "no overflow in the offset math"
+        );
+    }
+
+    #[test]
+    fn vector_at_on_empty_index_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir, "vecempty.bin");
+        let (_w, r) = FlatIndex::create(&path, dim(2), 4).unwrap();
+        assert_eq!(r.vector_at(Ordinal(0)), None);
+        assert_visibility_parity(&r, 2);
     }
 }

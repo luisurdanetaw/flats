@@ -18,6 +18,7 @@ pub mod sql;
 pub mod vm;
 pub mod compiler;
 
+pub use crate::engine::cursor::Cursor;
 pub use crate::engine::{CollectionConfig, Db, DbOptions};
 pub use crate::error::{Error, Result};
 pub use crate::metadata::{ColumnSpec, ColumnType, RangeOp, Row, Schema, Value};

@@ -4,8 +4,9 @@
 //! COMPILER → VM → optimizer**. This module is the SQLite-lineage codegen step:
 //! a pure *structural* translation of the already-resolved, already-validated
 //! plan into the instruction stream. It does no execution and no catalog
-//! access — everything it needs is the plan plus the collection's storage
-//! [`Schema`], handed in by the caller.
+//! access — everything it needs is the plan plus, for a statement against an
+//! EXISTING collection, that collection's storage [`Schema`], handed in by the
+//! caller. (A `CREATE` supplies its own; see below.)
 //!
 //! # The one lookup it performs: declaration ordinal → storage location
 //!
@@ -35,26 +36,45 @@
 //! why emission is recursive and `Project` passes a *body* DOWN into `Scan`
 //! rather than emitting after it returns.
 //!
-//! # Phase 7i status (this commit)
+//! # Where the CREATE schema comes from
 //!
-//! API skeleton + the full test suite. Every emission body is `unimplemented!()`,
-//! so the crate compiles and the compiler tests fail *at* `unimplemented!()`.
-//! Phase 7j fills the bodies in; the signatures here are stable.
+//! Every other statement compiles against an EXISTING collection, so its
+//! storage schema is a catalog lookup the caller performs. A `CREATE` has no
+//! catalog entry yet — the collection is what it is about to make — so its
+//! storage schema can only be derived from the DDL. [`compile`] does that
+//! itself via [`to_metadata_schema`], and interns the result: the
+//! `Const::Schema` a CREATE program carries is lowered from the very statement
+//! being compiled, never echoed back from the caller's `schema` argument.
 
 use crate::compiler::bytecode::{Addr, Cursor, Op, Program, Reg};
 use crate::compiler::constants::{Const, ConstPool};
+use crate::compiler::schema::{SchemaError, to_metadata_schema};
 use crate::metadata::common::{ColumnLocation, DeclarationOrdinal, Schema};
 use crate::sql::ast::Literal;
 use crate::sql::plan::LogicalPlan;
+use std::fmt;
 
 /// Compile a resolved [`LogicalPlan`] into a [`Program`].
 ///
-/// `schema` is the target collection's STORAGE schema (the vector-inclusive
+/// `schema` is the TARGET COLLECTION'S storage schema (the vector-inclusive
 /// [`Schema`] whose [`locate`](Schema::locate) maps declaration ordinals to
 /// storage locations). The caller looks it up from the same catalog the binder
 /// used and hands it in; the compiler itself stays catalog-free.
-pub fn compile(plan: LogicalPlan, schema: &Schema) -> Program {
-    let mut compiler = Compiler::new(schema);
+///
+/// It is **ignored for `CREATE COLLECTION`**, which has no existing collection
+/// to describe — see the module header. Nothing about the emitted program
+/// depends on what a caller passes there.
+pub fn compile(plan: LogicalPlan, schema: &Schema) -> Result<Program, CompileError> {
+    // THE one fallible step, hoisted out of emission on purpose: doing it here
+    // rather than in the CREATE arm keeps `emit_node` — and the recursive body
+    // closures threaded through it — infallible, so the `?` never has to travel
+    // back up through a `FnMut`.
+    let created = match &plan {
+        LogicalPlan::CreateCollection(create) => Some(to_metadata_schema(&create.schema)?),
+        _ => None,
+    };
+
+    let mut compiler = Compiler::new(schema, created);
     // The plan root emits itself. Wrapper nodes (Scan) thread a per-row body
     // DOWN into their loop; the root therefore receives an empty top-level body
     // (the leaf nodes ignore the body entirely).
@@ -62,7 +82,42 @@ pub fn compile(plan: LogicalPlan, schema: &Schema) -> Program {
     // Every program halts once the root's code is done — a Scan's loop has
     // already fallen through to here, an Insert/Create has finished its op.
     compiler.emit(Op::Halt);
-    compiler.finish()
+    Ok(compiler.finish())
+}
+
+/// Why a plan could not be compiled.
+///
+/// A stage-local error type (CLAUDE.md §5), currently with one cause: a `CREATE`
+/// whose bound schema does not lower to a valid storage schema. Emission itself
+/// is infallible — the binder and planner resolved everything — so every future
+/// variant will be of the same kind: a lowering the frontend could not have
+/// checked.
+#[derive(Debug)]
+pub enum CompileError {
+    /// A `CREATE COLLECTION`'s schema could not be lowered to storage form.
+    Schema(SchemaError),
+}
+
+impl From<SchemaError> for CompileError {
+    fn from(e: SchemaError) -> Self {
+        CompileError::Schema(e)
+    }
+}
+
+impl fmt::Display for CompileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompileError::Schema(e) => write!(f, "cannot compile CREATE COLLECTION: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CompileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CompileError::Schema(e) => Some(e),
+        }
+    }
 }
 
 /// The compiler's working state: the growing instruction stream, the constant
@@ -86,13 +141,17 @@ struct Compiler<'a> {
     /// loop), threaded into the per-row body. `None` outside any loop.
     cursor: Option<Cursor>,
     /// The target collection's storage schema — the source of the ordinal →
-    /// storage-location translation.
+    /// storage-location translation. Unused when compiling a `CREATE`.
     schema: &'a Schema,
+    /// For a `CREATE`, the storage schema [`compile`] lowered from the DDL,
+    /// waiting to be interned. `None` for every other plan.
+    created: Option<Schema>,
 }
 
 impl<'a> Compiler<'a> {
-    /// A fresh compiler for a plan compiled against `schema`.
-    fn new(schema: &'a Schema) -> Self {
+    /// A fresh compiler for a plan compiled against `schema`, carrying the
+    /// pre-lowered `created` schema when the plan is a `CREATE`.
+    fn new(schema: &'a Schema, created: Option<Schema>) -> Self {
         Compiler {
             ops: Vec::new(),
             consts: ConstPool::new(),
@@ -100,6 +159,7 @@ impl<'a> Compiler<'a> {
             next_cursor: 0,
             cursor: None,
             schema,
+            created,
         }
     }
 
@@ -286,10 +346,18 @@ impl<'a> Compiler<'a> {
             }
 
             LogicalPlan::CreateCollection(create) => {
-                // LEAF: one fat op. The interned schema is the STORAGE schema the
-                // caller built from the DDL and handed to `compile` — the single
-                // source the VM later persists, never a second build.
-                let schema = self.consts.add(Const::Schema(self.schema.clone()));
+                // LEAF: one fat op. The interned schema is the one `compile`
+                // LOWERED FROM THIS STATEMENT'S DDL — never `self.schema`, which
+                // describes an existing collection and, for a CREATE, is
+                // whatever the caller happened to have in hand. It is the single
+                // source the VM later persists; there is never a second build.
+                let lowered = match self.created.take() {
+                    Some(schema) => schema,
+                    // `compile` lowers it before emission begins, so reaching
+                    // here means the two dispatches disagree about the plan.
+                    None => unreachable!("compile did not lower the CREATE schema"),
+                };
+                let schema = self.consts.add(Const::Schema(lowered));
                 self.emit(Op::CreateCollection {
                     name: create.name.clone(),
                     schema,
@@ -313,9 +381,9 @@ impl<'a> Compiler<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::compile;
+    use super::{CompileError, compile};
     use crate::compiler::bytecode::{Addr, Cursor, Op, Program, Reg};
-    use crate::compiler::constants::{Const, ConstPool};
+    use crate::compiler::constants::{Const, ConstId, ConstPool};
     use crate::metadata::common::{
         CollectionConfig, ColumnSpec, ColumnType as MetaColumnType, Schema,
     };
@@ -493,7 +561,10 @@ mod tests {
             2,
             1,
         );
-        assert_eq!(compile(plan, &docs_meta_schema()), expected);
+        assert_eq!(
+            compile(plan, &docs_meta_schema()).expect("compiles"),
+            expected
+        );
     }
 
     #[test]
@@ -546,7 +617,10 @@ mod tests {
             3,
             1,
         );
-        assert_eq!(compile(plan, &docs_meta_schema()), expected);
+        assert_eq!(
+            compile(plan, &docs_meta_schema()).expect("compiles"),
+            expected
+        );
     }
 
     #[test]
@@ -581,7 +655,10 @@ mod tests {
             1,
             1,
         );
-        assert_eq!(compile(plan, &docs_meta_schema()), expected);
+        assert_eq!(
+            compile(plan, &docs_meta_schema()).expect("compiles"),
+            expected
+        );
     }
 
     #[test]
@@ -622,7 +699,10 @@ mod tests {
             2,
             1,
         );
-        assert_eq!(compile(plan, &docs_meta_schema()), expected);
+        assert_eq!(
+            compile(plan, &docs_meta_schema()).expect("compiles"),
+            expected
+        );
     }
 
     #[test]
@@ -657,7 +737,10 @@ mod tests {
             1,
             1,
         );
-        assert_eq!(compile(plan, &docs_meta_schema()), expected);
+        assert_eq!(
+            compile(plan, &docs_meta_schema()).expect("compiles"),
+            expected
+        );
     }
 
     // ========================================================================
@@ -716,7 +799,10 @@ mod tests {
             5,
             1,
         );
-        assert_eq!(compile(plan, &docs_meta_schema()), expected);
+        assert_eq!(
+            compile(plan, &docs_meta_schema()).expect("compiles"),
+            expected
+        );
     }
 
     // ========================================================================
@@ -748,7 +834,66 @@ mod tests {
             0,
             0,
         );
-        assert_eq!(compile(plan, &docs_meta_schema()), expected);
+        assert_eq!(
+            compile(plan, &docs_meta_schema()).expect("compiles"),
+            expected
+        );
+    }
+
+    /// The interned schema is LOWERED FROM THE DDL, not echoed from the caller.
+    ///
+    /// Every other CREATE test passes a `schema` argument that happens to equal
+    /// the one the DDL lowers to, so none of them can tell the two apart. This
+    /// one passes a deliberately WRONG schema — different columns, different
+    /// dimension — and asserts the program still carries the DDL's.
+    #[test]
+    fn create_ignores_the_caller_schema_and_lowers_the_ddl() {
+        let plan = LogicalPlan::CreateCollection(CreateCollection {
+            name: "docs".to_string(),
+            schema: docs_bind_schema(),
+            capacity: 1_000_000,
+        });
+
+        // Nothing like `docs`: one scalar, a 2-dim vector, different names.
+        let unrelated = Schema::from_columns(vec![
+            ColumnSpec::Vector {
+                name: "other".to_string(),
+                dim: NonZeroUsize::new(2).unwrap(),
+            },
+            ColumnSpec::Scalar {
+                name: "junk".to_string(),
+                ty: MetaColumnType::Int,
+            },
+        ])
+        .expect("valid schema");
+
+        let program = compile(plan, &unrelated).expect("compiles");
+        assert_eq!(
+            program.consts.get(ConstId(0)),
+            Some(&Const::Schema(docs_meta_schema())),
+            "CREATE must intern the schema lowered from its own DDL"
+        );
+    }
+
+    /// A schema the binder accepts but storage cannot represent fails the
+    /// compile rather than producing a corrupt `Const::Schema`. `VECTOR(0)`
+    /// passes the binder (rule C counts vector columns, it does not check the
+    /// dimension) and dies here.
+    #[test]
+    fn create_with_unlowerable_schema_is_a_compile_error() {
+        let plan = LogicalPlan::CreateCollection(CreateCollection {
+            name: "bad".to_string(),
+            schema: BindSchema {
+                columns: vec![bcol("v", ColumnType::Vector(0), 0, true)],
+            },
+            capacity: 10,
+        });
+
+        let err = compile(plan, &docs_meta_schema()).unwrap_err();
+        assert!(matches!(
+            err,
+            CompileError::Schema(crate::compiler::schema::SchemaError::ZeroDimension { .. })
+        ));
     }
 
     /// SINGLE-SOURCE INVARIANT (schema drift guard). The `metadata::Schema` the
@@ -800,6 +945,11 @@ mod tests {
     #[test]
     fn compiled_program_passes_validate() {
         let plan = docs_project(vec![colref("author", 1), colref("title", 2)], false);
-        assert!(compile(plan, &docs_meta_schema()).validate().is_ok());
+        assert!(
+            compile(plan, &docs_meta_schema())
+                .expect("compiles")
+                .validate()
+                .is_ok()
+        );
     }
 }
