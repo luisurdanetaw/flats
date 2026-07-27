@@ -29,8 +29,8 @@
 use std::fmt;
 
 use crate::sql::ast::{
-    ColumnDef, ColumnType, CollectionOption, CreateStmt, InsertStmt, Literal, Projection,
-    SelectStmt, Statement,
+    CollectionOption, ColumnDef, ColumnType, CreateStmt, InsertStmt, Literal, Projection,
+    SearchStmt, SelectStmt, Statement,
 };
 use crate::sql::lexer::{LexError, Lexer, Span, SpannedToken, Token};
 
@@ -219,18 +219,19 @@ impl Parser {
 
     // -- one function per grammar rule -------------------------------------
 
-    /// `statement := (select | insert | create) ';'`
+    /// `statement := (select | insert | create | search) ';'`
     pub fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         let stmt = match self.peek() {
             Token::Select => Statement::Select(self.parse_select()?),
             Token::Insert => Statement::Insert(self.parse_insert()?),
             Token::Create => Statement::CreateCollection(self.parse_create()?),
-            // EXTEND: dispatch Search/Delete/Update on their leading keyword.
+            Token::Search => Statement::Search(self.parse_search()?),
+            // EXTEND: dispatch Delete/Update on their leading keyword.
             Token::Eof => return Err(self.error(ParseErrorKind::UnexpectedEof)),
             _ => {
                 let found = format!("{:?}", self.peek());
                 return Err(self.error(ParseErrorKind::UnexpectedToken {
-                    expected: "SELECT, INSERT, or CREATE".to_string(),
+                    expected: "SELECT, INSERT, CREATE, or SEARCH".to_string(),
                     found,
                 }));
             }
@@ -246,6 +247,31 @@ impl Parser {
         self.expect(Token::From)?;
         let from = self.expect_ident()?;
         Ok(SelectStmt { projection, from })
+    }
+
+    /// `search := SEARCH TOP int_lit NEAREST TO vector_lit FROM ident`
+    ///
+    /// Every keyword is required and positional, so a missing one is an
+    /// `UnexpectedToken` naming what was wanted. The query reuses
+    /// [`parse_vector_lit`](Self::parse_vector_lit) — the same production an
+    /// `INSERT`'s embedding goes through — so the two can never drift.
+    fn parse_search(&mut self) -> Result<SearchStmt, ParseError> {
+        self.expect(Token::Search)?;
+        self.expect(Token::Top)?;
+        let k = self.expect_int()?;
+        self.expect(Token::Nearest)?;
+        self.expect(Token::To)?;
+        // Requiring the `[` here is what makes `SearchStmt::query` always a
+        // `Literal::Vector`: a string or a bare number after `TO` is a parse
+        // error, not something a later stage has to re-check.
+        let query = Literal::Vector(self.parse_vector_lit()?);
+        self.expect(Token::From)?;
+        let collection = self.expect_ident()?;
+        Ok(SearchStmt {
+            k,
+            query,
+            collection,
+        })
     }
 
     /// `projection := '*' | ident (',' ident)*`
@@ -409,10 +435,12 @@ impl Parser {
             Literal::Float(f) => Ok(f as f32),
             // parse_number only ever yields Int or Float; stay exhaustive
             // without panicking.
-            Literal::Vector(_) | Literal::Str(_) => Err(self.error(ParseErrorKind::UnexpectedToken {
-                expected: "number".to_string(),
-                found: "non-numeric literal".to_string(),
-            })),
+            Literal::Vector(_) | Literal::Str(_) => {
+                Err(self.error(ParseErrorKind::UnexpectedToken {
+                    expected: "number".to_string(),
+                    found: "non-numeric literal".to_string(),
+                }))
+            }
         }
     }
 
@@ -465,6 +493,108 @@ mod tests {
 
     fn cols(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    // -- SEARCH ------------------------------------------------------------
+    //
+    // `search := SEARCH TOP int_lit NEAREST TO vector_lit FROM ident`
+    // Bare form only — no RETURNING, no WHERE.
+
+    #[test]
+    fn parses_bare_search() {
+        assert_eq!(
+            ok("SEARCH TOP 5 NEAREST TO [0.1, 0.2, 0.3] FROM docs;"),
+            Statement::Search(SearchStmt {
+                k: 5,
+                query: Literal::Vector(vec![0.1, 0.2, 0.3]),
+                collection: "docs".to_string(),
+            })
+        );
+        // Keywords are case-insensitive, like every other statement.
+        assert_eq!(
+            ok("search top 5 nearest to [0.1, 0.2, 0.3] from docs;"),
+            ok("SEARCH TOP 5 NEAREST TO [0.1, 0.2, 0.3] FROM docs;")
+        );
+        // ...and the collection name keeps its source case.
+        match ok("SEARCH TOP 1 NEAREST TO [1.0] FROM MyDocs;") {
+            Statement::Search(s) => assert_eq!(s.collection, "MyDocs"),
+            other => panic!("expected Search, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_k_is_the_top_integer() {
+        // Several values, so a hard-coded or off-by-one `k` cannot pass.
+        for n in [1, 5, 10, 1000] {
+            match ok(&format!("SEARCH TOP {n} NEAREST TO [1.0, 2.0] FROM docs;")) {
+                Statement::Search(s) => assert_eq!(s.k, n, "TOP {n}"),
+                other => panic!("expected Search, got {other:?}"),
+            }
+        }
+        // `TOP 0` PARSES. It is meaningless, but "k must be >= 1" is a semantic
+        // rule, and the parser does not do semantics — the binder rejects it.
+        match ok("SEARCH TOP 0 NEAREST TO [1.0] FROM docs;") {
+            Statement::Search(s) => assert_eq!(s.k, 0),
+            other => panic!("expected Search, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_query_is_a_vector_literal() {
+        // The query slot holds the SAME `Literal::Vector` an INSERT carries —
+        // not a string, not a bare `Vec<f32>`, not a new type. That is what lets
+        // a later stage intern it as `Const::Vector` with no conversion, exactly
+        // as `INSERT` already does.
+        match ok("SEARCH TOP 3 NEAREST TO [0.5, -0.25, 0.125] FROM docs;") {
+            Statement::Search(s) => {
+                assert_eq!(s.query, Literal::Vector(vec![0.5, -0.25, 0.125]));
+                // Integer elements coerce to f32, the same rule vector literals
+                // already follow everywhere else.
+                match ok("SEARCH TOP 3 NEAREST TO [1, 2, 3] FROM docs;") {
+                    Statement::Search(s) => {
+                        assert_eq!(s.query, Literal::Vector(vec![1.0, 2.0, 3.0]))
+                    }
+                    other => panic!("expected Search, got {other:?}"),
+                }
+            }
+            other => panic!("expected Search, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_search_is_a_parse_error() {
+        // One case per token the grammar requires. Each is a clean `ParseError`
+        // — `err` panics if any of these parses OR panics.
+        for src in [
+            // missing TOP
+            "SEARCH 5 NEAREST TO [1.0] FROM docs;",
+            // non-integer TOP
+            "SEARCH TOP many NEAREST TO [1.0] FROM docs;",
+            "SEARCH TOP 1.5 NEAREST TO [1.0] FROM docs;",
+            "SEARCH TOP 'five' NEAREST TO [1.0] FROM docs;",
+            // missing NEAREST
+            "SEARCH TOP 5 TO [1.0] FROM docs;",
+            // missing TO
+            "SEARCH TOP 5 NEAREST [1.0] FROM docs;",
+            // missing the query vector
+            "SEARCH TOP 5 NEAREST TO FROM docs;",
+            // a non-vector where the query belongs
+            "SEARCH TOP 5 NEAREST TO 'not a vector' FROM docs;",
+            "SEARCH TOP 5 NEAREST TO 42 FROM docs;",
+            // unterminated vector
+            "SEARCH TOP 5 NEAREST TO [1.0, 2.0 FROM docs;",
+            // missing FROM
+            "SEARCH TOP 5 NEAREST TO [1.0] docs;",
+            // missing the collection
+            "SEARCH TOP 5 NEAREST TO [1.0] FROM;",
+            // missing the terminator
+            "SEARCH TOP 5 NEAREST TO [1.0] FROM docs",
+            // nothing after the keyword
+            "SEARCH;",
+            "SEARCH",
+        ] {
+            let _ = err(src);
+        }
     }
 
     // -- SELECT ------------------------------------------------------------
@@ -530,14 +660,27 @@ mod tests {
 
     #[test]
     fn types_resolve_by_position() {
-        let stmt = ok("CREATE COLLECTION c (a VECTOR(4), b TEXT, d INT, e FLOAT) WITH (capacity = 1);");
+        let stmt =
+            ok("CREATE COLLECTION c (a VECTOR(4), b TEXT, d INT, e FLOAT) WITH (capacity = 1);");
         assert_eq!(
             create_columns(&stmt),
             vec![
-                ColumnDef { name: "a".to_string(), ty: ColumnType::Vector(4) },
-                ColumnDef { name: "b".to_string(), ty: ColumnType::Text },
-                ColumnDef { name: "d".to_string(), ty: ColumnType::Int },
-                ColumnDef { name: "e".to_string(), ty: ColumnType::Float },
+                ColumnDef {
+                    name: "a".to_string(),
+                    ty: ColumnType::Vector(4)
+                },
+                ColumnDef {
+                    name: "b".to_string(),
+                    ty: ColumnType::Text
+                },
+                ColumnDef {
+                    name: "d".to_string(),
+                    ty: ColumnType::Int
+                },
+                ColumnDef {
+                    name: "e".to_string(),
+                    ty: ColumnType::Float
+                },
             ]
         );
     }
@@ -549,7 +692,10 @@ mod tests {
         assert_eq!(lower, upper);
         assert_eq!(
             create_columns(&lower),
-            vec![ColumnDef { name: "author".to_string(), ty: ColumnType::Text }]
+            vec![ColumnDef {
+                name: "author".to_string(),
+                ty: ColumnType::Text
+            }]
         );
     }
 
@@ -559,7 +705,10 @@ mod tests {
         let stmt = ok("CREATE COLLECTION docs (vector VECTOR(768)) WITH (capacity = 1);");
         assert_eq!(
             create_columns(&stmt),
-            vec![ColumnDef { name: "vector".to_string(), ty: ColumnType::Vector(768) }]
+            vec![ColumnDef {
+                name: "vector".to_string(),
+                ty: ColumnType::Vector(768)
+            }]
         );
     }
 
@@ -575,7 +724,10 @@ mod tests {
         match stmt {
             Statement::CreateCollection(c) => assert_eq!(
                 c.options,
-                vec![CollectionOption { name: "capacity".to_string(), value: 1000000 }]
+                vec![CollectionOption {
+                    name: "capacity".to_string(),
+                    value: 1000000
+                }]
             ),
             other => panic!("expected CreateCollection, got {other:?}"),
         }
@@ -593,20 +745,29 @@ mod tests {
     #[test]
     fn vector_literal_parses() {
         let stmt = ok("INSERT INTO docs (v) VALUES ([0.1, 0.2, 0.3]);");
-        assert_eq!(insert_values(&stmt), vec![Literal::Vector(vec![0.1, 0.2, 0.3])]);
+        assert_eq!(
+            insert_values(&stmt),
+            vec![Literal::Vector(vec![0.1, 0.2, 0.3])]
+        );
     }
 
     #[test]
     fn negative_vector_literal_applies_signs() {
         // proves the lexer's separate-Minus decision cashes out end to end.
         let stmt = ok("INSERT INTO docs (v) VALUES ([-0.1, 0.2, -0.3]);");
-        assert_eq!(insert_values(&stmt), vec![Literal::Vector(vec![-0.1, 0.2, -0.3])]);
+        assert_eq!(
+            insert_values(&stmt),
+            vec![Literal::Vector(vec![-0.1, 0.2, -0.3])]
+        );
     }
 
     #[test]
     fn integer_vector_elements_coerce_to_f32() {
         let stmt = ok("INSERT INTO docs (v) VALUES ([1, 0, 0]);");
-        assert_eq!(insert_values(&stmt), vec![Literal::Vector(vec![1.0, 0.0, 0.0])]);
+        assert_eq!(
+            insert_values(&stmt),
+            vec![Literal::Vector(vec![1.0, 0.0, 0.0])]
+        );
     }
 
     #[test]
@@ -703,12 +864,27 @@ mod tests {
             Statement::CreateCollection(CreateStmt {
                 name: "docs".to_string(),
                 columns: vec![
-                    ColumnDef { name: "vector".to_string(), ty: ColumnType::Vector(768) },
-                    ColumnDef { name: "author".to_string(), ty: ColumnType::Text },
-                    ColumnDef { name: "title".to_string(), ty: ColumnType::Text },
-                    ColumnDef { name: "published_at".to_string(), ty: ColumnType::Int },
+                    ColumnDef {
+                        name: "vector".to_string(),
+                        ty: ColumnType::Vector(768)
+                    },
+                    ColumnDef {
+                        name: "author".to_string(),
+                        ty: ColumnType::Text
+                    },
+                    ColumnDef {
+                        name: "title".to_string(),
+                        ty: ColumnType::Text
+                    },
+                    ColumnDef {
+                        name: "published_at".to_string(),
+                        ty: ColumnType::Int
+                    },
                 ],
-                options: vec![CollectionOption { name: "capacity".to_string(), value: 1000000 }],
+                options: vec![CollectionOption {
+                    name: "capacity".to_string(),
+                    value: 1000000
+                }],
             })
         );
     }

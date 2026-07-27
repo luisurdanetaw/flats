@@ -229,6 +229,16 @@ pub enum BindError {
         /// How many vector columns were declared (valid schemas have exactly 1).
         found: usize,
     },
+    /// The statement is valid V-SQL, but this layer does not bind it yet.
+    ///
+    /// Present so a newly-parseable statement cannot reach an unhandled match
+    /// arm: the grammar for a feature lands before its semantics do, and in
+    /// that window `Db::execute` must report a clean error rather than panic on
+    /// input a user can type. Remove the arm when the binding lands.
+    Unbound {
+        /// Which statement kind.
+        statement: &'static str,
+    },
     // EXTEND: DuplicateColumn, UnknownOption, ... as later phases need.
 }
 
@@ -262,6 +272,9 @@ impl fmt::Display for BindError {
                 f,
                 "a collection must have exactly one VECTOR column, found {found}"
             ),
+            BindError::Unbound { statement } => {
+                write!(f, "{statement} is parsed but not implemented yet")
+            }
         }
     }
 }
@@ -281,7 +294,13 @@ pub fn analyze(stmt: Statement, catalog: &impl Catalog) -> Result<BoundStatement
         Statement::CreateCollection(c) => {
             bind_create(c, catalog).map(BoundStatement::CreateCollection)
         }
-        // EXTEND: Search/Delete/Update dispatch here as those statements land.
+        // The SEARCH GRAMMAR exists (commit 1) but its binding does not. An
+        // explicit arm, not a wildcard: when the binding lands, deleting this
+        // line is what forces the real one to be written.
+        Statement::Search(_) => Err(BindError::Unbound {
+            statement: "SEARCH",
+        }),
+        // EXTEND: Delete/Update dispatch here as those statements land.
     }
 }
 

@@ -36,7 +36,9 @@ pub enum Statement {
     Insert(InsertStmt),
     /// `CREATE COLLECTION …`
     CreateCollection(CreateStmt),
-    // EXTEND: Search(SearchStmt), Delete(DeleteStmt), Update(UpdateStmt).
+    /// `SEARCH TOP … NEAREST TO … FROM …`
+    Search(SearchStmt),
+    // EXTEND: Delete(DeleteStmt), Update(UpdateStmt).
 }
 
 /// `SELECT projection FROM ident`.
@@ -57,6 +59,29 @@ pub enum Projection {
     Star,
     /// An explicit column list, in source order.
     Columns(Vec<String>),
+}
+
+/// `SEARCH TOP k NEAREST TO [query] FROM collection` — the bare vector search.
+///
+/// Deliberately minimal: no `RETURNING`, no `WHERE`. Both are additive later —
+/// an `Option` field each — rather than a reshape of this node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchStmt {
+    /// The `TOP` count. Carried as the lexed integer, unvalidated: the grammar
+    /// already excludes a negative (the lexer emits `-` as its own token), but
+    /// `TOP 0` parses fine and is the BINDER's to reject — the parser does not
+    /// do semantics.
+    pub k: i64,
+    /// The query vector.
+    ///
+    /// Typed as [`Literal`], not `Vec<f32>`, so it is the SAME vector-literal an
+    /// `INSERT` carries and a later stage can intern it as a `Const::Vector`
+    /// unchanged. The parser only ever produces [`Literal::Vector`] here — it
+    /// requires a `[` after `TO` — so the other variants are unreachable by
+    /// construction, at the cost of the type not saying so.
+    pub query: Literal,
+    /// The collection name after `FROM`.
+    pub collection: String,
 }
 
 /// `CREATE COLLECTION name ( columns ) WITH ( options )`.

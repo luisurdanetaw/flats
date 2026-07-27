@@ -308,6 +308,10 @@ impl Target {
             Statement::Select(s) => Target::Existing(s.from.clone()),
             Statement::Insert(i) => Target::Existing(i.collection.clone()),
             Statement::CreateCollection(_) => Target::New,
+            // A SEARCH reads an existing collection, like a SELECT. (The binder
+            // rejects it for now — see `BindError::Unbound` — but this is the
+            // right answer, so the arm is real rather than a placeholder.)
+            Statement::Search(s) => Target::Existing(s.collection.clone()),
         }
     }
 }
