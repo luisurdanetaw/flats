@@ -82,6 +82,8 @@ pub struct Cursor<'a> {
     /// How many ordinals were skipped as `Missing`/`Deleted`. Diagnostics only
     /// — a healthy scan under concurrent writes reports a nonzero count.
     skipped: u64,
+    /// How many rows were actually materialized out of the tuple store.
+    fetched: u64,
 }
 
 impl<'a> Cursor<'a> {
@@ -105,6 +107,7 @@ impl<'a> Cursor<'a> {
             current: None,
             row: None,
             skipped: 0,
+            fetched: 0,
         }
     }
 
@@ -139,6 +142,7 @@ impl<'a> Cursor<'a> {
                 RowGet::Live(values) => {
                     self.current = Some(ordinal);
                     self.row = Some(values);
+                    self.fetched += 1;
                     return Ok(true);
                 }
                 // World A: both are routine. Skip, count, keep going.
@@ -179,6 +183,31 @@ impl<'a> Cursor<'a> {
     /// Diagnostics; a nonzero count under concurrent writes is HEALTHY.
     pub fn skipped(&self) -> u64 {
         self.skipped
+    }
+
+    /// How many rows this cursor has materialized out of the tuple store.
+    ///
+    /// This is a STORAGE-READ COUNT, not a bookkeeping tally: it is incremented
+    /// at the one place [`tuples::Reader::get`] returns
+    /// [`Live`](RowGet::Live), so `fetched() + skipped()` is exactly the number
+    /// of `get` calls the cursor has issued. That is what makes it usable as
+    /// evidence that a scan is LAZY — a consumer that stops after `k` rows
+    /// leaves this at `k`, while an eager implementation would show the whole
+    /// collection. See `vm::exec`'s `select_is_lazy_not_materialized`.
+    pub fn fetched(&self) -> u64 {
+        self.fetched
+    }
+
+    /// The projection this cursor was built with — the [`ColumnId`]s it
+    /// materializes, in the order [`row`](Self::row) returns them.
+    ///
+    /// Exposed so a caller holding a storage `ColumnId` (the VM's `Op::Column`
+    /// operand) can find its POSITION rather than assume the two coincide. They
+    /// do for a [`Db::scan`](crate::Db::scan) cursor and will not for a narrower
+    /// projection, and that assumption would fail silently by returning the
+    /// wrong column's value.
+    pub fn columns(&self) -> &[ColumnId] {
+        &self.columns
     }
 }
 

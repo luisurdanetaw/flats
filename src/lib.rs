@@ -17,9 +17,15 @@ pub mod metadata;
 pub mod sql;
 pub mod vm;
 pub mod compiler;
+pub mod query;
 
 pub use crate::engine::cursor::Cursor;
 pub use crate::engine::{CollectionConfig, Db, DbOptions};
 pub use crate::error::{Error, Result};
+// The query pipeline's boundary types. `query::Error` is deliberately NOT
+// re-exported unqualified — `Error` above is the ENGINE's, and two types with
+// that name at the crate root would be exactly the confusion the stage-local
+// error split exists to prevent (CLAUDE.md §5).
+pub use crate::query::{Error as QueryError, RowStream};
 pub use crate::metadata::{ColumnSpec, ColumnType, RangeOp, Row, Schema, Value};
 pub use simd::dot;

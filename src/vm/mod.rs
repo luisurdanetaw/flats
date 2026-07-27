@@ -21,8 +21,10 @@
 //! They are built and tested ahead of the loop because each is a real
 //! translation with a way to be silently wrong — not plumbing.
 
+pub mod exec;
 pub mod record;
 pub mod value;
 
+pub use exec::{ExecError, OutputRow, RegValue, Vm};
 pub use record::{Record, SplitError, split_record};
 pub use value::ValueError;

@@ -40,6 +40,7 @@ use std::fmt;
 
 use crate::metadata::common::Value;
 use crate::sql::ast::Literal;
+use crate::vm::exec::RegValue;
 
 /// Why a [`Literal`] could not be lowered to a storage [`Value`].
 ///
@@ -95,6 +96,59 @@ impl From<&Value> for Literal {
             Value::Int(n) => Literal::Int(*n),
             Value::Float(f) => Literal::Float(*f),
             Value::Text(s) => Literal::Str(s.clone()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The register end of the same bridge
+//
+// The VM adds a third vocabulary: a REGISTER holds a `RegValue`. The two
+// conversions below are its edges, and they are the reason the whole insert path
+// reads `register → Literal → Value`:
+//
+//   Op::String / VectorConst / Integer / Real   pool or operand → RegValue
+//   Op::MakeRecord                              RegValue → Literal  (here)
+//   split_record                                Literal  → Value    (Prompt 4)
+//
+// and the read path is the mirror: `Op::Column` turns a stored `Value` straight
+// into a `RegValue` (below), skipping `Literal` because there is no packed
+// record on the way out.
+// ---------------------------------------------------------------------------
+
+/// A register's contents as a [`Literal`], for packing into a
+/// [`Record`](super::record::Record).
+///
+/// `None` for [`RegValue::Unset`] and [`RegValue::Record`] — a register that was
+/// never written, and a record nested inside a record. Both are emitter bugs
+/// with precise [`ExecError`](super::exec::ExecError) variants, so this returns
+/// `Option` rather than inventing a third error type for cases the caller can
+/// already name better.
+///
+/// The vector arm COPIES: `RegValue` holds an `Arc<[f32]>` but `Literal::Vector`
+/// owns a `Vec<f32>`. That is the one place the two representations disagree,
+/// and it costs one copy per inserted row — acceptable because `Db::insert`
+/// copies again into the WAL record anyway. Making `Record` hold `RegValue`
+/// directly would remove the hop; it is not worth rewriting `split_record` for.
+pub fn to_literal(value: &RegValue) -> Option<Literal> {
+    // No wildcard: a new `RegValue` variant must be classified here.
+    match value {
+        RegValue::Int(n) => Some(Literal::Int(*n)),
+        RegValue::Real(f) => Some(Literal::Float(*f)),
+        RegValue::Str(s) => Some(Literal::Str(s.clone())),
+        RegValue::Vector(v) => Some(Literal::Vector(v.to_vec())),
+        RegValue::Unset | RegValue::Record(_) => None,
+    }
+}
+
+/// A stored value as a register's contents, for [`Op::Column`](crate::compiler::Op).
+/// Total — every stored scalar has a register form.
+impl From<&Value> for RegValue {
+    fn from(value: &Value) -> RegValue {
+        match value {
+            Value::Int(n) => RegValue::Int(*n),
+            Value::Float(f) => RegValue::Real(*f),
+            Value::Text(s) => RegValue::Str(s.clone()),
         }
     }
 }
