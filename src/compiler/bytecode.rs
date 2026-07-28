@@ -44,6 +44,11 @@
 //                                     Emitted ONLY when include_vector is true —
 //                                     the vector is never read via Column.
 //
+//   RowId        cur, dst             read the current row's ORDINAL (its id)
+//                                     into `dst`
+//   Score        cur, dst             read the current row's similarity score
+//                                     into `dst`. KnnScan cursors only.
+//
 // Loading values
 //   Integer      value, dst           load an i64 literal
 //   Real         value, dst           load an f64 literal
@@ -73,7 +78,7 @@
 // Control
 //   Halt                              stop execution
 //
-// 17 opcodes = a working engine, vector search included.
+// 19 opcodes = a working engine, vector search and RETURNING included.
 //
 // ---------------------------------------------------------------------------
 // EXTEND: — not built yet. Added one statement at a time, as emission demands.
@@ -102,10 +107,11 @@
 //   SIMD loop inside one opcode, not 100k dispatches. This is the one place the
 //   "one opcode = one operation on one row" rule is intentionally broken.
 //
-//   SCORES are computed by the kernel but NOT threaded into registers yet —
-//   bare SEARCH returns rows, not scores. `RETURNING id, score` is what makes
-//   them observable, and it lands by parking the score in a register that
-//   `ResultRow` already knows how to emit (seam (c)).
+//   SCORES reach the caller through `Score`, which parks one in a register that
+//   `ResultRow` already knows how to emit — no new output machinery, because
+//   `ResultRow` reads REGISTERS rather than columns (seam (c)). That is also why
+//   `RETURNING title, score` costs nothing extra: by the time the row is emitted
+//   a stored column and a computed one are indistinguishable.
 //
 // LIMIT
 //   SetCounter      k, r              initialize a counter register
@@ -264,6 +270,32 @@ pub enum Op {
         /// Destination register (receives a handle).
         dst: Reg,
     },
+    /// Read the current row's ORDINAL — its stable id within the collection —
+    /// into `dst`.
+    ///
+    /// A per-row read off a cursor, like [`Op::Column`], but the value is the
+    /// row's identity rather than one of its stored columns. No existing
+    /// register-load covers it: `Integer` is a compile-time literal and `Column`
+    /// reads the tuple store, while the ordinal is the cursor's own position.
+    RowId {
+        /// Cursor whose current row is read.
+        cur: Cursor,
+        /// Destination register.
+        dst: Reg,
+    },
+    /// Read the current row's SIMILARITY SCORE into `dst`.
+    ///
+    /// Valid only on a cursor opened by [`Op::KnnScan`] — a plain scan has no
+    /// scores, and asking for one is an error rather than a zero. Separate from
+    /// [`Op::RowId`] rather than one op with a selector flag: an op whose
+    /// behavior switches on a flag is really several ops (see the module
+    /// header's smells).
+    Score {
+        /// Cursor whose current row is read.
+        cur: Cursor,
+        /// Destination register.
+        dst: Reg,
+    },
     /// Load an `i64` literal into `dst`.
     Integer {
         /// The literal value.
@@ -400,7 +432,7 @@ impl Program {
                     self.check_cursor(at, *cur)?;
                     self.check_reg(at, *dst)?;
                 }
-                Op::VectorFetch { cur, dst } => {
+                Op::VectorFetch { cur, dst } | Op::RowId { cur, dst } | Op::Score { cur, dst } => {
                     self.check_cursor(at, *cur)?;
                     self.check_reg(at, *dst)?;
                 }
@@ -558,4 +590,3 @@ impl fmt::Display for ValidateError {
 }
 
 impl std::error::Error for ValidateError {}
-

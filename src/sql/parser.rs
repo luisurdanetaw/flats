@@ -249,7 +249,8 @@ impl Parser {
         Ok(SelectStmt { projection, from })
     }
 
-    /// `search := SEARCH TOP int_lit NEAREST TO vector_lit FROM ident`
+    /// `search := SEARCH TOP int_lit NEAREST TO vector_lit FROM ident
+    ///            (RETURNING ident (',' ident)*)?`
     ///
     /// Every keyword is required and positional, so a missing one is an
     /// `UnexpectedToken` naming what was wanted. The query reuses
@@ -267,10 +268,24 @@ impl Parser {
         let query = Literal::Vector(self.parse_vector_lit()?);
         self.expect(Token::From)?;
         let collection = self.expect_ident()?;
+        // OPTIONAL. Absent means the default projection — see
+        // `SearchStmt::projection` for why that is `None` and not an empty list.
+        let projection = if *self.peek() == Token::Returning {
+            self.advance();
+            let mut names = vec![self.expect_ident()?];
+            while *self.peek() == Token::Comma {
+                self.advance();
+                names.push(self.expect_ident()?);
+            }
+            Some(names)
+        } else {
+            None
+        };
         Ok(SearchStmt {
             k,
             query,
             collection,
+            projection,
         })
     }
 
@@ -508,6 +523,7 @@ mod tests {
                 k: 5,
                 query: Literal::Vector(vec![0.1, 0.2, 0.3]),
                 collection: "docs".to_string(),
+                projection: None,
             })
         );
         // Keywords are case-insensitive, like every other statement.
@@ -558,6 +574,67 @@ mod tests {
                 }
             }
             other => panic!("expected Search, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_returning_list() {
+        // The list is recorded IN SOURCE ORDER and left unclassified: at parse
+        // time `id`, `score` and `title` are all just identifiers. Deciding
+        // which are pseudo-columns needs the schema, so it is the binder's.
+        match ok("SEARCH TOP 5 NEAREST TO [1.0] FROM docs RETURNING id, score;") {
+            Statement::Search(s) => {
+                assert_eq!(s.projection, Some(cols(&["id", "score"])));
+                // ...and the rest of the statement is unaffected.
+                assert_eq!(s.k, 5);
+                assert_eq!(s.collection, "docs");
+            }
+            other => panic!("expected Search, got {other:?}"),
+        }
+        // Order is preserved, not normalized.
+        match ok("SEARCH TOP 1 NEAREST TO [1.0] FROM docs RETURNING score, title, id;") {
+            Statement::Search(s) => assert_eq!(s.projection, Some(cols(&["score", "title", "id"]))),
+            other => panic!("expected Search, got {other:?}"),
+        }
+        // A single item is a list of one, not a special case.
+        match ok("SEARCH TOP 1 NEAREST TO [1.0] FROM docs RETURNING title;") {
+            Statement::Search(s) => assert_eq!(s.projection, Some(cols(&["title"]))),
+            other => panic!("expected Search, got {other:?}"),
+        }
+        // RETURNING is case-insensitive like every other keyword.
+        assert_eq!(
+            ok("search top 1 nearest to [1.0] from docs returning id;"),
+            ok("SEARCH TOP 1 NEAREST TO [1.0] FROM docs RETURNING id;")
+        );
+    }
+
+    #[test]
+    fn no_returning_is_none() {
+        // Absence is `None`, NOT an empty list — commit 2's default projection
+        // (every scalar column) is what `None` means, and an empty `Some(vec![])`
+        // would be a different statement entirely.
+        match ok("SEARCH TOP 5 NEAREST TO [1.0] FROM docs;") {
+            Statement::Search(s) => assert_eq!(s.projection, None),
+            other => panic!("expected Search, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_returning_is_a_parse_error() {
+        for src in [
+            // RETURNING with nothing after it
+            "SEARCH TOP 5 NEAREST TO [1.0] FROM docs RETURNING;",
+            // trailing comma
+            "SEARCH TOP 5 NEAREST TO [1.0] FROM docs RETURNING id,;",
+            // leading comma
+            "SEARCH TOP 5 NEAREST TO [1.0] FROM docs RETURNING , id;",
+            // a literal where a name belongs
+            "SEARCH TOP 5 NEAREST TO [1.0] FROM docs RETURNING 5;",
+            "SEARCH TOP 5 NEAREST TO [1.0] FROM docs RETURNING 'title';",
+            // RETURNING before FROM
+            "SEARCH TOP 5 NEAREST TO [1.0] RETURNING id FROM docs;",
+        ] {
+            let _ = err(src);
         }
     }
 

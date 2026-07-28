@@ -20,7 +20,9 @@
 //! signature is the whole point of splitting analysis from planning.
 //!
 
-use crate::sql::bind::{BoundCreate, BoundInsert, BoundSearch, BoundSelect, BoundStatement};
+use crate::sql::bind::{
+    BoundCreate, BoundInsert, BoundSearch, BoundSelect, BoundStatement, Projected,
+};
 use crate::sql::plan::{CreateCollection, Insert, Knn, LogicalPlan, Project, Scan};
 
 /// Build the [`LogicalPlan`] for an already-bound statement. Infallible: the
@@ -47,7 +49,13 @@ fn plan_select(bound: BoundSelect) -> LogicalPlan {
             collection: bound.from,
             schema: bound.schema,
         })),
-        columns: bound.projection,
+        // A `SELECT` can only project stored columns — the binder has no way to
+        // produce a pseudo-column here — so every item wraps.
+        columns: bound
+            .projection
+            .into_iter()
+            .map(Projected::Column)
+            .collect(),
         include_vector: bound.include_vector,
     })
 }
@@ -100,7 +108,7 @@ mod tests {
     use crate::sql::ast::{ColumnType, Literal};
     use crate::sql::bind::{
         BoundCreate, BoundInsert, BoundSearch, BoundSelect, BoundStatement, Catalog, ColumnRef,
-        ColumnSchema, Schema, TypedValue, analyze,
+        ColumnSchema, Projected, Schema, TypedValue, analyze,
     };
     use crate::sql::parser::parse;
     use crate::sql::plan::{CreateCollection, Insert, Knn, LogicalPlan, Project, Scan};
@@ -164,13 +172,19 @@ mod tests {
     }
 
     /// A `Project` over the `docs` scan, for terse expectations.
+    /// Wrap plain column refs as projection items — a `SELECT`'s projection is
+    /// always stored columns.
+    fn stored(columns: Vec<ColumnRef>) -> Vec<Projected> {
+        columns.into_iter().map(Projected::Column).collect()
+    }
+
     fn docs_project(columns: Vec<ColumnRef>, include_vector: bool) -> LogicalPlan {
         LogicalPlan::Project(Project {
             input: Box::new(LogicalPlan::Scan(Scan {
                 collection: "docs".to_string(),
                 schema: docs_schema(),
             })),
-            columns,
+            columns: stored(columns),
             include_vector,
         })
     }
@@ -268,7 +282,7 @@ mod tests {
             schema: docs_schema(),
             k: 5,
             query: vec![0.5; 768],
-            projection: vec![colref("author", 1), colref("title", 2)],
+            projection: stored(vec![colref("author", 1), colref("title", 2)]),
         });
         assert_eq!(
             plan(bound),
@@ -279,7 +293,7 @@ mod tests {
                     k: 5,
                     query: vec![0.5; 768],
                 })),
-                columns: vec![colref("author", 1), colref("title", 2)],
+                columns: stored(vec![colref("author", 1), colref("title", 2)]),
                 // Bare SEARCH never returns the embedding — the same rule
                 // `SELECT *` follows.
                 include_vector: false,
@@ -303,7 +317,7 @@ mod tests {
                 schema: docs_schema(),
                 k,
                 query: query.clone(),
-                projection: vec![colref("author", 1)],
+                projection: stored(vec![colref("author", 1)]),
             });
             match plan(bound) {
                 LogicalPlan::Project(p) => match *p.input {
@@ -407,11 +421,11 @@ mod tests {
                 })),
                 // Bare SEARCH has no projection clause, so the binder supplies
                 // every scalar in schema order — `SELECT *`'s expansion.
-                columns: vec![
+                columns: stored(vec![
                     colref("author", 1),
                     colref("title", 2),
                     colref("published_at", 3),
-                ],
+                ]),
                 include_vector: false,
             })
         );

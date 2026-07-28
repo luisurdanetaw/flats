@@ -69,9 +69,10 @@ pub enum Token {
     Nearest,
     /// `TO`
     To,
-    // EXTEND: future reserved keywords (Where, And, Or, Delete, Update, Set,
-    // Returning, …) get a variant here AND an arm in `keyword()` — nothing else
-    // changes.
+    /// `RETURNING`
+    Returning,
+    // EXTEND: future reserved keywords (Where, And, Or, Delete, Update, Set, …)
+    // get a variant here AND an arm in `keyword()` — nothing else changes.
 
     // -- identifiers & literals ---------------------------------------------
     /// An identifier. Also carries *type names* (`VECTOR`, `INT`, `TEXT`,
@@ -220,6 +221,7 @@ fn keyword(word: &str) -> Option<Token> {
         "top" => Some(Token::Top),
         "nearest" => Some(Token::Nearest),
         "to" => Some(Token::To),
+        "returning" => Some(Token::Returning),
         // EXTEND: future reserved keywords here.
         _ => None,
     }

@@ -63,6 +63,7 @@ use crate::compiler::constants::{Const, ConstPool};
 use crate::compiler::schema::{SchemaError, to_metadata_schema};
 use crate::metadata::common::{ColumnLocation, DeclarationOrdinal, Schema};
 use crate::sql::ast::Literal;
+use crate::sql::bind::{Projected, Pseudo};
 use crate::sql::plan::LogicalPlan;
 use std::fmt;
 
@@ -339,35 +340,59 @@ impl<'a> Compiler<'a> {
                 // must speak the SAME `'a` the outer `body` expects.
                 let mut row_body = |c: &mut Compiler<'a>| {
                     let base = c.next_reg;
-                    for col in &project.columns {
-                        // THE ordinal translation: ask the schema where this
-                        // declaration ordinal lives — never compute it here.
-                        // `compile` proved a non-CREATE plan has a schema
-                        // before emission began.
-                        let schema = match c.schema {
-                            Some(schema) => schema,
-                            None => unreachable!("a read compiled without a catalog schema"),
-                        };
-                        match schema.locate(DeclarationOrdinal::new(col.ordinal)) {
-                            Some(ColumnLocation::Scalar(id)) => {
+                    for item in &project.columns {
+                        // ONE loop for both statements. Every item ends up in a
+                        // register, and by the time `ResultRow` runs below, a
+                        // value read from storage and one the query computed are
+                        // indistinguishable — that is seam (c), and it is why
+                        // `RETURNING title, score` needs no special case.
+                        match item {
+                            // A computed pseudo-column: no schema lookup, because
+                            // there is nothing stored to look up.
+                            Projected::Pseudo(Pseudo::Id) => {
                                 let dst = c.alloc_reg();
                                 let cur = c.current_cursor();
-                                c.emit(Op::Column { cur, col: id, dst });
+                                c.emit(Op::RowId { cur, dst });
                             }
-                            Some(ColumnLocation::Vector { .. }) => {
-                                // The embedding is fetched from the flat index,
-                                // never read as a Column — and only when the
-                                // projection asked for it.
-                                if project.include_vector {
-                                    let dst = c.alloc_reg();
-                                    let cur = c.current_cursor();
-                                    c.emit(Op::VectorFetch { cur, dst });
+                            Projected::Pseudo(Pseudo::Score) => {
+                                let dst = c.alloc_reg();
+                                let cur = c.current_cursor();
+                                c.emit(Op::Score { cur, dst });
+                            }
+                            Projected::Column(col) => {
+                                // THE ordinal translation: ask the schema where
+                                // this declaration ordinal lives — never compute
+                                // it here. `compile` proved a non-CREATE plan has
+                                // a schema before emission began.
+                                let schema = match c.schema {
+                                    Some(schema) => schema,
+                                    None => {
+                                        unreachable!("a read compiled without a catalog schema")
+                                    }
+                                };
+                                match schema.locate(DeclarationOrdinal::new(col.ordinal)) {
+                                    Some(ColumnLocation::Scalar(id)) => {
+                                        let dst = c.alloc_reg();
+                                        let cur = c.current_cursor();
+                                        c.emit(Op::Column { cur, col: id, dst });
+                                    }
+                                    Some(ColumnLocation::Vector { .. }) => {
+                                        // The embedding is fetched from the flat
+                                        // index, never read as a Column — and
+                                        // only when the projection asked for it.
+                                        if project.include_vector {
+                                            let dst = c.alloc_reg();
+                                            let cur = c.current_cursor();
+                                            c.emit(Op::VectorFetch { cur, dst });
+                                        }
+                                    }
+                                    // The plan is already validated, so every
+                                    // ordinal resolves; a miss is a
+                                    // compiler/schema-pairing bug.
+                                    None => {
+                                        unreachable!("plan ordinal {} not in schema", col.ordinal)
+                                    }
                                 }
-                            }
-                            // The plan is already validated, so every ordinal
-                            // resolves; a miss is a compiler/schema-pairing bug.
-                            None => {
-                                unreachable!("plan ordinal {} not in schema", col.ordinal)
                             }
                         }
                     }
@@ -463,7 +488,7 @@ mod tests {
         CollectionConfig, ColumnSpec, ColumnType as MetaColumnType, Schema,
     };
     use crate::sql::ast::{ColumnType, Literal};
-    use crate::sql::bind::{ColumnRef, ColumnSchema, Schema as BindSchema, TypedValue};
+    use crate::sql::bind::{ColumnRef, ColumnSchema, Projected, Schema as BindSchema, TypedValue};
     use crate::sql::plan::{CreateCollection, Insert, LogicalPlan, Project, Scan};
     use std::num::NonZeroUsize;
 
@@ -546,11 +571,17 @@ mod tests {
         })
     }
 
+    /// Wrap plain column refs as projection items — a `SELECT`'s projection is
+    /// always stored columns.
+    fn stored(columns: Vec<ColumnRef>) -> Vec<Projected> {
+        columns.into_iter().map(Projected::Column).collect()
+    }
+
     /// A `Project` over the `docs` scan.
     fn docs_project(columns: Vec<ColumnRef>, include_vector: bool) -> LogicalPlan {
         LogicalPlan::Project(Project {
             input: Box::new(docs_scan()),
-            columns,
+            columns: stored(columns),
             include_vector,
         })
     }
@@ -983,7 +1014,7 @@ mod tests {
                 collection: "docs".to_string(),
                 schema: docs_bind_schema(),
             })),
-            columns: vec![colref("author", 1)],
+            columns: stored(vec![colref("author", 1)]),
             include_vector: false,
         });
 

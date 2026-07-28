@@ -17,14 +17,15 @@
 //! # Types
 //!
 //! This file is **types only** — no logic. The resolved support types
-//! ([`Schema`], [`ColumnRef`], [`TypedValue`]) are REUSED from the binder, not
+//! ([`Schema`], [`ColumnRef`](crate::sql::bind::ColumnRef), [`TypedValue`])
+//! are REUSED from the binder, not
 //! redefined here, so a plan and its originating bound statement speak in
 //! exactly the same resolved vocabulary.
 
 // Every node derives Debug + Clone + PartialEq: the planner tests assert whole
 // plans with `assert_eq!`, so structural equality is load-bearing.
 
-use crate::sql::bind::{ColumnRef, Schema, TypedValue};
+use crate::sql::bind::{Projected, Schema, TypedValue};
 
 /// One resolved query plan — the relational-algebra root the compiler consumes.
 #[derive(Debug, Clone, PartialEq)]
@@ -85,9 +86,14 @@ pub struct Project {
     /// a [`LogicalPlan::Knn`] for a `SEARCH`. Boxed because a plan is
     /// recursive.
     pub input: Box<LogicalPlan>,
-    /// The projected columns, bound to schema ordinals — carried through from
-    /// the bound projection.
-    pub columns: Vec<ColumnRef>,
+    /// What to emit per row, in output order — carried through from the bound
+    /// projection.
+    ///
+    /// [`Projected`] rather than a bare `ColumnRef` so ONE emission path serves both
+    /// statements: a `SELECT`'s items are always `Column`, a `SEARCH`'s may also
+    /// be the computed `id`/`score`. Widening this instead of giving `Knn` its
+    /// own projection is what keeps the two from drifting.
+    pub columns: Vec<Projected>,
     /// Split-storage flag, carried straight from the binder: `true` iff the
     /// embedding must be fetched from the flat vector index.
     pub include_vector: bool,

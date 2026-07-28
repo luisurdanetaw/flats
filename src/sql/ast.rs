@@ -82,6 +82,20 @@ pub struct SearchStmt {
     pub query: Literal,
     /// The collection name after `FROM`.
     pub collection: String,
+    /// The `RETURNING` list, in source order, or `None` when the clause was
+    /// omitted.
+    ///
+    /// `None` is NOT the same as `Some(vec![])`: it means "the default
+    /// projection" (every scalar column, as bare `SEARCH` has always returned),
+    /// whereas an empty list would be a request for no columns at all.
+    ///
+    /// The items are plain identifiers because at PARSE TIME they are
+    /// indistinguishable: `id` and `score` are computed pseudo-columns and
+    /// `title` is stored, but telling them apart needs the schema. That
+    /// classification is [`bind`](crate::sql::bind)'s. Same representation as
+    /// [`Projection::Columns`], deliberately — two different spellings of "a
+    /// list of projected names" in one AST would be a trap.
+    pub projection: Option<Vec<String>>,
 }
 
 /// `CREATE COLLECTION name ( columns ) WITH ( options )`.
