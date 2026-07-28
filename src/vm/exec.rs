@@ -58,6 +58,7 @@
 //! [`split_record`] cuts it into the embedding (flat index) and the
 //! `ColumnId`-keyed row (tuple store), because those go to different stores.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -66,7 +67,7 @@ use crate::compiler::constants::Const;
 use crate::engine::cursor::Cursor;
 use crate::engine::{CollectionId, Db};
 use crate::error::Error;
-use crate::metadata::common::Schema;
+use crate::metadata::common::{Ordinal, Schema};
 use crate::vm::record::{Record, SplitError, split_record};
 use crate::vm::value;
 
@@ -123,7 +124,25 @@ enum Slot {
     Closed,
     /// A read cursor. `Cursor<'static>` — it owns an `Arc` clone of the tuple
     /// reader, so a suspended stream borrows nothing.
-    Read(Box<Cursor<'static>>),
+    ///
+    /// `scores` is present only for a cursor opened by [`Op::KnnScan`]: the
+    /// similarity the kernel computed, KEYED BY ORDINAL.
+    ///
+    /// Keyed, not positional, and that is the whole correctness argument. The
+    /// obvious design — a parallel array plus an index bumped once per `Next` —
+    /// assumes the cursor consumes exactly one ordinal per step. It does not:
+    /// the cursor SKIPS any ordinal whose row is not materialized (a mid-apply
+    /// `Missing`, or a `Deleted` that landed in the tuple store before the flat
+    /// index), so one `Next` can swallow several ordinals and slide every
+    /// later row's score onto the wrong id. A map cannot drift, at the cost of
+    /// one small allocation per ranked query.
+    Read {
+        /// The cursor being walked.
+        cursor: Box<Cursor<'static>>,
+        /// ordinal → similarity, for a ranked read. `None` for a plain scan,
+        /// which has no scores to report.
+        scores: Option<HashMap<Ordinal, f32>>,
+    },
     /// A write cursor: the resolved collection and the schema `split_record`
     /// needs. Resolved ONCE at open time rather than per row.
     Write {
@@ -172,6 +191,7 @@ fn needs_db(op: &Op) -> bool {
         op,
         Op::OpenRead { .. }
             | Op::OpenWrite { .. }
+            | Op::KnnScan { .. }
             | Op::Insert { .. }
             | Op::CreateCollection { .. }
     )
@@ -193,6 +213,9 @@ fn mnemonic(op: &Op) -> &'static str {
         Op::ResultRow { .. } => "ResultRow",
         Op::MakeRecord { .. } => "MakeRecord",
         Op::Insert { .. } => "Insert",
+        Op::KnnScan { .. } => "KnnScan",
+        Op::RowId { .. } => "RowId",
+        Op::Score { .. } => "Score",
         Op::CreateCollection { .. } => "CreateCollection",
         Op::Halt => "Halt",
     }
@@ -305,17 +328,34 @@ impl Vm {
     /// exist yet: a future statement that opens a cursor mid-stream is rejected
     /// at the boundary instead of surprising a consumer.
     pub fn open_cursors(&mut self, db: &Db) -> Result<(), ExecError> {
-        while self.program.ops.get(self.pc).is_some_and(needs_db) {
-            // None of these ops yield or halt, so the flow is always `Next`.
-            self.exec_one(Some(db))?;
+        // Run until NOTHING AHEAD needs the database — not merely until the
+        // current op stops needing it. A `SEARCH`'s prologue is `VectorConst`
+        // (which does not) followed by `KnnScan` (which does), so stopping at
+        // the first self-sufficient op would detach one instruction too early
+        // and strand the scan.
+        while self.program.ops[self.pc..].iter().any(needs_db) {
+            match self.exec_one(Some(db))? {
+                Flow::Next => {}
+                // Producing a row, or finishing, before the last storage-facing
+                // op means the program interleaves reads with row production —
+                // it cannot be detached, and finding that out HERE is the point:
+                // no row has been handed out yet, so the caller can still report
+                // it as a compile-time failure.
+                Flow::Yield(_) | Flow::Halt => {
+                    let (at, op) = self.program.ops[self.pc..]
+                        .iter()
+                        .enumerate()
+                        .find(|(_, op)| needs_db(op))
+                        // The loop condition just proved one exists.
+                        .ok_or(ExecError::PcOutOfRange { pc: self.pc })?;
+                    return Err(ExecError::CannotDetach {
+                        op: mnemonic(op),
+                        at: self.pc + at,
+                    });
+                }
+            }
         }
-        match self.program.ops[self.pc..].iter().find(|op| needs_db(op)) {
-            Some(op) => Err(ExecError::CannotDetach {
-                op: mnemonic(op),
-                at: self.pc,
-            }),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
     /// The dispatch loop. Exits only at a yield, a halt, or an error.
@@ -396,7 +436,15 @@ impl Vm {
                     // is positioned before the first row and fetches one at a
                     // time, which is what makes the loop below lazy.
                     let cursor = db.scan(collection_id).map_err(ExecError::Engine)?;
-                    self.open(cur, Slot::Read(Box::new(cursor)))?;
+                    // A plain scan computes no similarities, so `Op::Score`
+                    // against this cursor is an error rather than a zero.
+                    self.open(
+                        cur,
+                        Slot::Read {
+                            cursor: Box::new(cursor),
+                            scores: None,
+                        },
+                    )?;
                 }
                 Op::SeekFirst { cur, end } => {
                     let (cur, end) = (*cur, *end);
@@ -419,6 +467,82 @@ impl Vm {
                         self.pc = body.0 as usize;
                         return Ok(Flow::Next);
                     }
+                }
+                Op::KnnScan {
+                    cur,
+                    collection,
+                    query,
+                    k,
+                } => {
+                    let (cur, query, k) = (*cur, *query, *k);
+                    let db = db.ok_or(ExecError::Detached { op: "KnnScan" })?;
+                    let vector = match self.reg(query) {
+                        Some(RegValue::Vector(v)) => v.clone(),
+                        _ => return Err(ExecError::NotAVector { reg: query.0 }),
+                    };
+                    let collection_id = db.collection_id(collection).map_err(ExecError::Engine)?;
+                    let k = usize::try_from(k).map_err(|_| ExecError::TopKOverflow { k })?;
+                    // The one coarse opcode: a whole SIMD top-k pass, not a
+                    // per-element interpreted loop. `search` already returns
+                    // most-similar first and excludes tombstones.
+                    let hits = db
+                        .search(collection_id, &vector, k)
+                        .map_err(ExecError::Engine)?;
+                    // SCORE ORDER IS THE PAYLOAD. Collect in the order `search`
+                    // ranked them and hand that straight to the cursor, which
+                    // imposes no order of its own — sorting here, or routing the
+                    // ordinals through a bitmap, would silently make the result
+                    // ascending and still look entirely plausible.
+                    let ranked: Vec<Ordinal> = hits.iter().map(|hit| hit.id).collect();
+                    // The scores travel with the cursor, keyed by ordinal, so
+                    // `Op::Score` can pair each row with its OWN similarity —
+                    // see `Slot::Read` for why a positional index would not do.
+                    let scores: HashMap<Ordinal, f32> =
+                        hits.into_iter().map(|hit| (hit.id, hit.score)).collect();
+                    let cursor = db
+                        .scan_over(collection_id, ranked.into_iter())
+                        .map_err(ExecError::Engine)?;
+                    self.open(
+                        cur,
+                        Slot::Read {
+                            cursor: Box::new(cursor),
+                            scores: Some(scores),
+                        },
+                    )?;
+                }
+                Op::RowId { cur, dst } => {
+                    let (cur, dst) = (*cur, *dst);
+                    let ordinal = self
+                        .read_cursor(cur)
+                        .ok_or(ExecError::NotAReadCursor { cur: cur.0 })?
+                        .ordinal()
+                        .ok_or(ExecError::CursorNotOnARow { cur: cur.0 })?;
+                    self.store(dst, RegValue::Int(ordinal.0 as i64))?;
+                }
+                Op::Score { cur, dst } => {
+                    let (cur, dst) = (*cur, *dst);
+                    let (cursor, scores) = match self.cursors.get(cur.0 as usize) {
+                        Some(Slot::Read { cursor, scores }) => (cursor, scores),
+                        Some(Slot::Closed) | None => {
+                            return Err(ExecError::CursorNotOpen { cur: cur.0 });
+                        }
+                        Some(Slot::Write { .. }) => {
+                            return Err(ExecError::NotAReadCursor { cur: cur.0 });
+                        }
+                    };
+                    // A plain scan produces no scores. Reporting that rather
+                    // than handing back a zero keeps "no similarity was
+                    // computed" from reading as "similarity 0".
+                    let scores = scores.as_ref().ok_or(ExecError::NoScores { cur: cur.0 })?;
+                    let ordinal = cursor
+                        .ordinal()
+                        .ok_or(ExecError::CursorNotOnARow { cur: cur.0 })?;
+                    // Looked up BY THIS ROW'S ORDINAL — never by how many times
+                    // the loop has gone round.
+                    let score = scores
+                        .get(&ordinal)
+                        .ok_or(ExecError::NoScoreForRow { ordinal: ordinal.0 })?;
+                    self.store(dst, RegValue::Real(*score as f64))?;
                 }
                 Op::Column { cur, col, dst } => {
                     let (cur, col, dst) = (*cur, *col, *dst);
@@ -585,7 +709,7 @@ impl Vm {
     /// proves the scan is lazy rather than asserting it.
     pub fn read_cursor(&self, cur: BytecodeCursor) -> Option<&Cursor<'static>> {
         match self.cursors.get(cur.0 as usize) {
-            Some(Slot::Read(cursor)) => Some(cursor),
+            Some(Slot::Read { cursor, .. }) => Some(cursor),
             _ => None,
         }
     }
@@ -593,7 +717,7 @@ impl Vm {
     /// The read cursor in slot `cur`, mutably — for the ops that ADVANCE it.
     fn read_cursor_mut(&mut self, cur: BytecodeCursor) -> Result<&mut Cursor<'static>, ExecError> {
         match self.cursors.get_mut(cur.0 as usize) {
-            Some(Slot::Read(cursor)) => Ok(cursor),
+            Some(Slot::Read { cursor, .. }) => Ok(cursor),
             Some(Slot::Closed) | None => Err(ExecError::CursorNotOpen { cur: cur.0 }),
             Some(Slot::Write { .. }) => Err(ExecError::NotAReadCursor { cur: cur.0 }),
         }
@@ -674,6 +798,29 @@ pub enum ExecError {
         op: &'static str,
         /// Where it sits in the instruction stream.
         at: usize,
+    },
+    /// `KnnScan`'s query register does not hold a vector.
+    NotAVector {
+        /// The register.
+        reg: u32,
+    },
+    /// `Score` was asked of a cursor that has no similarities — a plain scan
+    /// rather than a ranked read.
+    NoScores {
+        /// The slot.
+        cur: u8,
+    },
+    /// `Score` found no similarity for the row the cursor is parked on. The
+    /// cursor and the score map disagree about which ordinals the query
+    /// produced.
+    NoScoreForRow {
+        /// The offending ordinal.
+        ordinal: u32,
+    },
+    /// A `TOP k` operand does not fit in a `usize` on this target.
+    TopKOverflow {
+        /// The operand.
+        k: u64,
     },
     /// A capacity operand does not fit in a `usize` on this target.
     CapacityOverflow {
@@ -787,6 +934,16 @@ impl fmt::Display for ExecError {
                 write!(f, "capacity {capacity} does not fit in a usize")
             }
             ExecError::Engine(e) => write!(f, "{e}"),
+            ExecError::NotAVector { reg } => {
+                write!(f, "register r{reg} does not hold a query vector")
+            }
+            ExecError::TopKOverflow { k } => write!(f, "TOP {k} does not fit in a usize"),
+            ExecError::NoScores { cur } => {
+                write!(f, "cursor {cur} is not a ranked read, so it has no scores")
+            }
+            ExecError::NoScoreForRow { ordinal } => {
+                write!(f, "no similarity was computed for ordinal {ordinal}")
+            }
             ExecError::Detached { op } => {
                 write!(f, "{op} needs a database, but the program is detached")
             }
@@ -1698,6 +1855,106 @@ mod tests {
             vm.step(&db),
             Err(ExecError::ColumnNotProjected { cur: 0, col: 99 })
         ));
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn score_on_a_plain_scan_is_an_error() {
+        let (_dir, db) = docs_db();
+        db.insert(0, &embedding(1), row("alice", "doc", 1))
+            .expect("inserts");
+
+        // `Op::Score` only means something on a cursor `KnnScan` opened. A plain
+        // scan computed no similarities, and reporting that beats handing back a
+        // `0.0` that reads as "perfectly dissimilar" — a caller cannot tell the
+        // two apart, and every row would silently score the same.
+        //
+        // Unreachable through SQL (the binder only accepts `score` inside a
+        // SEARCH `RETURNING`), so hand-built bytecode is the only way to reach
+        // the guard at all.
+        let mut vm = Vm::new(Program {
+            ops: vec![
+                Op::OpenRead {
+                    cur: Cursor(0),
+                    collection: "docs".into(),
+                },
+                Op::SeekFirst {
+                    cur: Cursor(0),
+                    end: Addr(5),
+                },
+                Op::Score {
+                    cur: Cursor(0),
+                    dst: Reg(0),
+                },
+                Op::ResultRow {
+                    start: Reg(0),
+                    count: 1,
+                },
+                Op::Next {
+                    cur: Cursor(0),
+                    body: Addr(2),
+                },
+                Op::Halt,
+            ],
+            consts: ConstPool::new(),
+            n_regs: 1,
+            n_cursors: 1,
+        })
+        .expect("well-formed");
+
+        assert!(matches!(vm.step(&db), Err(ExecError::NoScores { cur: 0 })));
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn row_id_works_on_a_plain_scan() {
+        let (_dir, db) = docs_db();
+        for i in 0..3 {
+            db.insert(0, &embedding(i), row("alice", "doc", i))
+                .expect("inserts");
+        }
+
+        // `RowId`, unlike `Score`, is meaningful on ANY read cursor — the
+        // ordinal is the cursor's own position, not something a ranked query
+        // computed. Nothing in V-SQL emits it outside a SEARCH yet, but the op
+        // is not KNN-specific and should not pretend to be.
+        let mut vm = Vm::new(Program {
+            ops: vec![
+                Op::OpenRead {
+                    cur: Cursor(0),
+                    collection: "docs".into(),
+                },
+                Op::SeekFirst {
+                    cur: Cursor(0),
+                    end: Addr(5),
+                },
+                Op::RowId {
+                    cur: Cursor(0),
+                    dst: Reg(0),
+                },
+                Op::ResultRow {
+                    start: Reg(0),
+                    count: 1,
+                },
+                Op::Next {
+                    cur: Cursor(0),
+                    body: Addr(2),
+                },
+                Op::Halt,
+            ],
+            consts: ConstPool::new(),
+            n_regs: 1,
+            n_cursors: 1,
+        })
+        .expect("well-formed");
+
+        for expected in 0..3 {
+            assert_eq!(
+                vm.step(&db).expect("reads"),
+                Some(OutputRow(vec![RegValue::Int(expected)]))
+            );
+        }
+        assert_eq!(vm.step(&db).expect("reads"), None);
         db.close().unwrap();
     }
 

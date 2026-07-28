@@ -57,7 +57,7 @@ use std::fmt;
 use crate::compiler::bytecode::{Op, Program, ValidateError};
 use crate::compiler::compile;
 use crate::engine::Db;
-use crate::sql::bind::BoundStatement;
+use crate::sql::bind::{BoundStatement, Projected};
 use crate::sql::{BindError, ParseError, Statement, analyze, parse, plan};
 use crate::vm::exec::{ExecError, OutputRow, Vm};
 
@@ -308,6 +308,10 @@ impl Target {
             Statement::Select(s) => Target::Existing(s.from.clone()),
             Statement::Insert(i) => Target::Existing(i.collection.clone()),
             Statement::CreateCollection(_) => Target::New,
+            // A SEARCH reads an existing collection, like a SELECT. (The binder
+            // rejects it for now — see `BindError::Unbound` — but this is the
+            // right answer, so the arm is real rather than a placeholder.)
+            Statement::Search(s) => Target::Existing(s.collection.clone()),
         }
     }
 }
@@ -323,6 +327,20 @@ fn labels_of(bound: &BoundStatement) -> Vec<String> {
         BoundStatement::Select(select) => {
             select.projection.iter().map(|c| c.name.clone()).collect()
         }
+        // A SEARCH's labels are its RETURNING names in order — or, with no
+        // clause, the default projection's, like a `SELECT *`.
+        BoundStatement::Search(search) => search
+            .projection
+            .iter()
+            .map(|item| match item {
+                // The SCHEMA's spelling, not the source's — the same rule a
+                // SELECT column follows.
+                Projected::Column(col) => col.name.clone(),
+                // Canonical lowercase, for the same reason: a label is what the
+                // column IS, not how this particular query happened to spell it.
+                Projected::Pseudo(pseudo) => pseudo.name().to_string(),
+            })
+            .collect(),
         BoundStatement::Insert(_) | BoundStatement::CreateCollection(_) => Vec::new(),
     }
 }
@@ -675,6 +693,411 @@ mod tests {
         let star = db.execute("SELECT * FROM docs;").expect("compiles");
         assert_eq!(star.labels(), ["author", "title", "published_at"]);
         assert_eq!(collect(star).len(), 3);
+
+        db.close().unwrap();
+    }
+
+    // -- SEARCH: the first vector query -------------------------------------
+
+    /// Seed rows whose embeddings have a KNOWN dot-product order against the
+    /// query `[1, 0, 0, 0]`, and whose INSERT order is deliberately different
+    /// from their score order — so a result that came back in ordinal order
+    /// cannot be mistaken for a result that came back ranked.
+    ///
+    ///   title  embedding      dot([1,0,0,0])   ordinal   rank
+    ///   far    [1, 0, 0, 0]        1.0            0        3rd
+    ///   near   [3, 0, 0, 0]        3.0            1        1st
+    ///   mid    [2, 0, 0, 0]        2.0            2        2nd
+    fn seed_ranked(db: &Db) {
+        for (title, x, n) in [("far", 1.0, 1), ("near", 3.0, 2), ("mid", 2.0, 3)] {
+            db.execute(&format!(
+                "INSERT INTO docs (author, vector, title, published_at) \
+                 VALUES ('alice', [{x}, 0.0, 0.0, 0.0], '{title}', {n});"
+            ))
+            .expect("seeded row inserts");
+        }
+    }
+
+    /// The `title` column of each returned row, in the order the stream gave
+    /// them — the whole point of a ranked query.
+    fn titles(stream: RowStream) -> Vec<String> {
+        collect(stream)
+            .into_iter()
+            .map(|row| match &row[1] {
+                RegValue::Str(s) => s.clone(),
+                other => panic!("expected a title string, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bare_search_returns_nearest_in_score_order() {
+        let (_dir, db) = docs_db();
+        seed_ranked(&db);
+
+        let stream = db
+            .execute("SEARCH TOP 3 NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM docs;")
+            .expect("compiles and runs");
+        // Bare SEARCH projects every scalar, like `SELECT *`.
+        assert_eq!(stream.labels(), ["author", "title", "published_at"]);
+
+        // NEAREST FIRST. Ordinal order would be far, near, mid — so this
+        // assertion fails outright if the ranking is dropped anywhere between
+        // `search()` and the cursor.
+        assert_eq!(titles(stream), ["near", "mid", "far"]);
+
+        // The scalar columns come back whole, not just the ranked ordinals.
+        let stream = db
+            .execute("SEARCH TOP 1 NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM docs;")
+            .expect("compiles and runs");
+        assert_eq!(
+            collect(stream),
+            vec![vec![
+                RegValue::Str("alice".into()),
+                RegValue::Str("near".into()),
+                RegValue::Int(2),
+            ]]
+        );
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn search_top_k_limits_the_result() {
+        let (_dir, db) = docs_db();
+        // Five rows, so `k` is neither the row count nor a coincidence.
+        for n in 1..=5 {
+            db.execute(&format!(
+                "INSERT INTO docs (author, vector, title, published_at) \
+                 VALUES ('alice', [{n}.0, 0.0, 0.0, 0.0], 'doc {n}', {n});"
+            ))
+            .expect("inserts");
+        }
+
+        for k in [1, 3, 5] {
+            let stream = db
+                .execute(&format!(
+                    "SEARCH TOP {k} NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM docs;"
+                ))
+                .expect("compiles and runs");
+            assert_eq!(collect(stream).len(), k, "TOP {k}");
+        }
+        // Asking for more than exist yields what exists, not an error.
+        let stream = db
+            .execute("SEARCH TOP 50 NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM docs;")
+            .expect("compiles and runs");
+        assert_eq!(collect(stream).len(), 5);
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn search_dimension_mismatch_is_a_bind_error() {
+        let (_dir, db) = docs_db();
+        seed_ranked(&db);
+
+        // `docs.vector` is VECTOR(4). A wrong-length query is caught by the
+        // BINDER, before anything is compiled or run — the same rule and the
+        // same error an INSERT's embedding gets.
+        assert!(matches!(
+            db.execute("SEARCH TOP 3 NEAREST TO [1.0, 0.0] FROM docs;"),
+            Err(Error::Bind(BindError::DimensionMismatch {
+                expected: 4,
+                found: 2,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            db.execute("SEARCH TOP 3 NEAREST TO [1.0, 0.0, 0.0, 0.0, 0.0] FROM docs;"),
+            Err(Error::Bind(BindError::DimensionMismatch {
+                expected: 4,
+                found: 5,
+                ..
+            }))
+        ));
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn search_unknown_collection_is_a_bind_error() {
+        let (_dir, db) = docs_db();
+        // Same resolution path, same error a SELECT gets.
+        assert!(matches!(
+            db.execute("SEARCH TOP 3 NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM ghosts;"),
+            Err(Error::Bind(BindError::CollectionNotFound(name))) if name == "ghosts"
+        ));
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn search_top_zero_is_a_bind_error() {
+        let (_dir, db) = docs_db();
+        seed_ranked(&db);
+
+        // `TOP 0` PARSES (pinned in the parser tests) — "k >= 1" is semantics,
+        // and this is where semantics live. It must not reach `Db::search`,
+        // which has its own opinion about k, nor quietly become an empty result.
+        assert!(matches!(
+            db.execute("SEARCH TOP 0 NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM docs;"),
+            Err(Error::Bind(BindError::InvalidTopK { k: 0 }))
+        ));
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn bare_search_end_to_end() {
+        // THE HEADLINE: a vector query, from a SQL string to ranked rows.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[], DbOptions::default()).unwrap();
+
+        db.execute(CREATE).expect("CREATE runs");
+        seed_ranked(&db);
+
+        let stream = db
+            .execute("SEARCH TOP 5 NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM docs;")
+            .expect("SEARCH compiles");
+        assert_eq!(stream.labels(), ["author", "title", "published_at"]);
+        assert_eq!(
+            collect(stream),
+            vec![
+                vec![
+                    RegValue::Str("alice".into()),
+                    RegValue::Str("near".into()),
+                    RegValue::Int(2),
+                ],
+                vec![
+                    RegValue::Str("alice".into()),
+                    RegValue::Str("mid".into()),
+                    RegValue::Int(3),
+                ],
+                vec![
+                    RegValue::Str("alice".into()),
+                    RegValue::Str("far".into()),
+                    RegValue::Int(1),
+                ],
+            ],
+            "nearest first, with every scalar column"
+        );
+
+        db.close().unwrap();
+    }
+
+    // -- RETURNING: the register seam, cashed in ----------------------------
+
+    /// Seed `n` rows where row `i` has embedding `[(i+1), 0, 0, 0]` and title
+    /// `doc i`. Against the query `[1, 0, 0, 0]` the dot product is exactly
+    /// `i + 1`, so:
+    ///
+    ///   * scores are DISTINCT and strictly ordered — an off-by-one between a
+    ///     row's id and its score is observable, not masked by a tie;
+    ///   * `score == id + 1` is an invariant every returned row must satisfy,
+    ///     which is a per-row check rather than a whole-list comparison;
+    ///   * insert order is the REVERSE of score order, so a result that came
+    ///     back unranked cannot pass.
+    fn seed_scored(db: &Db, n: i64) {
+        for i in 0..n {
+            db.execute(&format!(
+                "INSERT INTO docs (author, vector, title, published_at) \
+                 VALUES ('alice', [{}.0, 0.0, 0.0, 0.0], 'doc {i}', {i});",
+                i + 1
+            ))
+            .expect("seeded row inserts");
+        }
+    }
+
+    const QUERY: &str = "[1.0, 0.0, 0.0, 0.0]";
+
+    #[test]
+    fn returning_id_and_score() {
+        let (_dir, db) = docs_db();
+        seed_scored(&db, 4);
+
+        let stream = db
+            .execute(&format!(
+                "SEARCH TOP 4 NEAREST TO {QUERY} FROM docs RETURNING id, score;"
+            ))
+            .expect("compiles and runs");
+        // Labels are the RETURNING names, in order — NOT the collection's
+        // columns, which is what a bare SEARCH would have reported.
+        assert_eq!(stream.labels(), ["id", "score"]);
+
+        let rows = collect(stream);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows,
+            vec![
+                vec![RegValue::Int(3), RegValue::Real(4.0)],
+                vec![RegValue::Int(2), RegValue::Real(3.0)],
+                vec![RegValue::Int(1), RegValue::Real(2.0)],
+                vec![RegValue::Int(0), RegValue::Real(1.0)],
+            ],
+            "nearest first, each id paired with its own score"
+        );
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn score_aligns_with_its_ordinal() {
+        // THE load-bearing test. `score == id + 1` holds for every seeded row by
+        // construction, so ANY drift between a row's id and the score reported
+        // beside it breaks the invariant — including an index advanced one step
+        // out of step with the cursor, which is invisible to an assertion that
+        // only checks "scores descend".
+        let (_dir, db) = docs_db();
+        seed_scored(&db, 6);
+
+        for k in [1, 3, 6] {
+            let stream = db
+                .execute(&format!(
+                    "SEARCH TOP {k} NEAREST TO {QUERY} FROM docs RETURNING id, score;"
+                ))
+                .expect("compiles and runs");
+            let rows = collect(stream);
+            assert_eq!(rows.len(), k, "TOP {k}");
+
+            let mut previous: Option<f64> = None;
+            for row in rows {
+                let (id, score) = match (&row[0], &row[1]) {
+                    (RegValue::Int(id), RegValue::Real(score)) => (*id, *score),
+                    other => panic!("expected (Int, Real), got {other:?}"),
+                };
+                assert_eq!(
+                    score,
+                    (id + 1) as f64,
+                    "row {id} was reported with score {score}, but its own \
+                     similarity is {}",
+                    id + 1
+                );
+                // ...and the ranking still descends, so the invariant above is
+                // not being satisfied by an accidentally-sorted-by-id result.
+                if let Some(previous) = previous {
+                    assert!(score < previous, "scores must descend");
+                }
+                previous = Some(score);
+            }
+        }
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn returning_mixes_stored_and_computed() {
+        // SEAM (c), exercised rather than asserted: one value read from storage
+        // (`title`, via `Column`) sitting beside one the query computed
+        // (`score`). Both are just registers by the time `ResultRow` runs, which
+        // is exactly why this costs nothing. A design that special-cased
+        // pseudo-columns — emitting them through a separate path instead of into
+        // the register file — would fail here even if `RETURNING id, score`
+        // worked.
+        let (_dir, db) = docs_db();
+        seed_scored(&db, 3);
+
+        let stream = db
+            .execute(&format!(
+                "SEARCH TOP 3 NEAREST TO {QUERY} FROM docs RETURNING title, score;"
+            ))
+            .expect("compiles and runs");
+        assert_eq!(stream.labels(), ["title", "score"]);
+        assert_eq!(
+            collect(stream),
+            vec![
+                vec![RegValue::Str("doc 2".into()), RegValue::Real(3.0)],
+                vec![RegValue::Str("doc 1".into()), RegValue::Real(2.0)],
+                vec![RegValue::Str("doc 0".into()), RegValue::Real(1.0)],
+            ]
+        );
+
+        // Interleaved the other way, and with all three kinds at once.
+        let stream = db
+            .execute(&format!(
+                "SEARCH TOP 2 NEAREST TO {QUERY} FROM docs RETURNING score, id, title, author;"
+            ))
+            .expect("compiles and runs");
+        assert_eq!(stream.labels(), ["score", "id", "title", "author"]);
+        assert_eq!(
+            collect(stream),
+            vec![
+                vec![
+                    RegValue::Real(3.0),
+                    RegValue::Int(2),
+                    RegValue::Str("doc 2".into()),
+                    RegValue::Str("alice".into()),
+                ],
+                vec![
+                    RegValue::Real(2.0),
+                    RegValue::Int(1),
+                    RegValue::Str("doc 1".into()),
+                    RegValue::Str("alice".into()),
+                ],
+            ]
+        );
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn returning_labels_match_the_clause() {
+        let (_dir, db) = docs_db();
+        seed_scored(&db, 2);
+
+        for (clause, expected) in [
+            ("id", vec!["id"]),
+            ("score", vec!["score"]),
+            ("id, score", vec!["id", "score"]),
+            ("score, id", vec!["score", "id"]),
+            ("title", vec!["title"]),
+            (
+                "title, id, score, author",
+                vec!["title", "id", "score", "author"],
+            ),
+        ] {
+            let stream = db
+                .execute(&format!(
+                    "SEARCH TOP 1 NEAREST TO {QUERY} FROM docs RETURNING {clause};"
+                ))
+                .expect("compiles and runs");
+            assert_eq!(stream.labels(), expected.as_slice(), "RETURNING {clause}");
+            // Arity of the rows matches the labels, so a header can never
+            // promise more columns than the stream delivers.
+            assert_eq!(collect(stream)[0].len(), expected.len());
+        }
+
+        // No clause -> the bare-SEARCH default is untouched.
+        let stream = db
+            .execute(&format!("SEARCH TOP 1 NEAREST TO {QUERY} FROM docs;"))
+            .expect("compiles and runs");
+        assert_eq!(stream.labels(), ["author", "title", "published_at"]);
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn returning_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[], DbOptions::default()).unwrap();
+
+        db.execute(CREATE).expect("CREATE runs");
+        seed_scored(&db, 5);
+
+        let stream = db
+            .execute(&format!(
+                "SEARCH TOP 5 NEAREST TO {QUERY} FROM docs RETURNING id, score;"
+            ))
+            .expect("SEARCH compiles");
+        assert_eq!(stream.labels(), ["id", "score"]);
+        assert_eq!(
+            collect(stream),
+            vec![
+                vec![RegValue::Int(4), RegValue::Real(5.0)],
+                vec![RegValue::Int(3), RegValue::Real(4.0)],
+                vec![RegValue::Int(2), RegValue::Real(3.0)],
+                vec![RegValue::Int(1), RegValue::Real(2.0)],
+                vec![RegValue::Int(0), RegValue::Real(1.0)],
+            ]
+        );
 
         db.close().unwrap();
     }

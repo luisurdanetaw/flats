@@ -40,7 +40,7 @@
 use std::fmt;
 
 use crate::sql::ast::{
-    ColumnType, CreateStmt, InsertStmt, Literal, Projection, SelectStmt, Statement,
+    ColumnType, CreateStmt, InsertStmt, Literal, Projection, SearchStmt, SelectStmt, Statement,
 };
 
 // ---------------------------------------------------------------------------
@@ -141,7 +141,9 @@ pub enum BoundStatement {
     Insert(BoundInsert),
     /// A resolved `CREATE COLLECTION`.
     CreateCollection(BoundCreate),
-    // EXTEND: Search(BoundSearch), Delete(BoundDelete), Update(BoundUpdate).
+    /// A resolved `SEARCH`.
+    Search(BoundSearch),
+    // EXTEND: Delete(BoundDelete), Update(BoundUpdate).
 }
 
 /// A resolved `SELECT projection FROM from`.
@@ -171,6 +173,98 @@ pub struct BoundInsert {
     /// `(cols) VALUES (...)` list may be in any order; the three stores want
     /// canonical order).
     pub row: Vec<TypedValue>,
+}
+
+/// One resolved item of a `SEARCH`'s `RETURNING` list.
+///
+/// A SEARCH can project two things a SELECT cannot, because a ranked read
+/// produces them and a plain scan does not: the row's ordinal and its
+/// similarity score. Neither is stored, so neither can be a [`ColumnRef`] —
+/// hence the enum rather than a widened column list.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Projected {
+    /// A stored scalar column, bound to its schema ordinal like any `SELECT`
+    /// column.
+    Column(ColumnRef),
+    /// A computed pseudo-column.
+    Pseudo(Pseudo),
+}
+
+/// A value a `SEARCH` computes rather than stores.
+///
+/// # These names are reserved inside a `RETURNING`
+///
+/// `id` and `score` are matched case-insensitively and win over any stored
+/// column of the same name, so the meaning of `RETURNING score` does not depend
+/// on which collection it is aimed at.
+///
+/// `id` is already reserved engine-wide (`create_collection` rejects a column
+/// called `id`, since it would collide with the ordinal SEARCH returns).
+/// **`score` is NOT** — a collection may currently declare a `score` column, and
+/// that column then becomes unreachable through `RETURNING`. Closing that means
+/// adding `score` to the engine's reserved list, which is a storage-layer change
+/// and deliberately not made here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pseudo {
+    /// The row's ordinal — its stable id within the collection.
+    Id,
+    /// The similarity the kernel computed for this row against the query.
+    Score,
+}
+
+impl Pseudo {
+    /// The canonical label, for a result header.
+    pub fn name(self) -> &'static str {
+        match self {
+            Pseudo::Id => "id",
+            Pseudo::Score => "score",
+        }
+    }
+
+    /// Recognize a pseudo-column by name, case-insensitively. `None` means the
+    /// name must resolve against the schema like an ordinary column.
+    fn from_name(name: &str) -> Option<Pseudo> {
+        if name.eq_ignore_ascii_case("id") {
+            Some(Pseudo::Id)
+        } else if name.eq_ignore_ascii_case("score") {
+            Some(Pseudo::Score)
+        } else {
+            None
+        }
+    }
+}
+
+/// A resolved bare `SEARCH` — the ranked read.
+///
+/// Structurally a `SELECT *` with a different ROW SOURCE: same collection, same
+/// schema, same all-scalars projection. Only `k` and `query` are new, and they
+/// decide *which* ordinals the read walks and *in what order* — nothing below
+/// the row source changes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundSearch {
+    /// The collection searched (confirmed to exist).
+    pub from: String,
+    /// Its resolved schema.
+    pub schema: Schema,
+    /// How many nearest rows to return. Validated `>= 1` here, so no later
+    /// stage has to wonder — `Db::search` has its own opinion about `k`, and it
+    /// should never be the one to discover a meaningless one.
+    pub k: u64,
+    /// The query vector, already checked against the collection's declared
+    /// dimension. A bare `Vec<f32>` rather than a `Literal`: the binder has
+    /// proved it is a vector of the right length, so carrying a type that could
+    /// still be a string would throw that proof away — and the compiler interns
+    /// it as `Const::Vector` unchanged.
+    pub query: Vec<f32>,
+    /// What the query returns, resolved: stored columns bound to their ordinals,
+    /// `id`/`score` as [`Pseudo`] items, in source order.
+    ///
+    /// When `RETURNING` is absent this holds the DEFAULT — every scalar column
+    /// in schema order, the embedding excluded — so a consumer never re-derives
+    /// it and bare `SEARCH` needs no special case. One field, because the
+    /// compiler now emits from exactly this list; the split that existed while
+    /// `RETURNING` was recorded-but-not-executed is gone.
+    pub projection: Vec<Projected>,
 }
 
 /// A resolved `CREATE COLLECTION`.
@@ -229,6 +323,21 @@ pub enum BindError {
         /// How many vector columns were declared (valid schemas have exactly 1).
         found: usize,
     },
+    /// A `SEARCH`'s `TOP k` is not a positive count.
+    InvalidTopK {
+        /// The requested count.
+        k: i64,
+    },
+    /// The statement is valid V-SQL, but this layer does not bind it yet.
+    ///
+    /// Present so a newly-parseable statement cannot reach an unhandled match
+    /// arm: the grammar for a feature lands before its semantics do, and in
+    /// that window `Db::execute` must report a clean error rather than panic on
+    /// input a user can type. Remove the arm when the binding lands.
+    Unbound {
+        /// Which statement kind.
+        statement: &'static str,
+    },
     // EXTEND: DuplicateColumn, UnknownOption, ... as later phases need.
 }
 
@@ -262,6 +371,12 @@ impl fmt::Display for BindError {
                 f,
                 "a collection must have exactly one VECTOR column, found {found}"
             ),
+            BindError::InvalidTopK { k } => {
+                write!(f, "TOP must be at least 1, found {k}")
+            }
+            BindError::Unbound { statement } => {
+                write!(f, "{statement} is parsed but not implemented yet")
+            }
         }
     }
 }
@@ -281,12 +396,127 @@ pub fn analyze(stmt: Statement, catalog: &impl Catalog) -> Result<BoundStatement
         Statement::CreateCollection(c) => {
             bind_create(c, catalog).map(BoundStatement::CreateCollection)
         }
-        // EXTEND: Search/Delete/Update dispatch here as those statements land.
+        Statement::Search(s) => bind_search(s, catalog).map(BoundStatement::Search),
+        // EXTEND: Delete/Update dispatch here as those statements land.
     }
 }
 
 /// `SELECT projection FROM from`. Resolves the collection, binds each projected
 /// column to its schema ordinal, and sets `include_vector` per rule (A).
+/// Bind a bare `SEARCH`.
+///
+/// Three checks, ordered by how fundamental the failure is — the same shape
+/// `bind_select` follows:
+///
+///  1. the collection exists (same lookup, same error as a `SELECT`);
+///  2. `k >= 1` — the parser deliberately let `TOP 0` through as syntax, and
+///     this is where it stops;
+///  3. the query vector's length matches the collection's declared dimension —
+///     the same rule, and the same error, an `INSERT`'s embedding gets.
+///
+/// The projection is not bound from source, because bare `SEARCH` has none: it
+/// defaults to every scalar column, exactly as `SELECT *` expands.
+fn bind_search(stmt: SearchStmt, catalog: &impl Catalog) -> Result<BoundSearch, BindError> {
+    // 1. Collection must exist.
+    let schema = catalog
+        .get_collection(&stmt.collection)
+        .ok_or_else(|| BindError::CollectionNotFound(stmt.collection.clone()))?;
+
+    // 2. `TOP k` must be a real count. `k <= 0` is meaningless, and handing it
+    //    to `Db::search` would just move the discovery somewhere less helpful.
+    if stmt.k < 1 {
+        return Err(BindError::InvalidTopK { k: stmt.k });
+    }
+    let k = stmt.k as u64;
+
+    // 3. The query must match the collection's embedding dimension. Checked
+    //    HERE so a wrong-length query never reaches the SIMD kernel.
+    let vector = schema
+        .columns
+        .iter()
+        .find(|c| c.is_vector)
+        // Every collection has exactly one vector column by construction.
+        .ok_or(BindError::VectorColumnCount { found: 0 })?;
+    let dim = match vector.ty {
+        ColumnType::Vector(dim) => dim,
+        // `is_vector` mirrors `ty`, so this is unreachable; erroring rather than
+        // panicking keeps the invariant checked instead of assumed.
+        _ => return Err(BindError::VectorColumnCount { found: 0 }),
+    };
+    // The parser only ever produces `Literal::Vector` here (it requires a `[`),
+    // so the other arms are unreachable — but a bind must not panic.
+    let query = match stmt.query {
+        Literal::Vector(v) => v,
+        _ => {
+            return Err(BindError::TypeMismatch {
+                column: vector.name.clone(),
+                expected: ColumnType::Vector(dim),
+                found: ColumnType::Text,
+            });
+        }
+    };
+    if query.len() != dim {
+        return Err(BindError::DimensionMismatch {
+            column: vector.name.clone(),
+            expected: dim,
+            found: query.len(),
+        });
+    }
+
+    // Default projection: every scalar, in schema order — `SELECT *`'s rule (A).
+    let projection: Vec<ColumnRef> = schema
+        .columns
+        .iter()
+        .filter(|c| !c.is_vector)
+        .map(|c| ColumnRef {
+            name: c.name.clone(),
+            ordinal: c.ordinal,
+        })
+        .collect();
+
+    // 4. Resolve `RETURNING`, if any. Each item is either a reserved
+    //    pseudo-column or an ordinary schema lookup — the SAME lookup and the
+    //    SAME error a `SELECT` column gets, so an unknown name reads
+    //    identically whichever statement it appears in.
+    let returning = match stmt.projection {
+        None => projection.iter().cloned().map(Projected::Column).collect(),
+        Some(names) => {
+            let mut items = Vec::with_capacity(names.len());
+            for name in names {
+                // Pseudo-columns are checked FIRST, so `RETURNING score` means
+                // the same thing against every collection (see `Pseudo`).
+                if let Some(pseudo) = Pseudo::from_name(&name) {
+                    items.push(Projected::Pseudo(pseudo));
+                    continue;
+                }
+                let col = schema
+                    .column(&name)
+                    .ok_or_else(|| BindError::ColumnNotFound(name.clone()))?;
+                // The embedding is not projectable: it lives in the flat index,
+                // and `RETURNING vector` would need a `VectorFetch` the ranked
+                // read does not emit. Rejected as "no such column" rather than
+                // silently dropped.
+                if col.is_vector {
+                    return Err(BindError::ColumnNotFound(name));
+                }
+                items.push(Projected::Column(ColumnRef {
+                    name: col.name.clone(),
+                    ordinal: col.ordinal,
+                }));
+            }
+            items
+        }
+    };
+
+    Ok(BoundSearch {
+        from: stmt.collection,
+        schema,
+        k,
+        query,
+        projection: returning,
+    })
+}
+
 fn bind_select(stmt: SelectStmt, catalog: &impl Catalog) -> Result<BoundSelect, BindError> {
     // 1. Collection must exist (the most fundamental failure comes first).
     let schema = catalog
@@ -559,6 +789,14 @@ mod tests {
         ColumnRef {
             name: name.to_string(),
             ordinal,
+        }
+    }
+
+    /// Bind a SEARCH against `docs`, returning the bound node.
+    fn bound_search(src: &str) -> BoundSearch {
+        match analyze(parse(src).expect("parse"), &docs_catalog()).expect("bind") {
+            BoundStatement::Search(s) => s,
+            other => panic!("expected Search, got {other:?}"),
         }
     }
 
@@ -874,6 +1112,130 @@ mod tests {
         assert_eq!(
             analyze_err(src, &cat),
             BindError::CollectionExists("docs".to_string()),
+        );
+    }
+
+    // -- RETURNING ---------------------------------------------------------
+
+    #[test]
+    fn id_and_score_bind_as_pseudocolumns() {
+        // Both are COMPUTED, not stored: `id` is the row's ordinal and `score`
+        // is what the kernel produced. Neither is looked up in the schema —
+        // `docs` has no column by either name, so a binder that resolved them
+        // like ordinary columns would reject the statement outright.
+        let bound = bound_search(&format!(
+            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING id, score;",
+            vec_lit(768)
+        ));
+        assert_eq!(
+            bound.projection,
+            vec![
+                Projected::Pseudo(Pseudo::Id),
+                Projected::Pseudo(Pseudo::Score),
+            ]
+        );
+        // Recognized case-insensitively, like the engine's reserved `id` rule.
+        let bound = bound_search(&format!(
+            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING ID, Score;",
+            vec_lit(768)
+        ));
+        assert_eq!(
+            bound.projection,
+            vec![
+                Projected::Pseudo(Pseudo::Id),
+                Projected::Pseudo(Pseudo::Score),
+            ]
+        );
+    }
+
+    #[test]
+    fn returning_a_stored_column_resolves() {
+        let bound = bound_search(&format!(
+            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING title;",
+            vec_lit(768)
+        ));
+        // Bound to the SCHEMA ordinal, exactly as a SELECT column would be —
+        // `title` is declaration ordinal 2.
+        assert_eq!(
+            bound.projection,
+            vec![Projected::Column(colref("title", 2))]
+        );
+
+        // Stored and computed items mix freely, in source order.
+        let bound = bound_search(&format!(
+            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING score, title, id, author;",
+            vec_lit(768)
+        ));
+        assert_eq!(
+            bound.projection,
+            vec![
+                Projected::Pseudo(Pseudo::Score),
+                Projected::Column(colref("title", 2)),
+                Projected::Pseudo(Pseudo::Id),
+                Projected::Column(colref("author", 1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn returning_unknown_column_is_a_bind_error() {
+        let src = format!(
+            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING nope;",
+            vec_lit(768)
+        );
+        assert!(matches!(
+            analyze(parse(&src).expect("parse"), &docs_catalog()),
+            Err(BindError::ColumnNotFound(name)) if name == "nope"
+        ));
+
+        // The embedding is not projectable either: it lives in the flat index,
+        // and bare SEARCH returns stored columns.
+        let src = format!(
+            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING vector;",
+            vec_lit(768)
+        );
+        assert!(matches!(
+            analyze(parse(&src).expect("parse"), &docs_catalog()),
+            Err(BindError::ColumnNotFound(name)) if name == "vector"
+        ));
+    }
+
+    #[test]
+    fn no_returning_keeps_the_default_projection() {
+        // Commit 2's behaviour, untouched: every scalar column in schema order,
+        // the embedding excluded.
+        let bound = bound_search(&format!(
+            "SEARCH TOP 5 NEAREST TO {} FROM docs;",
+            vec_lit(768)
+        ));
+        let default = vec![
+            colref("author", 1),
+            colref("title", 2),
+            colref("published_at", 3),
+        ];
+        assert_eq!(
+            bound.projection,
+            default
+                .into_iter()
+                .map(Projected::Column)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn returning_replaces_the_default_projection() {
+        // A `RETURNING` clause REPLACES the default outright — it does not add
+        // to it. `id, score` means two columns, not five.
+        let bound = bound_search(&format!(
+            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING id, score;",
+            vec_lit(768)
+        ));
+        assert_eq!(
+            bound.projection,
+            vec![
+                Projected::Pseudo(Pseudo::Id),
+                Projected::Pseudo(Pseudo::Score),
+            ]
         );
     }
 }

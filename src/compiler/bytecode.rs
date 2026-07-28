@@ -44,6 +44,11 @@
 //                                     Emitted ONLY when include_vector is true —
 //                                     the vector is never read via Column.
 //
+//   RowId        cur, dst             read the current row's ORDINAL (its id)
+//                                     into `dst`
+//   Score        cur, dst             read the current row's similarity score
+//                                     into `dst`. KnnScan cursors only.
+//
 // Loading values
 //   Integer      value, dst           load an i64 literal
 //   Real         value, dst           load an f64 literal
@@ -58,6 +63,11 @@
 //   Insert       cur, rec             write the record in `rec` through the
 //                                     cursor: WAL + tuple store + bitmap index
 //                                     + flat index
+//   KnnScan      cur, collection, query, k
+//                                     SIMD top-k over the flat index. Opens
+//                                     `cur` over the winning ordinals IN SCORE
+//                                     ORDER (nearest first). Occupies the same
+//                                     slot OpenRead does for a SELECT.
 //   CreateCollection name, #schema, capacity
 //                                     provision a collection: WAL append,
 //                                     catalog write, and allocation of all three
@@ -68,7 +78,7 @@
 // Control
 //   Halt                              stop execution
 //
-// 16 opcodes = a working engine.
+// 19 opcodes = a working engine, vector search and RETURNING included.
 //
 // ---------------------------------------------------------------------------
 // EXTEND: — not built yet. Added one statement at a time, as emission demands.
@@ -87,17 +97,21 @@
 //   Delete       cur                  delete the row under the cursor
 //   Update       cur, rec             replace the row under the cursor
 //
-// SEARCH — the fat opcodes
+// SEARCH — the rest
 //   BitmapFrom   cur, →pred, dst      build a bitmap of rows passing the
 //                                     predicate, via the bitmap metadata index
-//   KnnScan      cur, queryReg, k, bitmapReg?, outCur
-//                                     SIMD top-k over the flat index, optionally
-//                                     masked by a bitmap (prefilter). Emits
-//                                     ranked (rowid, score) into `outCur`.
+//   (KnnScan has landed — see the core set. Its `bitmapReg` prefilter operand is
+//   the piece still missing, and arrives with BitmapFrom.)
 //   GRANULARITY NOTE: KnnScan is deliberately COARSE. Interpreting the distance
 //   loop per-element would be catastrophic — 100k distances must be one tight
 //   SIMD loop inside one opcode, not 100k dispatches. This is the one place the
 //   "one opcode = one operation on one row" rule is intentionally broken.
+//
+//   SCORES reach the caller through `Score`, which parks one in a register that
+//   `ResultRow` already knows how to emit — no new output machinery, because
+//   `ResultRow` reads REGISTERS rather than columns (seam (c)). That is also why
+//   `RETURNING title, score` costs nothing extra: by the time the row is emitted
+//   a stored column and a computed one are indistinguishable.
 //
 // LIMIT
 //   SetCounter      k, r              initialize a counter register
@@ -256,6 +270,32 @@ pub enum Op {
         /// Destination register (receives a handle).
         dst: Reg,
     },
+    /// Read the current row's ORDINAL — its stable id within the collection —
+    /// into `dst`.
+    ///
+    /// A per-row read off a cursor, like [`Op::Column`], but the value is the
+    /// row's identity rather than one of its stored columns. No existing
+    /// register-load covers it: `Integer` is a compile-time literal and `Column`
+    /// reads the tuple store, while the ordinal is the cursor's own position.
+    RowId {
+        /// Cursor whose current row is read.
+        cur: Cursor,
+        /// Destination register.
+        dst: Reg,
+    },
+    /// Read the current row's SIMILARITY SCORE into `dst`.
+    ///
+    /// Valid only on a cursor opened by [`Op::KnnScan`] — a plain scan has no
+    /// scores, and asking for one is an error rather than a zero. Separate from
+    /// [`Op::RowId`] rather than one op with a selector flag: an op whose
+    /// behavior switches on a flag is really several ops (see the module
+    /// header's smells).
+    Score {
+        /// Cursor whose current row is read.
+        cur: Cursor,
+        /// Destination register.
+        dst: Reg,
+    },
     /// Load an `i64` literal into `dst`.
     Integer {
         /// The literal value.
@@ -307,6 +347,25 @@ pub enum Op {
         cur: Cursor,
         /// Register holding the record to write.
         rec: Reg,
+    },
+    /// SIMD top-`k` over the flat index: rank `collection`'s rows by similarity
+    /// to the query vector in `query`, and open `cur` over the winning ordinals
+    /// **in score order, nearest first**.
+    ///
+    /// Deliberately COARSE (see the module header's granularity note): the
+    /// distance loop is one tight SIMD pass inside one opcode, never 100k
+    /// dispatches. It occupies exactly the slot `OpenRead` does for a `SELECT` —
+    /// it opens the read cursor — so everything after it is the same loop.
+    KnnScan {
+        /// Cursor slot to open over the ranked ordinals.
+        cur: Cursor,
+        /// Collection to search.
+        collection: String,
+        /// Register holding the query vector.
+        query: Reg,
+        /// How many nearest rows to take (`>= 1`, enforced by the binder).
+        k: u64,
+        // EXTEND: bitmap: Option<Reg> — a WHERE-derived prefilter mask.
     },
     /// Provision a collection. One fat op — nothing about DDL varies at runtime.
     CreateCollection {
@@ -373,7 +432,7 @@ impl Program {
                     self.check_cursor(at, *cur)?;
                     self.check_reg(at, *dst)?;
                 }
-                Op::VectorFetch { cur, dst } => {
+                Op::VectorFetch { cur, dst } | Op::RowId { cur, dst } | Op::Score { cur, dst } => {
                     self.check_cursor(at, *cur)?;
                     self.check_reg(at, *dst)?;
                 }
@@ -394,6 +453,10 @@ impl Program {
                 Op::Insert { cur, rec } => {
                     self.check_cursor(at, *cur)?;
                     self.check_reg(at, *rec)?;
+                }
+                Op::KnnScan { cur, query, .. } => {
+                    self.check_cursor(at, *cur)?;
+                    self.check_reg(at, *query)?;
                 }
                 Op::CreateCollection { schema, .. } => {
                     self.check_const(at, *schema)?;
@@ -527,4 +590,3 @@ impl fmt::Display for ValidateError {
 }
 
 impl std::error::Error for ValidateError {}
-

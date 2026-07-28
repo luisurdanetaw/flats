@@ -20,8 +20,10 @@
 //! signature is the whole point of splitting analysis from planning.
 //!
 
-use crate::sql::bind::{BoundCreate, BoundInsert, BoundSelect, BoundStatement};
-use crate::sql::plan::{CreateCollection, Insert, LogicalPlan, Project, Scan};
+use crate::sql::bind::{
+    BoundCreate, BoundInsert, BoundSearch, BoundSelect, BoundStatement, Projected,
+};
+use crate::sql::plan::{CreateCollection, Insert, Knn, LogicalPlan, Project, Scan};
 
 /// Build the [`LogicalPlan`] for an already-bound statement. Infallible: the
 /// binder validated everything, so this only reshapes statement-shaped IR into
@@ -31,7 +33,8 @@ pub fn plan(bound: BoundStatement) -> LogicalPlan {
         BoundStatement::Select(s) => plan_select(s),
         BoundStatement::Insert(i) => plan_insert(i),
         BoundStatement::CreateCollection(c) => plan_create(c),
-        // EXTEND: Search -> Knn, Delete/Update -> their own nodes.
+        BoundStatement::Search(s) => plan_search(s),
+        // EXTEND: Delete/Update -> their own nodes.
     }
 }
 
@@ -46,8 +49,37 @@ fn plan_select(bound: BoundSelect) -> LogicalPlan {
             collection: bound.from,
             schema: bound.schema,
         })),
-        columns: bound.projection,
+        // A `SELECT` can only project stored columns — the binder has no way to
+        // produce a pseudo-column here — so every item wraps.
+        columns: bound
+            .projection
+            .into_iter()
+            .map(Projected::Column)
+            .collect(),
         include_vector: bound.include_vector,
+    })
+}
+
+/// `BoundSearch` → `Project` over `Knn`.
+///
+/// The SAME shape `plan_select` produces, with `Knn` where `Scan` would be. That
+/// is not a coincidence to be tidied away later — it is the point: a ranked read
+/// and a full read differ only in their row source, so the compiler emits one
+/// loop for both and only the prologue that opens the cursor differs.
+///
+/// `include_vector` is `false`: bare `SEARCH` returns the matched rows' stored
+/// columns, never the embedding — the same rule as `SELECT *`. `RETURNING` is
+/// what will let a caller ask for more.
+fn plan_search(bound: BoundSearch) -> LogicalPlan {
+    LogicalPlan::Project(Project {
+        input: Box::new(LogicalPlan::Knn(Knn {
+            collection: bound.from,
+            schema: bound.schema,
+            k: bound.k,
+            query: bound.query,
+        })),
+        columns: bound.projection,
+        include_vector: false,
     })
 }
 
@@ -75,11 +107,11 @@ mod tests {
     use super::plan;
     use crate::sql::ast::{ColumnType, Literal};
     use crate::sql::bind::{
-        BoundCreate, BoundInsert, BoundSelect, BoundStatement, Catalog, ColumnRef, ColumnSchema,
-        Schema, TypedValue, analyze,
+        BoundCreate, BoundInsert, BoundSearch, BoundSelect, BoundStatement, Catalog, ColumnRef,
+        ColumnSchema, Projected, Schema, TypedValue, analyze,
     };
     use crate::sql::parser::parse;
-    use crate::sql::plan::{CreateCollection, Insert, LogicalPlan, Project, Scan};
+    use crate::sql::plan::{CreateCollection, Insert, Knn, LogicalPlan, Project, Scan};
     use std::collections::HashMap;
 
     // -- resolved-value helpers (mirror the binder's docs fixture) ---------
@@ -140,13 +172,19 @@ mod tests {
     }
 
     /// A `Project` over the `docs` scan, for terse expectations.
+    /// Wrap plain column refs as projection items — a `SELECT`'s projection is
+    /// always stored columns.
+    fn stored(columns: Vec<ColumnRef>) -> Vec<Projected> {
+        columns.into_iter().map(Projected::Column).collect()
+    }
+
     fn docs_project(columns: Vec<ColumnRef>, include_vector: bool) -> LogicalPlan {
         LogicalPlan::Project(Project {
             input: Box::new(LogicalPlan::Scan(Scan {
                 collection: "docs".to_string(),
                 schema: docs_schema(),
             })),
-            columns,
+            columns: stored(columns),
             include_vector,
         })
     }
@@ -230,10 +268,69 @@ mod tests {
             projection: vec![colref("vector", 0)],
             include_vector: true,
         });
+        assert_eq!(plan(bound), docs_project(vec![colref("vector", 0)], true),);
+    }
+
+    #[test]
+    fn plans_search_projection_over_knn() {
+        // A `SEARCH` plans to the SAME shape a `SELECT` does — `Project` over a
+        // leaf — with `Knn` where `Scan` would be. That is the invariant the
+        // compiler leans on: one read loop serves both, and only the leaf's
+        // prologue differs.
+        let bound = BoundStatement::Search(BoundSearch {
+            from: "docs".to_string(),
+            schema: docs_schema(),
+            k: 5,
+            query: vec![0.5; 768],
+            projection: stored(vec![colref("author", 1), colref("title", 2)]),
+        });
         assert_eq!(
             plan(bound),
-            docs_project(vec![colref("vector", 0)], true),
+            LogicalPlan::Project(Project {
+                input: Box::new(LogicalPlan::Knn(Knn {
+                    collection: "docs".to_string(),
+                    schema: docs_schema(),
+                    k: 5,
+                    query: vec![0.5; 768],
+                })),
+                columns: stored(vec![colref("author", 1), colref("title", 2)]),
+                // Bare SEARCH never returns the embedding — the same rule
+                // `SELECT *` follows.
+                include_vector: false,
+            })
         );
+    }
+
+    #[test]
+    fn plans_search_carries_k_and_query_unchanged() {
+        // The planner only changes SHAPE. `k` and the query vector are carried
+        // through byte for byte — the binder already validated both, and a
+        // planner that rounded, truncated, or re-derived either would be
+        // silently changing what the query means.
+        for (k, query) in [
+            (1u64, vec![0.5f32; 768]),
+            (1000, vec![-0.25; 768]),
+            (7, vec![0.0; 768]),
+        ] {
+            let bound = BoundStatement::Search(BoundSearch {
+                from: "docs".to_string(),
+                schema: docs_schema(),
+                k,
+                query: query.clone(),
+                projection: stored(vec![colref("author", 1)]),
+            });
+            match plan(bound) {
+                LogicalPlan::Project(p) => match *p.input {
+                    LogicalPlan::Knn(knn) => {
+                        assert_eq!(knn.k, k);
+                        assert_eq!(knn.query, query);
+                        assert_eq!(knn.collection, "docs");
+                    }
+                    other => panic!("expected Knn under the Project, got {other:?}"),
+                },
+                other => panic!("expected Project, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -285,6 +382,52 @@ mod tests {
         assert_eq!(
             plan(bound),
             docs_project(vec![colref("author", 1), colref("title", 2)], false),
+        );
+    }
+
+    /// A query vector matching `docs_schema`'s `VECTOR(768)`, plus its SQL
+    /// spelling. Every element is an exact binary fraction, so the literal
+    /// round-trips through the parser's `f64 -> f32` coercion bit for bit and
+    /// the comparison below is not a float-tolerance question.
+    fn query_768() -> (Vec<f32>, String) {
+        let mut query = vec![0.5f32; 768];
+        query[0] = 0.25;
+        query[767] = -0.125;
+        let literal = query
+            .iter()
+            .map(|x| format!("{x:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        (query, literal)
+    }
+
+    #[test]
+    fn end_to_end_search() {
+        let cat = docs_catalog();
+        let (query, literal) = query_768();
+        let bound = analyze(
+            parse(&format!("SEARCH TOP 5 NEAREST TO [{literal}] FROM docs;")).expect("parse"),
+            &cat,
+        )
+        .expect("bind");
+        assert_eq!(
+            plan(bound),
+            LogicalPlan::Project(Project {
+                input: Box::new(LogicalPlan::Knn(Knn {
+                    collection: "docs".to_string(),
+                    schema: docs_schema(),
+                    k: 5,
+                    query,
+                })),
+                // Bare SEARCH has no projection clause, so the binder supplies
+                // every scalar in schema order — `SELECT *`'s expansion.
+                columns: stored(vec![
+                    colref("author", 1),
+                    colref("title", 2),
+                    colref("published_at", 3),
+                ]),
+                include_vector: false,
+            })
         );
     }
 

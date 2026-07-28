@@ -61,9 +61,18 @@ pub enum Token {
     Into,
     /// `VALUES`
     Values,
-    // EXTEND: future reserved keywords (Where, And, Or, Search, Top, Nearest,
-    // To, Delete, Update, Set, Returning, …) get a variant here AND an arm in
-    // `keyword()` — nothing else changes.
+    /// `SEARCH`
+    Search,
+    /// `TOP`
+    Top,
+    /// `NEAREST`
+    Nearest,
+    /// `TO`
+    To,
+    /// `RETURNING`
+    Returning,
+    // EXTEND: future reserved keywords (Where, And, Or, Delete, Update, Set, …)
+    // get a variant here AND an arm in `keyword()` — nothing else changes.
 
     // -- identifiers & literals ---------------------------------------------
     /// An identifier. Also carries *type names* (`VECTOR`, `INT`, `TEXT`,
@@ -101,7 +110,6 @@ pub enum Token {
     Star,
     // EXTEND: future operators (Lt, Gt, Le, Ge, Ne, …) get a variant
     // here AND a match arm in `next_token` — nothing else changes.
-
     /// End of input. Always the final token in a successful stream.
     Eof,
 }
@@ -209,6 +217,11 @@ fn keyword(word: &str) -> Option<Token> {
         "insert" => Some(Token::Insert),
         "into" => Some(Token::Into),
         "values" => Some(Token::Values),
+        "search" => Some(Token::Search),
+        "top" => Some(Token::Top),
+        "nearest" => Some(Token::Nearest),
+        "to" => Some(Token::To),
+        "returning" => Some(Token::Returning),
         // EXTEND: future reserved keywords here.
         _ => None,
     }
@@ -302,7 +315,10 @@ impl<'a> Lexer<'a> {
         self.pos += 1;
         SpannedToken {
             token,
-            span: Span { start, end: self.pos },
+            span: Span {
+                start,
+                end: self.pos,
+            },
         }
     }
 
@@ -347,7 +363,10 @@ impl<'a> Lexer<'a> {
         let token = keyword(text).unwrap_or_else(|| Token::Ident(text.to_string()));
         SpannedToken {
             token,
-            span: Span { start, end: self.pos },
+            span: Span {
+                start,
+                end: self.pos,
+            },
         }
     }
 
@@ -383,7 +402,10 @@ impl<'a> Lexer<'a> {
         };
         Ok(SpannedToken {
             token,
-            span: Span { start, end: self.pos },
+            span: Span {
+                start,
+                end: self.pos,
+            },
         })
     }
 
@@ -415,7 +437,10 @@ impl<'a> Lexer<'a> {
                         self.pos += 1; // closing quote
                         return Ok(SpannedToken {
                             token: Token::StrLit(value),
-                            span: Span { start, end: self.pos },
+                            span: Span {
+                                start,
+                                end: self.pos,
+                            },
                         });
                     }
                 }

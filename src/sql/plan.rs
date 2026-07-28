@@ -17,14 +17,15 @@
 //! # Types
 //!
 //! This file is **types only** — no logic. The resolved support types
-//! ([`Schema`], [`ColumnRef`], [`TypedValue`]) are REUSED from the binder, not
+//! ([`Schema`], [`ColumnRef`](crate::sql::bind::ColumnRef), [`TypedValue`])
+//! are REUSED from the binder, not
 //! redefined here, so a plan and its originating bound statement speak in
 //! exactly the same resolved vocabulary.
 
 // Every node derives Debug + Clone + PartialEq: the planner tests assert whole
 // plans with `assert_eq!`, so structural equality is load-bearing.
 
-use crate::sql::bind::{ColumnRef, Schema, TypedValue};
+use crate::sql::bind::{Projected, Schema, TypedValue};
 
 /// One resolved query plan — the relational-algebra root the compiler consumes.
 #[derive(Debug, Clone, PartialEq)]
@@ -37,8 +38,11 @@ pub enum LogicalPlan {
     Insert(Insert),
     /// Provision a new collection.
     CreateCollection(CreateCollection),
-    // EXTEND: Filter(Filter) for WHERE, Knn(Knn) for SEARCH — a new variant
-    // plus a match arm in the planner, without reworking the core.
+    /// Rank a collection's rows by similarity to a query vector (leaf of a
+    /// ranked read tree).
+    Knn(Knn),
+    // EXTEND: Filter(Filter) for WHERE — a new variant plus a match arm in the
+    // planner, without reworking the core.
 }
 
 /// Read every live row of a collection. The leaf of a read plan.
@@ -51,15 +55,45 @@ pub struct Scan {
     // EXTEND: predicate: Option<Predicate>  // pushed-down WHERE / bitmap mask.
 }
 
+/// Rank a collection's rows by similarity to a query vector, nearest first.
+///
+/// The LEAF of a ranked read, sitting exactly where a [`Scan`] sits under the
+/// same [`Project`]. That is the whole design: a `SEARCH` and a `SELECT` differ
+/// only in WHERE THE ORDINALS COME FROM — `Scan` walks every live row, `Knn`
+/// walks the top `k` in score order — and everything above is identical.
+///
+/// It carries no projection of its own for the same reason: the projection
+/// belongs to the [`Project`] above it, so there is exactly one place that
+/// decides which columns a read returns, shared by both statements.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Knn {
+    /// The collection searched (already confirmed to exist by the binder).
+    pub collection: String,
+    /// Its resolved schema — carried so downstream nodes share its ordinals.
+    pub schema: Schema,
+    /// How many nearest rows to return (validated `>= 1` by the binder).
+    pub k: u64,
+    /// The query vector, already checked against the collection's dimension.
+    pub query: Vec<f32>,
+    // EXTEND: prefilter: Option<Predicate> — the WHERE-mask a `BitmapFrom`
+    // would supply, narrowing the candidate set before ranking.
+}
+
 /// Project a column list out of `input`. Wraps a [`Scan`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Project {
-    /// The plan tree below this node (a [`LogicalPlan::Scan`] in the bootstrap
-    /// subset). Boxed because a plan is recursive.
+    /// The plan tree below this node — a [`LogicalPlan::Scan`] for a `SELECT`,
+    /// a [`LogicalPlan::Knn`] for a `SEARCH`. Boxed because a plan is
+    /// recursive.
     pub input: Box<LogicalPlan>,
-    /// The projected columns, bound to schema ordinals — carried through from
-    /// the bound projection.
-    pub columns: Vec<ColumnRef>,
+    /// What to emit per row, in output order — carried through from the bound
+    /// projection.
+    ///
+    /// [`Projected`] rather than a bare `ColumnRef` so ONE emission path serves both
+    /// statements: a `SELECT`'s items are always `Column`, a `SEARCH`'s may also
+    /// be the computed `id`/`score`. Widening this instead of giving `Knn` its
+    /// own projection is what keeps the two from drifting.
+    pub columns: Vec<Projected>,
     /// Split-storage flag, carried straight from the binder: `true` iff the
     /// embedding must be fetched from the flat vector index.
     pub include_vector: bool,

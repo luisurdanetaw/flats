@@ -8,7 +8,7 @@ pub mod planner;
 pub use crate::sql::lexer::{LexError, LexErrorKind, Lexer, Span, SpannedToken, Token};
 pub use crate::sql::ast::{
     ColumnDef, ColumnType, CollectionOption, CreateStmt, InsertStmt, Literal, Projection,
-    SelectStmt, Statement,
+    SearchStmt, SelectStmt, Statement,
 };
 pub use crate::sql::parser::{ParseError, ParseErrorKind, Parser, parse};
 pub use crate::sql::bind::{
