@@ -11,6 +11,7 @@
 pub mod engine;
 pub mod error;
 pub mod index;
+pub mod platform;
 pub mod simd;
 pub mod wal;
 pub mod metadata;

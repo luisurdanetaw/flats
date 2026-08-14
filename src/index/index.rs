@@ -619,7 +619,14 @@ impl Reader {
         }
 
         let vectors = self.inner.committed_vectors();
-        let mut heap = BinaryHeap::with_capacity(k);
+        // Reserve for the SMALLER of `k` and the rows that exist. `k` is a user
+        // operand (`SEARCH TOP k`) that the binder only floors at 1, so it can
+        // be `i64::MAX` — and `with_capacity` on that aborts the process with a
+        // capacity overflow. The heap never grows past the number of committed
+        // vectors anyway (the push below is guarded by `heap.len() < k`), so
+        // clamping costs nothing and removes the panic.
+        let committed = vectors.len() / dim;
+        let mut heap = BinaryHeap::with_capacity(k.min(committed));
 
         for (id, v) in vectors.chunks_exact(dim).enumerate() {
             if self.inner.is_deleted(id) {
