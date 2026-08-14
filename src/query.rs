@@ -792,6 +792,48 @@ mod tests {
     }
 
     #[test]
+    fn an_enormous_top_k_does_not_abort_the_process() {
+        let (_dir, db) = docs_db();
+        seed_ranked(&db);
+
+        // REGRESSION: `TOP i64::MAX` reached `BinaryHeap::with_capacity(k)` in
+        // the flat index and aborted the process with a capacity overflow. The
+        // binder only floors `k` at 1 and `usize::try_from` succeeds on 64-bit,
+        // so nothing upstream bounded it — and a panic in library code on input
+        // a user can TYPE is exactly what the boundary exists to prevent
+        // (CLAUDE.md §5). The heap is now reserved for `min(k, committed)`.
+        //
+        // The assertion is simply that this RETURNS: reaching the next line at
+        // all is the property under test. Every row is returned, because asking
+        // for more rows than exist yields what exists.
+        let stream = db
+            .execute(&format!(
+                "SEARCH TOP {} NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM docs;",
+                i64::MAX
+            ))
+            .expect("an absurd k compiles and runs rather than aborting");
+        assert_eq!(collect(stream).len(), 3, "every seeded row comes back");
+
+        // The same operand against an EMPTY collection: `committed` is 0 there,
+        // so the clamp is doing all the work and a stray `k`-sized reservation
+        // would still abort.
+        db.execute(
+            "CREATE COLLECTION empty_docs (vector VECTOR(4), author TEXT) \
+             WITH (capacity = 16);",
+        )
+        .expect("the collection is created");
+        let stream = db
+            .execute(&format!(
+                "SEARCH TOP {} NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM empty_docs;",
+                i64::MAX
+            ))
+            .expect("an absurd k over an empty collection runs too");
+        assert_eq!(collect(stream).len(), 0);
+
+        db.close().unwrap();
+    }
+
+    #[test]
     fn search_dimension_mismatch_is_a_bind_error() {
         let (_dir, db) = docs_db();
         seed_ranked(&db);
