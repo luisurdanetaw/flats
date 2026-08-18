@@ -75,33 +75,44 @@
 //                                     varies at runtime, so there is nothing to
 //                                     interpret.
 //
+// WHERE — predicates are SET ALGEBRA, not per-row comparisons
+//   BitmapEq     collection, colId, valueReg, dst
+//                                     ordinals where col == value
+//   BitmapRange  collection, colId, rangeOp, valueReg, dst
+//                                     ordinals where col <op> value
+//   BitmapAnd    rA, rB, dst          intersection
+//   BitmapOr     rA, rB, dst          union
+//   BitmapNot    collection, r, dst   complement WITHIN the live set
+//
+//   There are deliberately NO `Lt`/`Ge`/`JumpIfFalse` opcodes and no per-row
+//   predicate evaluation. Every V-SQL predicate is `col <op> literal` joined by
+//   AND/OR, and the metadata index answers exactly that shape as a roaring
+//   bitmap — so a WHERE clause is a handful of set operations producing an
+//   ORDINAL SOURCE, which is precisely what a cursor already consumes.
+//   `OpenRead`/`KnnScan` take that bitmap as an optional `filter` operand.
+//
+//   Same granularity argument as KnnScan below: interpreting a comparison per
+//   row per predicate would be thousands of dispatches where the index does one
+//   sorted-range walk. The day a predicate arrives that the index CANNOT
+//   answer (arithmetic, column-to-column) is the day per-row comparison
+//   opcodes earn their place — and the DESIGN NOTE that used to sit here,
+//   agonizing over comparison-with-branch vs. boolean-producing comparisons,
+//   is the decision to make then.
+//
 // Control
 //   Halt                              stop execution
 //
-// 19 opcodes = a working engine, vector search and RETURNING included.
+// 24 opcodes = a working engine, vector search, RETURNING and WHERE included.
 //
 // ---------------------------------------------------------------------------
 // EXTEND: — not built yet. Added one statement at a time, as emission demands.
 // ---------------------------------------------------------------------------
-//
-// WHERE
-//   Lt / Le / Gt / Ge / Eq / Ne   rA, rB, dst_or_→addr
-//   JumpIfFalse  r, →addr
-//   Goto         →addr
-//   DESIGN NOTE: two styles exist. Comparison-with-branch (`Lt rA, rB, →skip`)
-//   emits tighter code; boolean-producing comparisons + JumpIfFalse compose
-//   more naturally once AND/OR over sub-expressions arrive. Pick ONE and stay
-//   consistent — mixing them is how jump logic gets subtly wrong.
 //
 // DML
 //   Delete       cur                  delete the row under the cursor
 //   Update       cur, rec             replace the row under the cursor
 //
 // SEARCH — the rest
-//   BitmapFrom   cur, →pred, dst      build a bitmap of rows passing the
-//                                     predicate, via the bitmap metadata index
-//   (KnnScan has landed — see the core set. Its `bitmapReg` prefilter operand is
-//   the piece still missing, and arrives with BitmapFrom.)
 //   GRANULARITY NOTE: KnnScan is deliberately COARSE. Interpreting the distance
 //   loop per-element would be catastrophic — 100k distances must be one tight
 //   SIMD loop inside one opcode, not 100k dispatches. This is the one place the
@@ -180,7 +191,7 @@
 use std::fmt;
 
 use crate::compiler::constants::{ConstId, ConstPool};
-use crate::metadata::common::ColumnId;
+use crate::metadata::common::{ColumnId, RangeOp};
 
 // ---------------------------------------------------------------------------
 // Operand newtypes
@@ -228,6 +239,15 @@ pub enum Op {
         cur: Cursor,
         /// Collection name.
         collection: String,
+        /// A register holding the `WHERE`-derived bitmap, or `None` to walk
+        /// every live row.
+        ///
+        /// An `Option` operand rather than a second opcode: this selects the
+        /// cursor's ORDINAL SOURCE, it does not switch what the instruction
+        /// does. (Contrast the module header's "a flag that switches its
+        /// behavior means it's really several ops" — that is about behavior,
+        /// not data.)
+        filter: Option<Reg>,
     },
     /// Open a WRITE cursor on `collection` (DML).
     OpenWrite {
@@ -365,7 +385,77 @@ pub enum Op {
         query: Reg,
         /// How many nearest rows to take (`>= 1`, enforced by the binder).
         k: u64,
-        // EXTEND: bitmap: Option<Reg> — a WHERE-derived prefilter mask.
+        /// A register holding the `WHERE`-derived bitmap, or `None` to rank
+        /// every live row.
+        ///
+        /// A PREFILTER: rows outside it never enter the top-`k` heap, so `k`
+        /// counts rows that satisfy the predicate.
+        filter: Option<Reg>,
+    },
+    /// Ordinals where `col == value`, as a bitmap in `dst`.
+    ///
+    /// The comparand comes from a REGISTER, loaded by the same `Integer` /
+    /// `Real` / `String` ops an `INSERT` uses — so a predicate literal and an
+    /// inserted literal travel by exactly one mechanism.
+    BitmapEq {
+        /// Collection whose metadata index is consulted. Carried on the op
+        /// because a bitmap is built BEFORE any cursor is open — there is no
+        /// cursor operand to take the collection from.
+        collection: String,
+        /// Storage column id (scalar-only numbering).
+        col: ColumnId,
+        /// Register holding the comparand.
+        value: Reg,
+        /// Destination register (receives the bitmap).
+        dst: Reg,
+    },
+    /// Ordinals where `col <op> value`, as a bitmap in `dst`.
+    ///
+    /// Ordered comparison only — `=` is [`Op::BitmapEq`], because the metadata
+    /// index answers the two by different structures (a dictionary vs. a
+    /// sorted key range).
+    BitmapRange {
+        /// Collection whose metadata index is consulted.
+        collection: String,
+        /// Storage column id (scalar-only numbering).
+        col: ColumnId,
+        /// Which ordered comparison.
+        op: RangeOp,
+        /// Register holding the comparand.
+        value: Reg,
+        /// Destination register (receives the bitmap).
+        dst: Reg,
+    },
+    /// Intersection of two bitmaps — `AND`.
+    BitmapAnd {
+        /// Left operand register.
+        a: Reg,
+        /// Right operand register.
+        b: Reg,
+        /// Destination register.
+        dst: Reg,
+    },
+    /// Union of two bitmaps — `OR`.
+    BitmapOr {
+        /// Left operand register.
+        a: Reg,
+        /// Right operand register.
+        b: Reg,
+        /// Destination register.
+        dst: Reg,
+    },
+    /// Complement of a bitmap WITHIN THE LIVE SET — how `!=` is built.
+    ///
+    /// Complementing against the live rows rather than the whole ordinal space
+    /// is what keeps tombstones out: a deleted row satisfies no predicate, so
+    /// negating `a = 1` must not resurrect it.
+    BitmapNot {
+        /// Collection whose live set bounds the complement.
+        collection: String,
+        /// Register holding the bitmap to complement.
+        src: Reg,
+        /// Destination register.
+        dst: Reg,
     },
     /// Provision a collection. One fat op — nothing about DDL varies at runtime.
     CreateCollection {
@@ -417,7 +507,13 @@ impl Program {
 
         for (at, op) in self.ops.iter().enumerate() {
             match op {
-                Op::OpenRead { cur, .. } | Op::OpenWrite { cur, .. } => {
+                Op::OpenRead { cur, filter, .. } => {
+                    self.check_cursor(at, *cur)?;
+                    if let Some(r) = filter {
+                        self.check_reg(at, *r)?;
+                    }
+                }
+                Op::OpenWrite { cur, .. } => {
                     self.check_cursor(at, *cur)?;
                 }
                 Op::SeekFirst { cur, end } => {
@@ -454,9 +550,27 @@ impl Program {
                     self.check_cursor(at, *cur)?;
                     self.check_reg(at, *rec)?;
                 }
-                Op::KnnScan { cur, query, .. } => {
+                Op::KnnScan {
+                    cur, query, filter, ..
+                } => {
                     self.check_cursor(at, *cur)?;
                     self.check_reg(at, *query)?;
+                    if let Some(r) = filter {
+                        self.check_reg(at, *r)?;
+                    }
+                }
+                Op::BitmapEq { value, dst, .. } | Op::BitmapRange { value, dst, .. } => {
+                    self.check_reg(at, *value)?;
+                    self.check_reg(at, *dst)?;
+                }
+                Op::BitmapAnd { a, b, dst } | Op::BitmapOr { a, b, dst } => {
+                    self.check_reg(at, *a)?;
+                    self.check_reg(at, *b)?;
+                    self.check_reg(at, *dst)?;
+                }
+                Op::BitmapNot { src, dst, .. } => {
+                    self.check_reg(at, *src)?;
+                    self.check_reg(at, *dst)?;
                 }
                 Op::CreateCollection { schema, .. } => {
                     self.check_const(at, *schema)?;

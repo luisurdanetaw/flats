@@ -60,6 +60,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering as AtomicOrdering};
 
 use memmap2::MmapMut;
+use roaring::RoaringBitmap;
 
 use crate::error::{Error, Result};
 use crate::simd::dot;
@@ -607,6 +608,29 @@ impl Reader {
     /// Brute-force top-`k` search. Tombstoned ordinals are skipped. Results are
     /// most-similar (highest dot product) first.
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
+        self.search_filtered(query, k, None)
+    }
+
+    /// Brute-force top-`k` search restricted to `allowed`.
+    ///
+    /// `allowed` is a PREFILTER, not a post-filter: an ordinal outside it never
+    /// enters the heap, so `k` counts rows that satisfy the predicate. Ranking
+    /// first and filtering after would return fewer than `k` rows whenever the
+    /// nearest neighbours happen not to match — and would look entirely
+    /// plausible while doing it.
+    ///
+    /// `None` means "no restriction" and is exactly [`Reader::search`].
+    ///
+    /// Still a full pass over the vectors. A very selective filter would be
+    /// better served by iterating the bitmap and fetching those rows directly,
+    /// but that inverts the loop and loses the sequential scan the SIMD kernel
+    /// wants — worth measuring before assuming, and deliberately not done here.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        allowed: Option<&RoaringBitmap>,
+    ) -> Result<Vec<SearchResult>> {
         let dim = self.inner.dim.get();
         if query.len() != dim {
             return Err(Error::DimensionMismatch {
@@ -630,6 +654,13 @@ impl Reader {
 
         for (id, v) in vectors.chunks_exact(dim).enumerate() {
             if self.inner.is_deleted(id) {
+                continue;
+            }
+            // The prefilter, applied BEFORE the distance is even computed —
+            // excluded rows cost one bitmap probe instead of a dot product.
+            if let Some(allowed) = allowed
+                && !allowed.contains(id as u32)
+            {
                 continue;
             }
             let hit = SearchResult {

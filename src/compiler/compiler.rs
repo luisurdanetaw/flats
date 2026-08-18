@@ -61,9 +61,9 @@
 use crate::compiler::bytecode::{Addr, Cursor, Op, Program, Reg};
 use crate::compiler::constants::{Const, ConstPool};
 use crate::compiler::schema::{SchemaError, to_metadata_schema};
-use crate::metadata::common::{ColumnLocation, DeclarationOrdinal, Schema};
-use crate::sql::ast::Literal;
-use crate::sql::bind::{Projected, Pseudo};
+use crate::metadata::common::{ColumnId, ColumnLocation, DeclarationOrdinal, RangeOp, Schema};
+use crate::sql::ast::{CompareOp, Literal};
+use crate::sql::bind::{BoundPredicate, Projected, Pseudo};
 use crate::sql::plan::LogicalPlan;
 use std::fmt;
 
@@ -232,6 +232,130 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// Load a literal into a freshly allocated register, and return it.
+    ///
+    /// Large payloads (vector, string) go to the constant pool and the
+    /// instruction carries the handle; small scalars load inline. Shared by
+    /// `INSERT`'s value list and `WHERE`'s comparands so a literal reaches a
+    /// register by exactly one route.
+    fn emit_literal(&mut self, lit: &Literal) -> Reg {
+        let dst = self.alloc_reg();
+        let op = match lit {
+            Literal::Vector(v) => {
+                let id = self.consts.add(Const::Vector(v.clone()));
+                Op::VectorConst { id, dst }
+            }
+            Literal::Str(s) => {
+                let id = self.consts.add(Const::Str(s.clone()));
+                Op::String { id, dst }
+            }
+            Literal::Int(n) => Op::Integer { value: *n, dst },
+            Literal::Float(f) => Op::Real { value: *f, dst },
+        };
+        self.emit(op);
+        dst
+    }
+
+    /// Emit the ops that build `pred`'s bitmap, returning the register it lands
+    /// in.
+    ///
+    /// Post-order over the predicate tree: each child's bitmap is materialized
+    /// into a register, then combined. There is no control flow here at all —
+    /// no jumps, no per-row branching — because a predicate is answered as SET
+    /// ALGEBRA against the metadata index rather than evaluated per row. See
+    /// the WHERE section of the `bytecode` module header.
+    fn emit_predicate(&mut self, pred: &BoundPredicate, collection: &str) -> Reg {
+        match pred {
+            BoundPredicate::And(l, r) => {
+                let a = self.emit_predicate(l, collection);
+                let b = self.emit_predicate(r, collection);
+                let dst = self.alloc_reg();
+                self.emit(Op::BitmapAnd { a, b, dst });
+                dst
+            }
+            BoundPredicate::Or(l, r) => {
+                let a = self.emit_predicate(l, collection);
+                let b = self.emit_predicate(r, collection);
+                let dst = self.alloc_reg();
+                self.emit(Op::BitmapOr { a, b, dst });
+                dst
+            }
+            BoundPredicate::Compare { column, op, value } => {
+                // THE ordinal translation, same as a projected `Column`: ask
+                // the schema where this declaration ordinal lives rather than
+                // computing a ColumnId here.
+                let schema = match self.schema {
+                    Some(schema) => schema,
+                    None => unreachable!("a filtered read compiled without a catalog schema"),
+                };
+                let col = match schema.locate(DeclarationOrdinal::new(column.ordinal)) {
+                    Some(ColumnLocation::Scalar(id)) => id,
+                    // The binder rejects predicates on the embedding (the flat
+                    // index has no postings to consult), so neither arm is
+                    // reachable from a bound plan.
+                    Some(ColumnLocation::Vector { .. }) => {
+                        unreachable!("the binder rejects filtering on the vector column")
+                    }
+                    None => unreachable!("plan ordinal {} not in schema", column.ordinal),
+                };
+                let value = self.emit_literal(&value.value);
+                let dst = self.alloc_reg();
+                match op {
+                    CompareOp::Eq => {
+                        self.emit(Op::BitmapEq {
+                            collection: collection.to_string(),
+                            col,
+                            value,
+                            dst,
+                        });
+                    }
+                    // `!=` is the complement of `=` within the live set. Two
+                    // ops rather than a `lookup_ne` the index does not have —
+                    // and the complement must be bounded by `live`, or a
+                    // tombstoned row would satisfy every `!=`.
+                    CompareOp::Ne => {
+                        let eq = self.alloc_reg();
+                        self.emit(Op::BitmapEq {
+                            collection: collection.to_string(),
+                            col,
+                            value,
+                            dst: eq,
+                        });
+                        self.emit(Op::BitmapNot {
+                            collection: collection.to_string(),
+                            src: eq,
+                            dst,
+                        });
+                    }
+                    CompareOp::Lt => self.emit_range(collection, col, RangeOp::Lt, value, dst),
+                    CompareOp::Le => self.emit_range(collection, col, RangeOp::Le, value, dst),
+                    CompareOp::Gt => self.emit_range(collection, col, RangeOp::Gt, value, dst),
+                    CompareOp::Ge => self.emit_range(collection, col, RangeOp::Ge, value, dst),
+                }
+                dst
+            }
+        }
+    }
+
+    /// One ordered comparison. Split out only so the four arms above read as
+    /// four one-liners.
+    fn emit_range(
+        &mut self,
+        collection: &str,
+        col: ColumnId,
+        op: RangeOp,
+        value: Reg,
+        dst: Reg,
+    ) {
+        self.emit(Op::BitmapRange {
+            collection: collection.to_string(),
+            col,
+            op,
+            value,
+            dst,
+        });
+    }
+
     /// Allocate the next register (monotonic; no reuse). Bumps [`next_reg`],
     /// which becomes [`Program::n_regs`].
     fn alloc_reg(&mut self) -> Reg {
@@ -301,11 +425,20 @@ impl<'a> Compiler<'a> {
         match node {
             LogicalPlan::Scan(scan) => {
                 // WRAPPER: owns the read loop. Its PROLOGUE opens a cursor over
-                // every live row; the loop itself is shared with `Knn`.
+                // every live row — or, with a `WHERE`, over the ordinals the
+                // predicate admits. The loop itself is shared with `Knn`.
+                //
+                // The predicate is emitted BEFORE the cursor opens, because its
+                // bitmap IS the cursor's ordinal source.
+                let filter = scan
+                    .predicate
+                    .as_ref()
+                    .map(|p| self.emit_predicate(p, &scan.collection));
                 let cur = self.alloc_cursor();
                 self.emit(Op::OpenRead {
                     cur,
                     collection: scan.collection.clone(),
+                    filter,
                 });
                 self.emit_read_loop(cur, body);
             }
@@ -316,6 +449,12 @@ impl<'a> Compiler<'a> {
                 // every live row, load the query vector and let `KnnScan` open
                 // one over the top `k` IN SCORE ORDER. The loop below is byte
                 // for byte the one a `SELECT` runs.
+                // Emitted before the scan, like `Scan`'s: the bitmap is a
+                // PREFILTER the ranking runs inside, not a sieve applied after.
+                let filter = knn
+                    .predicate
+                    .as_ref()
+                    .map(|p| self.emit_predicate(p, &knn.collection));
                 let cur = self.alloc_cursor();
                 // The embedding is a large payload, so it goes to the constant
                 // pool and the instruction carries a handle — the same rule an
@@ -328,6 +467,7 @@ impl<'a> Compiler<'a> {
                     collection: knn.collection.clone(),
                     query,
                     k: knn.k,
+                    filter,
                 });
                 self.emit_read_loop(cur, body);
             }
@@ -417,23 +557,7 @@ impl<'a> Compiler<'a> {
                 });
                 let base = self.next_reg;
                 for value in &insert.row {
-                    let dst = self.alloc_reg();
-                    // Large payloads (vector, string) go to the constant pool
-                    // and the instruction carries the handle; small scalars load
-                    // inline.
-                    let op = match &value.value {
-                        Literal::Vector(v) => {
-                            let id = self.consts.add(Const::Vector(v.clone()));
-                            Op::VectorConst { id, dst }
-                        }
-                        Literal::Str(s) => {
-                            let id = self.consts.add(Const::Str(s.clone()));
-                            Op::String { id, dst }
-                        }
-                        Literal::Int(n) => Op::Integer { value: *n, dst },
-                        Literal::Float(f) => Op::Real { value: *f, dst },
-                    };
-                    self.emit(op);
+                    self.emit_literal(&value.value);
                 }
                 let count = self.next_reg - base;
                 let rec = self.alloc_reg();
@@ -485,10 +609,12 @@ mod tests {
     use crate::compiler::bytecode::{Addr, Cursor, Op, Program, Reg};
     use crate::compiler::constants::{Const, ConstId, ConstPool};
     use crate::metadata::common::{
-        CollectionConfig, ColumnSpec, ColumnType as MetaColumnType, Schema,
+        CollectionConfig, ColumnSpec, ColumnType as MetaColumnType, RangeOp, Schema,
     };
-    use crate::sql::ast::{ColumnType, Literal};
-    use crate::sql::bind::{ColumnRef, ColumnSchema, Projected, Schema as BindSchema, TypedValue};
+    use crate::sql::ast::{ColumnType, CompareOp, Literal};
+    use crate::sql::bind::{
+        BoundPredicate, ColumnRef, ColumnSchema, Projected, Schema as BindSchema, TypedValue,
+    };
     use crate::sql::plan::{CreateCollection, Insert, LogicalPlan, Project, Scan};
     use std::num::NonZeroUsize;
 
@@ -568,6 +694,7 @@ mod tests {
         LogicalPlan::Scan(Scan {
             collection: "docs".to_string(),
             schema: docs_bind_schema(),
+            predicate: None,
         })
     }
 
@@ -619,6 +746,169 @@ mod tests {
     }
 
     // ========================================================================
+    // WHERE — predicates lower to bitmap set algebra.
+    // ========================================================================
+
+    /// `SELECT author FROM docs WHERE <pred>`, compiled.
+    fn filtered_ops(predicate: BoundPredicate) -> Vec<Op> {
+        let plan = LogicalPlan::Project(Project {
+            input: Box::new(LogicalPlan::Scan(Scan {
+                collection: "docs".to_string(),
+                schema: docs_bind_schema(),
+                predicate: Some(predicate),
+            })),
+            columns: stored(vec![colref("author", 1)]),
+            include_vector: false,
+        });
+        compile(plan, Some(&docs_meta_schema()))
+            .expect("a filtered select compiles")
+            .ops
+    }
+
+    fn cmp_pred(name: &str, ordinal: usize, op: CompareOp, value: i64) -> BoundPredicate {
+        BoundPredicate::Compare {
+            column: colref(name, ordinal),
+            op,
+            value: TypedValue {
+                value: Literal::Int(value),
+                ty: ColumnType::Int,
+            },
+        }
+    }
+
+    #[test]
+    fn a_predicate_is_emitted_before_the_cursor_opens() {
+        // The ordering that makes the design work: the bitmap IS the cursor's
+        // ordinal source, so it must exist before `OpenRead` runs. `OpenRead`
+        // then names the register holding it.
+        let ops = filtered_ops(cmp_pred("published_at", 3, CompareOp::Lt, 2));
+        assert_eq!(
+            ops[0],
+            Op::Integer {
+                value: 2,
+                dst: Reg(0)
+            },
+            "the comparand loads first"
+        );
+        assert_eq!(
+            ops[1],
+            Op::BitmapRange {
+                collection: "docs".to_string(),
+                // published_at: declaration ordinal 3 → storage ColumnId 2.
+                col: 2,
+                op: RangeOp::Lt,
+                value: Reg(0),
+                dst: Reg(1),
+            },
+            "translated through schema.locate, like every other column"
+        );
+        assert_eq!(
+            ops[2],
+            Op::OpenRead {
+                cur: Cursor(0),
+                collection: "docs".to_string(),
+                filter: Some(Reg(1)),
+            },
+            "the cursor opens over the bitmap the predicate produced"
+        );
+    }
+
+    #[test]
+    fn equality_emits_a_dictionary_lookup_not_a_range() {
+        // The index answers `=` and `<` by different structures, so they are
+        // different opcodes rather than one with an operator operand.
+        let ops = filtered_ops(cmp_pred("published_at", 3, CompareOp::Eq, 7));
+        assert!(
+            matches!(ops[1], Op::BitmapEq { col: 2, .. }),
+            "got {:?}",
+            ops[1]
+        );
+    }
+
+    #[test]
+    fn not_equal_lowers_to_equality_then_complement() {
+        // There is no `lookup_ne` on the index, so `!=` is built from the two
+        // primitives that exist — and the complement carries the collection
+        // because it must be bounded by that collection's LIVE set.
+        let ops = filtered_ops(cmp_pred("published_at", 3, CompareOp::Ne, 7));
+        let eq_dst = match &ops[1] {
+            Op::BitmapEq { dst, .. } => *dst,
+            other => panic!("expected BitmapEq, got {other:?}"),
+        };
+        let not_dst = match &ops[2] {
+            Op::BitmapNot {
+                collection,
+                src,
+                dst,
+            } => {
+                assert_eq!(collection, "docs", "bounded by this collection's live set");
+                assert_eq!(*src, eq_dst, "complements exactly what BitmapEq produced");
+                *dst
+            }
+            other => panic!("expected BitmapNot, got {other:?}"),
+        };
+        // And the cursor opens over the COMPLEMENT, not the equality.
+        assert_eq!(
+            ops[3],
+            Op::OpenRead {
+                cur: Cursor(0),
+                collection: "docs".to_string(),
+                filter: Some(not_dst),
+            }
+        );
+    }
+
+    #[test]
+    fn and_or_emit_post_order_with_no_jumps_at_all() {
+        // The structural claim behind skipping per-row comparison opcodes:
+        // a predicate compiles to straight-line set algebra. Both children are
+        // materialized into registers, then combined — and nothing branches.
+        let ops = filtered_ops(BoundPredicate::And(
+            Box::new(cmp_pred("published_at", 3, CompareOp::Lt, 4)),
+            Box::new(cmp_pred("published_at", 3, CompareOp::Eq, 2)),
+        ));
+        // Integer, BitmapRange, Integer, BitmapEq, BitmapAnd, OpenRead, ...
+        assert!(matches!(ops[4], Op::BitmapAnd { .. }), "got {:?}", ops[4]);
+        assert_eq!(
+            ops[5],
+            Op::OpenRead {
+                cur: Cursor(0),
+                collection: "docs".to_string(),
+                filter: Some(Reg(4)),
+            }
+        );
+        // No control flow among the predicate's ops — the loop's own
+        // SeekFirst/Next come later, and are the ONLY jumps in the program.
+        let predicate_ops = &ops[..5];
+        assert!(
+            !predicate_ops
+                .iter()
+                .any(|op| matches!(op, Op::SeekFirst { .. } | Op::Next { .. })),
+            "a predicate must not branch: {predicate_ops:?}"
+        );
+    }
+
+    #[test]
+    fn a_filtered_program_still_validates() {
+        // Every new op's register operands must be in range — the bitmap ops
+        // allocate registers the same way everything else does.
+        let plan = LogicalPlan::Project(Project {
+            input: Box::new(LogicalPlan::Scan(Scan {
+                collection: "docs".to_string(),
+                schema: docs_bind_schema(),
+                predicate: Some(BoundPredicate::Or(
+                    Box::new(cmp_pred("published_at", 3, CompareOp::Ne, 4)),
+                    Box::new(cmp_pred("published_at", 3, CompareOp::Ge, 2)),
+                )),
+            })),
+            columns: stored(vec![colref("author", 1)]),
+            include_vector: false,
+        });
+        let program = compile(plan, Some(&docs_meta_schema())).expect("compiles");
+        program.validate().expect("a filtered program is well-formed");
+    }
+
+    // ========================================================================
     // SELECT — the wrapping / recursion case.
     // ========================================================================
 
@@ -634,6 +924,7 @@ mod tests {
                 Op::OpenRead {
                     cur: Cursor(0),
                     collection: "docs".to_string(),
+                    filter: None,
                 },
                 // SeekFirst's target is the Halt (index 6).
                 Op::SeekFirst {
@@ -689,6 +980,7 @@ mod tests {
                 Op::OpenRead {
                     cur: Cursor(0),
                     collection: "docs".to_string(),
+                    filter: None,
                 },
                 Op::SeekFirst {
                     cur: Cursor(0),
@@ -738,6 +1030,7 @@ mod tests {
                 Op::OpenRead {
                     cur: Cursor(0),
                     collection: "docs".to_string(),
+                    filter: None,
                 },
                 Op::SeekFirst {
                     cur: Cursor(0),
@@ -777,6 +1070,7 @@ mod tests {
                 Op::OpenRead {
                     cur: Cursor(0),
                     collection: "docs".to_string(),
+                    filter: None,
                 },
                 Op::SeekFirst {
                     cur: Cursor(0),
@@ -819,6 +1113,7 @@ mod tests {
                 Op::OpenRead {
                     cur: Cursor(0),
                     collection: "docs".to_string(),
+                    filter: None,
                 },
                 Op::SeekFirst {
                     cur: Cursor(0),
@@ -1013,6 +1308,7 @@ mod tests {
             input: Box::new(LogicalPlan::Scan(Scan {
                 collection: "docs".to_string(),
                 schema: docs_bind_schema(),
+                predicate: None,
             })),
             columns: stored(vec![colref("author", 1)]),
             include_vector: false,

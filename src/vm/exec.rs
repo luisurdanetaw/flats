@@ -62,12 +62,15 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+use roaring::RoaringBitmap;
+
 use crate::compiler::bytecode::{Cursor as BytecodeCursor, Op, Program, Reg, ValidateError};
 use crate::compiler::constants::Const;
 use crate::engine::cursor::Cursor;
 use crate::engine::{CollectionId, Db};
 use crate::error::Error;
-use crate::metadata::common::{Ordinal, Schema};
+use crate::metadata::common::{Ordinal, Schema, Value};
+use crate::metadata::index as meta;
 use crate::vm::record::{Record, SplitError, split_record};
 use crate::vm::value;
 
@@ -109,6 +112,13 @@ pub enum RegValue {
     /// [`Op::Insert`]. The ISA's `MakeRecord dst` is a register, so a register
     /// has to be able to hold one.
     Record(Record),
+    /// A set of ordinals — the value a `WHERE` clause computes.
+    ///
+    /// Produced by the `Bitmap*` ops and consumed by `OpenRead`/`KnnScan` as
+    /// their `filter` operand. `Arc` for the same reason [`RegValue::Vector`]
+    /// has one: a bitmap over a large collection is a real payload, and the
+    /// combining ops read their inputs without wanting to copy them.
+    Bitmap(Arc<RoaringBitmap>),
 }
 
 /// One cursor slot: what a `cur` operand refers to between `OpenRead`/
@@ -194,6 +204,10 @@ fn needs_db(op: &Op) -> bool {
             | Op::KnnScan { .. }
             | Op::Insert { .. }
             | Op::CreateCollection { .. }
+            // Every bitmap op reads the collection's metadata index.
+            | Op::BitmapEq { .. }
+            | Op::BitmapRange { .. }
+            | Op::BitmapNot { .. }
     )
 }
 
@@ -217,6 +231,11 @@ fn mnemonic(op: &Op) -> &'static str {
         Op::RowId { .. } => "RowId",
         Op::Score { .. } => "Score",
         Op::CreateCollection { .. } => "CreateCollection",
+        Op::BitmapEq { .. } => "BitmapEq",
+        Op::BitmapRange { .. } => "BitmapRange",
+        Op::BitmapAnd { .. } => "BitmapAnd",
+        Op::BitmapOr { .. } => "BitmapOr",
+        Op::BitmapNot { .. } => "BitmapNot",
         Op::Halt => "Halt",
     }
 }
@@ -426,16 +445,95 @@ impl Vm {
                 // stays drained however many times it is stepped.
                 Op::Halt => return Ok(Flow::Halt),
 
+                // -- WHERE: set algebra over the metadata index ---------------
+                Op::BitmapEq {
+                    collection,
+                    col,
+                    value,
+                    dst,
+                } => {
+                    let (col, value, dst) = (*col, *value, *dst);
+                    let db = db.ok_or(ExecError::Detached { op: "BitmapEq" })?;
+                    let meta = self.metadata(db, collection)?;
+                    let needle = self.value(value)?;
+                    let found = meta.lookup_eq(col, &needle).map_err(ExecError::Engine)?;
+                    self.store(dst, RegValue::Bitmap(Arc::new(found)))?;
+                }
+                Op::BitmapRange {
+                    collection,
+                    col,
+                    op,
+                    value,
+                    dst,
+                } => {
+                    let (col, op, value, dst) = (*col, *op, *value, *dst);
+                    let db = db.ok_or(ExecError::Detached { op: "BitmapRange" })?;
+                    let meta = self.metadata(db, collection)?;
+                    let needle = self.value(value)?;
+                    let found = meta
+                        .lookup_range(col, op, &needle)
+                        .map_err(ExecError::Engine)?;
+                    self.store(dst, RegValue::Bitmap(Arc::new(found)))?;
+                }
+                Op::BitmapAnd { a, b, dst } => {
+                    let (a, b, dst) = (*a, *b, *dst);
+                    let (left, right) = (self.bitmap(a)?, self.bitmap(b)?);
+                    let out = left.as_ref() & right.as_ref();
+                    self.store(dst, RegValue::Bitmap(Arc::new(out)))?;
+                }
+                Op::BitmapOr { a, b, dst } => {
+                    let (a, b, dst) = (*a, *b, *dst);
+                    let (left, right) = (self.bitmap(a)?, self.bitmap(b)?);
+                    let out = left.as_ref() | right.as_ref();
+                    self.store(dst, RegValue::Bitmap(Arc::new(out)))?;
+                }
+                Op::BitmapNot {
+                    collection,
+                    src,
+                    dst,
+                } => {
+                    let (src, dst) = (*src, *dst);
+                    let db = db.ok_or(ExecError::Detached { op: "BitmapNot" })?;
+                    let meta = self.metadata(db, collection)?;
+                    let inner = self.bitmap(src)?;
+                    // Complement within the LIVE set, not the whole ordinal
+                    // space: a deleted row satisfies no predicate, so negating
+                    // one must not resurrect it.
+                    let out = meta.live() - inner.as_ref();
+                    self.store(dst, RegValue::Bitmap(Arc::new(out)))?;
+                }
+
                 // -- the read loop ---------------------------------------------
-                Op::OpenRead { cur, collection } => {
-                    let cur = *cur;
+                Op::OpenRead {
+                    cur,
+                    collection,
+                    filter,
+                } => {
+                    let (cur, filter) = (*cur, *filter);
                     let db = db.ok_or(ExecError::Detached { op: "OpenRead" })?;
                     let collection_id = db.collection_id(collection).map_err(ExecError::Engine)?;
                     // `scan` snapshots `live()` HERE, so the row SET is fixed
                     // for this scan — but the ROWS are not read yet. The cursor
                     // is positioned before the first row and fetches one at a
                     // time, which is what makes the loop below lazy.
-                    let cursor = db.scan(collection_id).map_err(ExecError::Engine)?;
+                    //
+                    // A `WHERE` replaces that snapshot with the predicate's
+                    // bitmap. Nothing else about the loop changes: a cursor is
+                    // an ordinal source, and both are ordinal sources.
+                    let cursor = match filter {
+                        None => db.scan(collection_id).map_err(ExecError::Engine)?,
+                        Some(reg) => {
+                            let bitmap = self.bitmap(reg)?;
+                            db.scan_over(
+                                collection_id,
+                                // Owned, not borrowed: the cursor is
+                                // `'static`, so it cannot hold a reference to
+                                // a register that the program may overwrite.
+                                bitmap.iter().collect::<Vec<u32>>().into_iter().map(Ordinal),
+                            )
+                            .map_err(ExecError::Engine)?
+                        }
+                    };
                     // A plain scan computes no similarities, so `Op::Score`
                     // against this cursor is an error rather than a zero.
                     self.open(
@@ -473,8 +571,9 @@ impl Vm {
                     collection,
                     query,
                     k,
+                    filter,
                 } => {
-                    let (cur, query, k) = (*cur, *query, *k);
+                    let (cur, query, k, filter) = (*cur, *query, *k, *filter);
                     let db = db.ok_or(ExecError::Detached { op: "KnnScan" })?;
                     let vector = match self.reg(query) {
                         Some(RegValue::Vector(v)) => v.clone(),
@@ -485,9 +584,20 @@ impl Vm {
                     // The one coarse opcode: a whole SIMD top-k pass, not a
                     // per-element interpreted loop. `search` already returns
                     // most-similar first and excludes tombstones.
-                    let hits = db
-                        .search(collection_id, &vector, k)
-                        .map_err(ExecError::Engine)?;
+                    //
+                    // With a `WHERE`, the bitmap goes IN to the ranking rather
+                    // than being applied to its output: `TOP k` must count rows
+                    // that satisfy the predicate, so filtering afterwards would
+                    // return fewer than `k` whenever the nearest neighbours
+                    // happen not to match — and look entirely plausible.
+                    let hits = match filter {
+                        None => db.search(collection_id, &vector, k),
+                        Some(reg) => {
+                            let bitmap = self.bitmap(reg)?;
+                            db.search_where(collection_id, &vector, k, &bitmap)
+                        }
+                    }
+                    .map_err(ExecError::Engine)?;
                     // SCORE ORDER IS THE PAYLOAD. Collect in the order `search`
                     // ranked them and hand that straight to the cursor, which
                     // imposes no order of its own — sorting here, or routing the
@@ -735,6 +845,52 @@ impl Vm {
         }
     }
 
+    /// The metadata-index reader for `collection`, by name.
+    ///
+    /// The bitmap ops carry a collection NAME rather than a cursor, because a
+    /// predicate is evaluated before any cursor is open — its result is what
+    /// the cursor will be opened over.
+    fn metadata(&self, db: &Db, collection: &str) -> Result<meta::Reader, ExecError> {
+        let id = db.collection_id(collection).map_err(ExecError::Engine)?;
+        db.metadata_reader(id).ok_or(ExecError::Engine(
+            crate::Error::UnknownCollectionName {
+                name: collection.to_string(),
+            },
+        ))
+    }
+
+    /// Read a register as a metadata [`Value`] — a predicate's comparand.
+    ///
+    /// The binder type-checked the literal against its column, so the variant
+    /// here always matches what the index expects; the error arms exist
+    /// because a register is only proved in-range by `validate`, never proved
+    /// to hold a particular type.
+    fn value(&self, reg: Reg) -> Result<Value, ExecError> {
+        match self.reg(reg) {
+            Some(RegValue::Int(n)) => Ok(Value::Int(*n)),
+            Some(RegValue::Real(f)) => Ok(Value::Float(*f)),
+            Some(RegValue::Str(s)) => Ok(Value::Text(s.clone())),
+            Some(RegValue::Unset) | None => Err(ExecError::UnsetRegister { reg: reg.0 }),
+            // A vector, record, or bitmap as a comparand is an emitter bug: the
+            // binder rejects predicates on the embedding, and nothing else can
+            // produce one here.
+            Some(_) => Err(ExecError::NotAComparand { reg: reg.0 }),
+        }
+    }
+
+    /// Read a register as a bitmap.
+    ///
+    /// Clones the `Arc`, not the bitmap: the combining ops need their operands
+    /// alive while they write a third register, and the borrow checker cannot
+    /// see that `dst` differs from `a` and `b`.
+    fn bitmap(&self, reg: Reg) -> Result<Arc<RoaringBitmap>, ExecError> {
+        match self.reg(reg) {
+            Some(RegValue::Bitmap(b)) => Ok(b.clone()),
+            Some(RegValue::Unset) | None => Err(ExecError::UnsetRegister { reg: reg.0 }),
+            Some(_) => Err(ExecError::NotABitmap { reg: reg.0 }),
+        }
+    }
+
     /// Read the register run `start .. start + count` into a row.
     ///
     /// An [`RegValue::Unset`] register is an ERROR, not an empty value:
@@ -800,6 +956,17 @@ pub enum ExecError {
         at: usize,
     },
     /// `KnnScan`'s query register does not hold a vector.
+    /// A register a bitmap op read does not hold a bitmap.
+    NotABitmap {
+        /// The offending register.
+        reg: u32,
+    },
+    /// A register used as a predicate's comparand holds something that cannot
+    /// be compared against a stored column (a vector, record, or bitmap).
+    NotAComparand {
+        /// The offending register.
+        reg: u32,
+    },
     NotAVector {
         /// The register.
         reg: u32,
@@ -936,6 +1103,12 @@ impl fmt::Display for ExecError {
             ExecError::Engine(e) => write!(f, "{e}"),
             ExecError::NotAVector { reg } => {
                 write!(f, "register r{reg} does not hold a query vector")
+            }
+            ExecError::NotABitmap { reg } => {
+                write!(f, "register r{reg} does not hold a bitmap")
+            }
+            ExecError::NotAComparand { reg } => {
+                write!(f, "register r{reg} does not hold a comparable value")
             }
             ExecError::TopKOverflow { k } => write!(f, "TOP {k} does not fit in a usize"),
             ExecError::NoScores { cur } => {
@@ -1618,6 +1791,7 @@ mod tests {
                 Op::OpenRead {
                     cur: Cursor(0),
                     collection: "docs".into(),
+                    filter: None,
                 },
                 Op::SeekFirst {
                     cur: Cursor(0),
@@ -1777,6 +1951,7 @@ mod tests {
                 Op::OpenRead {
                     cur: Cursor(0),
                     collection: "docs".into(),
+                    filter: None,
                 },
                 Op::SeekFirst {
                     cur: Cursor(0),
@@ -1825,6 +2000,7 @@ mod tests {
                 Op::OpenRead {
                     cur: Cursor(0),
                     collection: "docs".into(),
+                    filter: None,
                 },
                 Op::SeekFirst {
                     cur: Cursor(0),
@@ -1877,6 +2053,7 @@ mod tests {
                 Op::OpenRead {
                     cur: Cursor(0),
                     collection: "docs".into(),
+                    filter: None,
                 },
                 Op::SeekFirst {
                     cur: Cursor(0),
@@ -1923,6 +2100,7 @@ mod tests {
                 Op::OpenRead {
                     cur: Cursor(0),
                     collection: "docs".into(),
+                    filter: None,
                 },
                 Op::SeekFirst {
                     cur: Cursor(0),

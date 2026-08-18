@@ -48,6 +48,9 @@ fn plan_select(bound: BoundSelect) -> LogicalPlan {
         input: Box::new(LogicalPlan::Scan(Scan {
             collection: bound.from,
             schema: bound.schema,
+            // Pushed straight onto the leaf — see the note in `plan.rs` on why
+            // there is no separate `Filter` node to push it down FROM.
+            predicate: bound.filter,
         })),
         // A `SELECT` can only project stored columns — the binder has no way to
         // produce a pseudo-column here — so every item wraps.
@@ -77,6 +80,7 @@ fn plan_search(bound: BoundSearch) -> LogicalPlan {
             schema: bound.schema,
             k: bound.k,
             query: bound.query,
+            predicate: bound.filter,
         })),
         columns: bound.projection,
         include_vector: false,
@@ -183,6 +187,7 @@ mod tests {
             input: Box::new(LogicalPlan::Scan(Scan {
                 collection: "docs".to_string(),
                 schema: docs_schema(),
+                predicate: None,
             })),
             columns: stored(columns),
             include_vector,
@@ -227,6 +232,7 @@ mod tests {
             schema: docs_schema(),
             projection: vec![colref("author", 1), colref("title", 2)],
             include_vector: false,
+            filter: None,
         });
         assert_eq!(
             plan(bound),
@@ -246,6 +252,7 @@ mod tests {
                 colref("published_at", 3),
             ],
             include_vector: false,
+            filter: None,
         });
         assert_eq!(
             plan(bound),
@@ -267,6 +274,7 @@ mod tests {
             schema: docs_schema(),
             projection: vec![colref("vector", 0)],
             include_vector: true,
+            filter: None,
         });
         assert_eq!(plan(bound), docs_project(vec![colref("vector", 0)], true),);
     }
@@ -283,6 +291,7 @@ mod tests {
             k: 5,
             query: vec![0.5; 768],
             projection: stored(vec![colref("author", 1), colref("title", 2)]),
+            filter: None,
         });
         assert_eq!(
             plan(bound),
@@ -292,6 +301,7 @@ mod tests {
                     schema: docs_schema(),
                     k: 5,
                     query: vec![0.5; 768],
+                    predicate: None,
                 })),
                 columns: stored(vec![colref("author", 1), colref("title", 2)]),
                 // Bare SEARCH never returns the embedding — the same rule
@@ -318,6 +328,7 @@ mod tests {
                 k,
                 query: query.clone(),
                 projection: stored(vec![colref("author", 1)]),
+                filter: None,
             });
             match plan(bound) {
                 LogicalPlan::Project(p) => match *p.input {
@@ -418,6 +429,7 @@ mod tests {
                     schema: docs_schema(),
                     k: 5,
                     query,
+                    predicate: None,
                 })),
                 // Bare SEARCH has no projection clause, so the binder supplies
                 // every scalar in schema order — `SELECT *`'s expansion.

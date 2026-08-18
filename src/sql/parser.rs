@@ -29,8 +29,8 @@
 use std::fmt;
 
 use crate::sql::ast::{
-    CollectionOption, ColumnDef, ColumnType, CreateStmt, InsertStmt, Literal, Projection,
-    SearchStmt, SelectStmt, Statement,
+    CollectionOption, ColumnDef, ColumnType, CompareOp, CreateStmt, Expr, InsertStmt, Literal,
+    Projection, SearchStmt, SelectStmt, Statement,
 };
 use crate::sql::lexer::{LexError, Lexer, Span, SpannedToken, Token};
 
@@ -240,17 +240,121 @@ impl Parser {
         Ok(stmt)
     }
 
-    /// `select := SELECT projection FROM ident`
+    /// `select := SELECT projection FROM ident [WHERE expr]`
     fn parse_select(&mut self) -> Result<SelectStmt, ParseError> {
         self.expect(Token::Select)?;
         let projection = self.parse_projection()?;
         self.expect(Token::From)?;
         let from = self.expect_ident()?;
-        Ok(SelectStmt { projection, from })
+        let filter = self.parse_where()?;
+        Ok(SelectStmt {
+            projection,
+            from,
+            filter,
+        })
+    }
+
+    /// `where := WHERE expr` — the whole clause, absent when the keyword is not
+    /// there. Shared by every statement that takes a predicate, so `SELECT` and
+    /// `SEARCH` cannot end up accepting different expression grammars.
+    fn parse_where(&mut self) -> Result<Option<Expr>, ParseError> {
+        if *self.peek() != Token::Where {
+            return Ok(None);
+        }
+        self.advance();
+        Ok(Some(self.parse_expr()?))
+    }
+
+    /// `expr := or_expr` — the entry point, named for what callers want.
+    fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+        self.parse_or()
+    }
+
+    /// `or_expr := and_expr (OR and_expr)*`
+    ///
+    /// `OR` is the LOOSEST operator, so it sits outermost: parsing it here
+    /// means each side is a fully-parsed `AND` chain, which is what makes
+    /// `a = 1 OR b = 2 AND c = 3` group as `a = 1 OR (b = 2 AND c = 3)`.
+    /// Left-associative, like SQL.
+    fn parse_or(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_and()?;
+        while *self.peek() == Token::Or {
+            self.advance();
+            let right = self.parse_and()?;
+            left = Expr::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    /// `and_expr := cmp_expr (AND cmp_expr)*`
+    fn parse_and(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_comparison()?;
+        while *self.peek() == Token::And {
+            self.advance();
+            let right = self.parse_comparison()?;
+            left = Expr::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    /// `cmp_expr := primary [op primary]`
+    ///
+    /// NON-associative, deliberately: `a < b < c` is a chained comparison that
+    /// means nothing here, and looping would silently accept it as
+    /// `(a < b) < c`. One optional operator, then stop — a second one is left
+    /// for the caller to choke on, which reports the error at the right token.
+    fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
+        let left = self.parse_primary()?;
+        let op = match self.peek() {
+            Token::Lt => CompareOp::Lt,
+            Token::Le => CompareOp::Le,
+            Token::Gt => CompareOp::Gt,
+            Token::Ge => CompareOp::Ge,
+            Token::Eq => CompareOp::Eq,
+            Token::Ne => CompareOp::Ne,
+            _ => return Ok(left),
+        };
+        self.advance();
+        let right = self.parse_primary()?;
+        Ok(Expr::Compare {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        })
+    }
+
+    /// `primary := ident | literal | '(' expr ')'`
+    ///
+    /// An identifier becomes [`Expr::Column`] without checking that any such
+    /// column exists — that needs the catalog, and it is the binder's.
+    fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+        match self.peek() {
+            Token::LParen => {
+                self.advance();
+                let inner = self.parse_expr()?;
+                self.expect(Token::RParen)?;
+                Ok(inner)
+            }
+            Token::Ident(_) => Ok(Expr::Column(self.expect_ident()?)),
+            // Every literal form the rest of the grammar knows, including
+            // vectors — which no predicate can usefully compare, but rejecting
+            // that HERE would mean the parser knowing what a comparison means.
+            // The binder says so, in terms of the column's type.
+            Token::StrLit(_) | Token::Minus | Token::IntLit(_) | Token::FloatLit(_)
+            | Token::LBracket => Ok(Expr::Literal(self.parse_literal()?)),
+            Token::Eof => Err(self.error(ParseErrorKind::UnexpectedEof)),
+            other => {
+                let found = format!("{other:?}");
+                Err(self.error(ParseErrorKind::UnexpectedToken {
+                    expected: "column name, literal, or `(`".to_string(),
+                    found,
+                }))
+            }
+        }
     }
 
     /// `search := SEARCH TOP int_lit NEAREST TO vector_lit FROM ident
-    ///            (RETURNING ident (',' ident)*)?`
+    ///            (WHERE expr)? (RETURNING ident (',' ident)*)?`
     ///
     /// Every keyword is required and positional, so a missing one is an
     /// `UnexpectedToken` naming what was wanted. The query reuses
@@ -268,6 +372,10 @@ impl Parser {
         let query = Literal::Vector(self.parse_vector_lit()?);
         self.expect(Token::From)?;
         let collection = self.expect_ident()?;
+        // WHERE comes BEFORE RETURNING (CLAUDE.md §4): the predicate selects
+        // rows, the projection describes what comes back, and reading them in
+        // that order is what the spec's examples spell.
+        let filter = self.parse_where()?;
         // OPTIONAL. Absent means the default projection — see
         // `SearchStmt::projection` for why that is `None` and not an empty list.
         let projection = if *self.peek() == Token::Returning {
@@ -286,6 +394,7 @@ impl Parser {
             query,
             collection,
             projection,
+            filter,
         })
     }
 
@@ -524,6 +633,7 @@ mod tests {
                 query: Literal::Vector(vec![0.1, 0.2, 0.3]),
                 collection: "docs".to_string(),
                 projection: None,
+                filter: None,
             })
         );
         // Keywords are case-insensitive, like every other statement.
@@ -683,6 +793,7 @@ mod tests {
             Statement::Select(SelectStmt {
                 projection: Projection::Columns(cols(&["x", "y"])),
                 from: "docs".to_string(),
+                filter: None,
             })
         );
     }
@@ -694,6 +805,7 @@ mod tests {
             Statement::Select(SelectStmt {
                 projection: Projection::Star,
                 from: "docs".to_string(),
+                filter: None,
             })
         );
     }
@@ -706,8 +818,183 @@ mod tests {
             Statement::Select(SelectStmt {
                 projection: Projection::Columns(cols(&["x"])),
                 from: "docs".to_string(),
+                filter: None,
             })
         );
+    }
+
+    // -- WHERE / expressions -----------------------------------------------
+
+    /// The filter of a parsed `SELECT`, for tests that only care about it.
+    fn filter_of(sql: &str) -> Option<Expr> {
+        match ok(sql) {
+            Statement::Select(s) => s.filter,
+            other => panic!("expected a SELECT, got {other:?}"),
+        }
+    }
+
+    fn col(name: &str) -> Box<Expr> {
+        Box::new(Expr::Column(name.to_string()))
+    }
+
+    fn int(n: i64) -> Box<Expr> {
+        Box::new(Expr::Literal(Literal::Int(n)))
+    }
+
+    fn cmp(left: Box<Expr>, op: CompareOp, right: Box<Expr>) -> Box<Expr> {
+        Box::new(Expr::Compare { left, op, right })
+    }
+
+    #[test]
+    fn a_statement_without_where_has_no_filter() {
+        assert_eq!(filter_of("SELECT x FROM docs;"), None);
+    }
+
+    #[test]
+    fn a_simple_comparison_parses() {
+        assert_eq!(
+            filter_of("SELECT x FROM docs WHERE z < 2;"),
+            Some(*cmp(col("z"), CompareOp::Lt, int(2)))
+        );
+    }
+
+    #[test]
+    fn every_comparison_operator_parses() {
+        for (sql, op) in [
+            ("<", CompareOp::Lt),
+            ("<=", CompareOp::Le),
+            (">", CompareOp::Gt),
+            (">=", CompareOp::Ge),
+            ("=", CompareOp::Eq),
+            ("!=", CompareOp::Ne),
+            ("<>", CompareOp::Ne),
+        ] {
+            let stmt = format!("SELECT x FROM docs WHERE z {sql} 2;");
+            assert_eq!(
+                filter_of(&stmt),
+                Some(*cmp(col("z"), op, int(2))),
+                "{sql} did not parse as {op:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn and_binds_tighter_than_or() {
+        // THE precedence test. `a = 1 OR b = 2 AND c = 3` must group as
+        // `a = 1 OR (b = 2 AND c = 3)`. Getting this backwards changes which
+        // rows come back, and silently — both readings are valid predicates.
+        let expected = Expr::Or(
+            cmp(col("a"), CompareOp::Eq, int(1)),
+            Box::new(Expr::And(
+                cmp(col("b"), CompareOp::Eq, int(2)),
+                cmp(col("c"), CompareOp::Eq, int(3)),
+            )),
+        );
+        assert_eq!(
+            filter_of("SELECT x FROM docs WHERE a = 1 OR b = 2 AND c = 3;"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn parentheses_override_precedence() {
+        let expected = Expr::And(
+            Box::new(Expr::Or(
+                cmp(col("a"), CompareOp::Eq, int(1)),
+                cmp(col("b"), CompareOp::Eq, int(2)),
+            )),
+            cmp(col("c"), CompareOp::Eq, int(3)),
+        );
+        assert_eq!(
+            filter_of("SELECT x FROM docs WHERE (a = 1 OR b = 2) AND c = 3;"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn and_and_or_are_left_associative() {
+        // `a AND b AND c` is `(a AND b) AND c`. Right-association would give
+        // the same rows for AND/OR, but the plan shape differs and the tests
+        // downstream assert on tree structure.
+        let expected = Expr::And(
+            Box::new(Expr::And(
+                cmp(col("a"), CompareOp::Eq, int(1)),
+                cmp(col("b"), CompareOp::Eq, int(2)),
+            )),
+            cmp(col("c"), CompareOp::Eq, int(3)),
+        );
+        assert_eq!(
+            filter_of("SELECT x FROM docs WHERE a = 1 AND b = 2 AND c = 3;"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn a_negative_comparand_parses_as_a_negative_literal() {
+        assert_eq!(
+            filter_of("SELECT x FROM docs WHERE z < -2;"),
+            Some(*cmp(col("z"), CompareOp::Lt, int(-2)))
+        );
+    }
+
+    #[test]
+    fn a_flipped_comparison_parses_as_written() {
+        // `2 > z` is legal syntax; NORMALIZING it to `z < 2` is the binder's
+        // job, because only the binder knows which side names a column.
+        assert_eq!(
+            filter_of("SELECT x FROM docs WHERE 2 > z;"),
+            Some(*cmp(int(2), CompareOp::Gt, col("z")))
+        );
+    }
+
+    #[test]
+    fn a_string_comparand_parses() {
+        assert_eq!(
+            filter_of("SELECT x FROM docs WHERE author = 'alice';"),
+            Some(*cmp(
+                col("author"),
+                CompareOp::Eq,
+                Box::new(Expr::Literal(Literal::Str("alice".to_string())))
+            ))
+        );
+    }
+
+    #[test]
+    fn chained_comparisons_are_rejected() {
+        // `a < b < c` means nothing in V-SQL. Parsing it as `(a < b) < c`
+        // would accept it and produce a predicate no one asked for.
+        // (`err` panics unless the parse fails, so calling it IS the assertion.)
+        err("SELECT x FROM docs WHERE a < b < c;");
+    }
+
+    #[test]
+    fn a_where_clause_missing_its_expression_is_an_error() {
+        err("SELECT x FROM docs WHERE;");
+        err("SELECT x FROM docs WHERE z <;");
+        err("SELECT x FROM docs WHERE (z < 2;");
+    }
+
+    #[test]
+    fn search_takes_where_before_returning() {
+        // Clause ORDER is fixed by the spec (CLAUDE.md §4).
+        let stmt = ok("SEARCH TOP 5 NEAREST TO [0.1, 0.2] FROM docs WHERE z < 2 RETURNING id, score;");
+        let Statement::Search(search) = stmt else {
+            panic!("expected a SEARCH");
+        };
+        assert_eq!(search.filter, Some(*cmp(col("z"), CompareOp::Lt, int(2))));
+        assert_eq!(
+            search.projection,
+            Some(vec!["id".to_string(), "score".to_string()])
+        );
+
+        // WHERE without RETURNING, and the reverse order rejected.
+        let stmt = ok("SEARCH TOP 5 NEAREST TO [0.1, 0.2] FROM docs WHERE z < 2;");
+        let Statement::Search(search) = stmt else {
+            panic!("expected a SEARCH");
+        };
+        assert!(search.filter.is_some() && search.projection.is_none());
+        // RETURNING before WHERE is not the spec's order.
+        err("SEARCH TOP 5 NEAREST TO [0.1, 0.2] FROM docs RETURNING id WHERE z < 2;");
     }
 
     #[test]
@@ -722,6 +1009,7 @@ mod tests {
             Statement::Select(SelectStmt {
                 projection: Projection::Columns(cols(&["published_at"])),
                 from: "docs".to_string(),
+                filter: None,
             })
         );
     }
@@ -924,6 +1212,7 @@ mod tests {
             Statement::Select(SelectStmt {
                 projection: Projection::Columns(cols(&["x", "y"])),
                 from: "docs".to_string(),
+                filter: None,
             })
         );
     }

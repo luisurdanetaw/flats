@@ -422,6 +422,7 @@ mod tests {
                 Op::OpenRead {
                     cur: Cursor(0),
                     collection: "docs".into(),
+                    filter: None,
                 },
                 Op::SeekFirst {
                     cur: Cursor(0),
@@ -1295,6 +1296,208 @@ mod tests {
         // Labels still land — a header is knowable without any rows.
         assert_eq!(stream.labels(), ["author"]);
         assert!(collect(stream).is_empty());
+        db.close().unwrap();
+    }
+
+    // -- WHERE, end to end --------------------------------------------------
+
+    /// Four rows whose `published_at` spans a usable range, and whose vectors
+    /// put `bob` NEARER the query than `carol` while giving them different
+    /// `published_at` values — the arrangement the prefilter test needs.
+    fn seed_filterable(db: &Db) {
+        for (author, x, n) in [
+            ("alice", 1.0, 1),
+            ("bob", 0.9, 5),
+            ("carol", 0.0, 1),
+            ("dave", 0.0, 9),
+        ] {
+            db.execute(&format!(
+                "INSERT INTO docs (author, vector, title, published_at) \
+                 VALUES ('{author}', [{x}, 0.0, 0.0, 0.0], 'doc', {n});"
+            ))
+            .expect("seeded row inserts");
+        }
+    }
+
+    /// The `author` of each returned row, in stream order.
+    fn authors(stream: RowStream) -> Vec<String> {
+        collect(stream)
+            .into_iter()
+            .map(|row| match &row[0] {
+                RegValue::Str(s) => s.clone(),
+                other => panic!("expected an author string, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// `SELECT author FROM docs WHERE <predicate>`, as authors.
+    fn where_authors(db: &Db, predicate: &str) -> Vec<String> {
+        let sql = format!("SELECT author FROM docs WHERE {predicate};");
+        authors(db.execute(&sql).expect("the filtered select runs"))
+    }
+
+    #[test]
+    fn select_where_filters_rows() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        assert_eq!(where_authors(&db, "published_at < 2"), ["alice", "carol"]);
+        assert_eq!(where_authors(&db, "published_at = 5"), ["bob"]);
+        assert_eq!(
+            where_authors(&db, "published_at >= 5"),
+            ["bob", "dave"],
+            "an inclusive bound includes its endpoint"
+        );
+        assert_eq!(where_authors(&db, "author = 'carol'"), ["carol"]);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn and_intersects_or_unions() {
+        // The two combining ops, checked against results rather than bitmaps:
+        // AND narrows, OR widens.
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        assert_eq!(
+            where_authors(&db, "published_at < 6 AND author = 'bob'"),
+            ["bob"]
+        );
+        assert_eq!(
+            where_authors(&db, "published_at = 5 OR published_at = 9"),
+            ["bob", "dave"]
+        );
+        // Precedence survives the whole pipeline: `a OR b AND c` is
+        // `a OR (b AND c)`, so `alice` (matching the OR's left side) comes back
+        // even though she fails the AND.
+        assert_eq!(
+            where_authors(
+                &db,
+                "author = 'alice' OR published_at = 5 AND author = 'bob'"
+            ),
+            ["alice", "bob"]
+        );
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn not_equal_excludes_only_the_named_value() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+        assert_eq!(
+            where_authors(&db, "author != 'alice'"),
+            ["bob", "carol", "dave"]
+        );
+        assert_eq!(
+            where_authors(&db, "published_at != 1"),
+            ["bob", "dave"],
+            "both rows holding the excluded value are dropped"
+        );
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn a_predicate_matching_nothing_returns_an_empty_result_with_labels() {
+        // An empty bitmap must produce a well-formed empty result, not an
+        // error: `SeekFirst` jumps past the loop body, and the labels still
+        // describe what came back empty.
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+        let stream = db
+            .execute("SELECT author FROM docs WHERE published_at = 424242;")
+            .expect("a predicate matching nothing still runs");
+        assert_eq!(stream.labels(), ["author"]);
+        assert!(collect(stream).is_empty());
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn search_where_is_a_prefilter_not_a_postfilter() {
+        // THE semantic that is easy to get wrong and impossible to notice.
+        //
+        // `bob` (x=0.9) is NEARER the query than `carol` (x=0.0), but `bob`
+        // fails `published_at < 2`. A prefilter therefore returns
+        // [alice, carol] — two rows, the two nearest AMONG THOSE MATCHING.
+        // Ranking first and filtering after would rank [alice, bob], drop
+        // `bob`, and return a single row — fewer than the requested TOP 2,
+        // while looking entirely plausible.
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        let stream = db
+            .execute(
+                "SEARCH TOP 2 NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM docs \
+                 WHERE published_at < 2 RETURNING author;",
+            )
+            .expect("the filtered search runs");
+        assert_eq!(
+            authors(stream),
+            ["alice", "carol"],
+            "TOP k counts rows that satisfy the predicate"
+        );
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn search_where_preserves_score_order() {
+        // The filter narrows the candidate set; it must not disturb the
+        // ranking within it.
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+        let stream = db
+            .execute(
+                "SEARCH TOP 3 NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM docs \
+                 WHERE published_at != 9 RETURNING author;",
+            )
+            .expect("the filtered search runs");
+        // alice (1.0) > bob (0.9) > carol (0.0); dave is excluded.
+        assert_eq!(authors(stream), ["alice", "bob", "carol"]);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn an_ordered_comparison_on_text_is_refused_at_the_boundary() {
+        // The metadata index answers a TEXT range with an EMPTY bitmap by
+        // design, so accepting this would return zero rows and look exactly
+        // like a collection with no matching data. It must be an error the
+        // user sees, not a silent wrong answer.
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+        // `RowStream` is not `Debug`, so `expect_err` is unavailable.
+        let message = match db.execute("SELECT author FROM docs WHERE author < 'm';") {
+            Ok(_) => panic!("an ordered TEXT comparison must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            message.contains("author"),
+            "the error names the column: {message}"
+        );
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn a_where_clause_naming_an_unknown_column_is_a_bind_error() {
+        let (_dir, db) = docs_db();
+        if db.execute("SELECT author FROM docs WHERE nope = 1;").is_ok() {
+            panic!("an unknown column in WHERE must be refused");
+        }
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn a_deleted_row_never_satisfies_a_predicate() {
+        // Every lookup is masked by `live`, and `!=` complements WITHIN it —
+        // so a tombstone cannot be resurrected by negating a predicate. Rows
+        // here are all live, so this pins the complement's BOUND: `!=` must
+        // return only real rows, never the unused ordinal space up to
+        // capacity.
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+        assert_eq!(
+            where_authors(&db, "author != 'nobody'").len(),
+            4,
+            "the complement is bounded by the live set, not by capacity"
+        );
         db.close().unwrap();
     }
 }

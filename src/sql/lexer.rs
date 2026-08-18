@@ -71,8 +71,14 @@ pub enum Token {
     To,
     /// `RETURNING`
     Returning,
-    // EXTEND: future reserved keywords (Where, And, Or, Delete, Update, Set, …)
-    // get a variant here AND an arm in `keyword()` — nothing else changes.
+    /// `WHERE`
+    Where,
+    /// `AND`
+    And,
+    /// `OR`
+    Or,
+    // EXTEND: future reserved keywords (Delete, Update, Set, …) get a variant
+    // here AND an arm in `keyword()` — nothing else changes.
 
     // -- identifiers & literals ---------------------------------------------
     /// An identifier. Also carries *type names* (`VECTOR`, `INT`, `TEXT`,
@@ -108,8 +114,16 @@ pub enum Token {
     /// `*` — the `SELECT *` wildcard. Core V-SQL, so it is a real token even
     /// though none of the three bootstrap statements use it.
     Star,
-    // EXTEND: future operators (Lt, Gt, Le, Ge, Ne, …) get a variant
-    // here AND a match arm in `next_token` — nothing else changes.
+    /// `<`
+    Lt,
+    /// `<=`
+    Le,
+    /// `>`
+    Gt,
+    /// `>=`
+    Ge,
+    /// `!=` (also spelled `<>`).
+    Ne,
     /// End of input. Always the final token in a successful stream.
     Eof,
 }
@@ -222,6 +236,9 @@ fn keyword(word: &str) -> Option<Token> {
         "nearest" => Some(Token::Nearest),
         "to" => Some(Token::To),
         "returning" => Some(Token::Returning),
+        "where" => Some(Token::Where),
+        "and" => Some(Token::And),
+        "or" => Some(Token::Or),
         // EXTEND: future reserved keywords here.
         _ => None,
     }
@@ -291,8 +308,29 @@ impl<'a> Lexer<'a> {
             // parser's job (design decision 2).
             b'-' => Ok(self.single(Token::Minus, start)),
             b'*' => Ok(self.single(Token::Star, start)),
-            // EXTEND: new single-char operators (Lt `<`, Gt `>`, …)
-            // get a match arm here plus a `Token` variant.
+            // Comparison operators, longest match FIRST. `<=` must not lex as
+            // `<` then `=` — the parser would see a comparison followed by a
+            // stray `=` and report a baffling error at the wrong position.
+            b'<' => match self.peek_after(start) {
+                Some(b'=') => Ok(self.double(Token::Le, start)),
+                // `<>` is standard SQL's other spelling of `!=`. Accepted
+                // because it costs one arm and people type it out of habit.
+                Some(b'>') => Ok(self.double(Token::Ne, start)),
+                _ => Ok(self.single(Token::Lt, start)),
+            },
+            b'>' => match self.peek_after(start) {
+                Some(b'=') => Ok(self.double(Token::Ge, start)),
+                _ => Ok(self.single(Token::Gt, start)),
+            },
+            // A lone `!` is not a token in V-SQL — there is no NOT operator —
+            // so the `=` is required rather than optional.
+            b'!' => match self.peek_after(start) {
+                Some(b'=') => Ok(self.double(Token::Ne, start)),
+                _ => Err(LexError {
+                    kind: LexErrorKind::UnexpectedChar('!'),
+                    pos: start,
+                }),
+            },
             b'\'' => self.scan_string(start),
             _ if b.is_ascii_digit() => self.scan_number(start),
             _ if b == b'_' || b.is_ascii_alphabetic() => Ok(self.scan_ident(start)),
@@ -320,6 +358,24 @@ impl<'a> Lexer<'a> {
                 end: self.pos,
             },
         }
+    }
+
+    /// Advance past a two-byte token and span it `[start, pos)`.
+    fn double(&mut self, token: Token, start: usize) -> SpannedToken {
+        self.pos += 2;
+        SpannedToken {
+            token,
+            span: Span {
+                start,
+                end: self.pos,
+            },
+        }
+    }
+
+    /// The byte after the one at `start`, for deciding between a one- and
+    /// two-character operator.
+    fn peek_after(&self, start: usize) -> Option<u8> {
+        self.src.as_bytes().get(start + 1).copied()
     }
 
     /// Skip whitespace and `-- …` line comments (to end of line). Loops so runs
@@ -487,6 +543,74 @@ mod tests {
         assert_eq!(lex("select"), vec![Token::Select]);
         assert_eq!(lex("SELECT"), vec![Token::Select]);
         assert_eq!(lex("SeLeCt"), vec![Token::Select]);
+    }
+
+    #[test]
+    fn where_clause_keywords_lex() {
+        assert_eq!(
+            lex("WHERE a AND b OR c"),
+            vec![
+                Token::Where,
+                ident("a"),
+                Token::And,
+                ident("b"),
+                Token::Or,
+                ident("c")
+            ]
+        );
+        // Same case-insensitivity every other keyword gets.
+        assert_eq!(lex("where and or"), vec![Token::Where, Token::And, Token::Or]);
+    }
+
+    #[test]
+    fn comparison_operators_lex() {
+        assert_eq!(
+            lex("< <= > >= = != <>"),
+            vec![
+                Token::Lt,
+                Token::Le,
+                Token::Gt,
+                Token::Ge,
+                Token::Eq,
+                Token::Ne,
+                Token::Ne,
+            ]
+        );
+    }
+
+    #[test]
+    fn two_character_operators_win_over_one() {
+        // Maximal munch. Lexing `<=` as `<` then `=` would leave the parser
+        // staring at a stray `=` and reporting the error in the wrong place.
+        assert_eq!(lex("a<=1"), vec![ident("a"), Token::Le, Token::IntLit(1)]);
+        assert_eq!(lex("a>=1"), vec![ident("a"), Token::Ge, Token::IntLit(1)]);
+        assert_eq!(lex("a!=1"), vec![ident("a"), Token::Ne, Token::IntLit(1)]);
+        // ... but a bare `<` followed by something else is still just `<`.
+        assert_eq!(lex("a<1"), vec![ident("a"), Token::Lt, Token::IntLit(1)]);
+        // `<` then a SPACE then `=` is two tokens, not `<=`.
+        assert_eq!(lex("a < = 1"), vec![
+            ident("a"),
+            Token::Lt,
+            Token::Eq,
+            Token::IntLit(1)
+        ]);
+    }
+
+    #[test]
+    fn a_lone_bang_is_a_lex_error() {
+        // V-SQL has no NOT operator, so `!` is only ever half of `!=`.
+        let err = Lexer::new("a ! b").tokenize().expect_err("must fail");
+        assert_eq!(err.kind, LexErrorKind::UnexpectedChar('!'));
+    }
+
+    #[test]
+    fn a_negative_comparand_still_lexes_as_minus_then_number() {
+        // Sign stays the parser's job (design decision 2) — adding comparison
+        // operators must not change that.
+        assert_eq!(
+            lex("z < -2"),
+            vec![ident("z"), Token::Lt, Token::Minus, Token::IntLit(2)]
+        );
     }
 
     #[test]
