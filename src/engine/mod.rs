@@ -57,6 +57,8 @@ pub mod cursor;
 use crate::engine::cursor::Cursor;
 use crate::error::{Error, Result};
 use crate::index::index::{FlatIndex, Ordinal, Reader, SearchResult, Writer};
+use roaring::RoaringBitmap;
+
 use crate::metadata::common::{Row, Schema};
 use crate::metadata::index::MetadataIndex;
 use crate::metadata::tuples::TupleStore;
@@ -787,6 +789,23 @@ impl Db {
     pub fn search(&self, collection: u32, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
         let coll = self.collection(collection)?;
         coll.reader.search(query, k)
+    }
+
+    /// Brute-force top-`k` search within `collection`, restricted to `allowed`.
+    ///
+    /// The `WHERE`-clause path for `SEARCH`. `allowed` is a PREFILTER — `k`
+    /// counts rows that satisfy it, so a filtered search still returns `k` rows
+    /// whenever `k` of them match. See
+    /// [`index::Reader::search_filtered`](crate::index::index::Reader::search_filtered).
+    pub fn search_where(
+        &self,
+        collection: u32,
+        query: &[f32],
+        k: usize,
+        allowed: &RoaringBitmap,
+    ) -> Result<Vec<SearchResult>> {
+        let coll = self.collection(collection)?;
+        coll.reader.search_filtered(query, k, Some(allowed))
     }
 
     /// Create a new collection through the WAL (Phase 6): DDL is a mutation,

@@ -323,7 +323,10 @@ enum Source {
     /// A terminal, with editing and history.
     Editing {
         editor: Editor,
-        keys: Keys<StdinLock<'static>>,
+        /// Boxed because `Keys` carries a read buffer, which would otherwise
+        /// make this variant hundreds of bytes larger than `Plain` — and an
+        /// enum is as big as its largest variant.
+        keys: Box<Keys<StdinLock<'static>>>,
     },
     /// A pipe, a file, or a terminal that refused raw mode.
     Plain { lines: Lines<StdinLock<'static>> },
@@ -338,7 +341,7 @@ impl Source {
         if interactive && RawMode::enable(STDIN_FD).is_ok() {
             Source::Editing {
                 editor: Editor::new(),
-                keys: Keys::new(io::stdin().lock()),
+                keys: Box::new(Keys::new(io::stdin().lock())),
             }
         } else {
             Source::Plain {
@@ -653,6 +656,9 @@ fn render(value: &RegValue) -> String {
         // whoever lands `VectorFetch`.
         RegValue::Vector(v) => format!("<vector dim={}>", v.len()),
         RegValue::Record(_) => "<record>".to_string(),
+        // A WHERE intermediate. Never projected — it exists between the
+        // predicate's ops and the cursor that opens over it.
+        RegValue::Bitmap(b) => format!("<bitmap {} rows>", b.len()),
         // Never emitted: reading an unset register is an ExecError, so a row
         // carrying one cannot reach here.
         RegValue::Unset => "<unset>".to_string(),

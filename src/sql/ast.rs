@@ -10,7 +10,13 @@
 //! Grammar this mirrors (see parser.rs):
 //!
 //!   statement    := (select | insert | create) ';'
-//!   select       := SELECT projection FROM ident
+//!   select       := SELECT projection FROM ident [where]
+//!   where        := WHERE expr
+//!   expr         := or_expr
+//!   or_expr      := and_expr (OR and_expr)*
+//!   and_expr     := cmp_expr (AND cmp_expr)*
+//!   cmp_expr     := primary [('<'|'<='|'>'|'>='|'='|'!=') primary]
+//!   primary      := ident | literal | '(' expr ')'
 //!   projection   := '*' | ident (',' ident)*
 //!   create       := CREATE COLLECTION ident '(' col_def (',' col_def)* ')'
 //!                   WITH '(' opt (',' opt)* ')'
@@ -41,14 +47,84 @@ pub enum Statement {
     // EXTEND: Delete(DeleteStmt), Update(UpdateStmt).
 }
 
-/// `SELECT projection FROM ident`.
+/// `SELECT projection FROM ident [WHERE expr]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
     /// What to return.
     pub projection: Projection,
     /// The collection name after `FROM`.
     pub from: String,
-    // EXTEND: pub filter: Option<Expr>,  // WHERE — arrives with Expr, later.
+    /// The `WHERE` predicate, or `None` when the clause was omitted.
+    pub filter: Option<Expr>,
+}
+
+/// A `WHERE` expression, as WRITTEN — unresolved and unchecked.
+///
+/// Deliberately more general than V-SQL accepts: `Compare` holds two arbitrary
+/// sub-expressions, so `1 = 2` and `a < b` both parse. That is not an
+/// oversight. The parser does no semantics anywhere else in this crate (a
+/// column name is just a string until [`bind`](crate::sql::bind) resolves it),
+/// and a grammar that could only *spell* legal predicates would have to know
+/// which identifiers are columns — which needs the catalog. So the shape is
+/// permissive here and narrowed by the binder, which can say
+/// "`a < b`: comparing two columns is not supported" instead of the parser
+/// saying "expected literal, found identifier".
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    /// A bare identifier — a column reference, once something can confirm it.
+    Column(String),
+    /// A literal value.
+    Literal(Literal),
+    /// `left <op> right`.
+    Compare {
+        /// Left operand.
+        left: Box<Expr>,
+        /// The comparison.
+        op: CompareOp,
+        /// Right operand.
+        right: Box<Expr>,
+    },
+    /// `left AND right` — binds tighter than `OR`.
+    And(Box<Expr>, Box<Expr>),
+    /// `left OR right` — the loosest operator.
+    Or(Box<Expr>, Box<Expr>),
+}
+
+/// The six comparisons V-SQL supports. No `LIKE`, no `IN`, no `BETWEEN` —
+/// see CLAUDE.md §4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareOp {
+    /// `<`
+    Lt,
+    /// `<=`
+    Le,
+    /// `>`
+    Gt,
+    /// `>=`
+    Ge,
+    /// `=`
+    Eq,
+    /// `!=` (or `<>`)
+    Ne,
+}
+
+impl CompareOp {
+    /// The operator meaning the same thing with its operands swapped:
+    /// `2 > z` is `z < 2`.
+    ///
+    /// Used by the binder to normalize a flipped comparison into the
+    /// `column <op> literal` form the metadata index can answer. Equality and
+    /// inequality are symmetric and map to themselves.
+    pub fn flipped(self) -> CompareOp {
+        match self {
+            CompareOp::Lt => CompareOp::Gt,
+            CompareOp::Le => CompareOp::Ge,
+            CompareOp::Gt => CompareOp::Lt,
+            CompareOp::Ge => CompareOp::Le,
+            CompareOp::Eq => CompareOp::Eq,
+            CompareOp::Ne => CompareOp::Ne,
+        }
+    }
 }
 
 /// The `SELECT` projection list.
@@ -61,10 +137,8 @@ pub enum Projection {
     Columns(Vec<String>),
 }
 
-/// `SEARCH TOP k NEAREST TO [query] FROM collection` — the bare vector search.
-///
-/// Deliberately minimal: no `RETURNING`, no `WHERE`. Both are additive later —
-/// an `Option` field each — rather than a reshape of this node.
+/// `SEARCH TOP k NEAREST TO [query] FROM collection [WHERE expr]
+/// [RETURNING …]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchStmt {
     /// The `TOP` count. Carried as the lexed integer, unvalidated: the grammar
@@ -96,6 +170,12 @@ pub struct SearchStmt {
     /// [`Projection::Columns`], deliberately — two different spellings of "a
     /// list of projected names" in one AST would be a trap.
     pub projection: Option<Vec<String>>,
+    /// The `WHERE` predicate, or `None` when the clause was omitted.
+    ///
+    /// Same type as [`SelectStmt::filter`] — a predicate means the same thing
+    /// in both statements, and giving `SEARCH` its own would guarantee the two
+    /// drift apart.
+    pub filter: Option<Expr>,
 }
 
 /// `CREATE COLLECTION name ( columns ) WITH ( options )`.

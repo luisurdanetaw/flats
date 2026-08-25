@@ -40,7 +40,8 @@
 use std::fmt;
 
 use crate::sql::ast::{
-    ColumnType, CreateStmt, InsertStmt, Literal, Projection, SearchStmt, SelectStmt, Statement,
+    ColumnType, CompareOp, CreateStmt, Expr, InsertStmt, Literal, Projection, SearchStmt,
+    SelectStmt, Statement,
 };
 
 // ---------------------------------------------------------------------------
@@ -127,6 +128,41 @@ pub struct TypedValue {
     pub ty: ColumnType,
 }
 
+/// A resolved, validated `WHERE` predicate.
+///
+/// The narrow counterpart to the parser's permissive [`Expr`]: every leaf is
+/// `column <op> literal` with the column bound to an ordinal and the literal
+/// type-checked against it. The shapes `Expr` allows but V-SQL does not —
+/// column-to-column, literal-to-literal, a bare column as a truth value — do
+/// not exist in this type, so no later stage has to handle them.
+///
+/// # Why this shape, and not an expression tree
+///
+/// Every leaf here is exactly one call to the metadata index
+/// ([`lookup_eq`](crate::metadata::index::Reader::lookup_eq) /
+/// [`lookup_range`](crate::metadata::index::Reader::lookup_range)), and `And` /
+/// `Or` are bitmap intersection and union. That is why the VM needs no
+/// comparison opcodes and no per-row predicate evaluation: a `WHERE` clause is
+/// answered as set algebra over roaring bitmaps, and the result is an ordinal
+/// source a [`Cursor`](crate::engine::cursor::Cursor) opens over directly.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundPredicate {
+    /// `column <op> value`, always in that order — [`bind_comparison`]
+    /// normalizes a flipped comparison before it gets here.
+    Compare {
+        /// The column, bound to its schema ordinal.
+        column: ColumnRef,
+        /// The comparison.
+        op: CompareOp,
+        /// The comparand, type-checked against the column.
+        value: TypedValue,
+    },
+    /// Both sides must hold — bitmap intersection.
+    And(Box<BoundPredicate>, Box<BoundPredicate>),
+    /// Either side may hold — bitmap union.
+    Or(Box<BoundPredicate>, Box<BoundPredicate>),
+}
+
 // ---------------------------------------------------------------------------
 // bound statements
 // ---------------------------------------------------------------------------
@@ -159,7 +195,8 @@ pub struct BoundSelect {
     /// Split-storage rule (A): `true` iff the embedding must be fetched. `*`
     /// leaves it `false`; naming the vector column sets it `true`.
     pub include_vector: bool,
-    // EXTEND: pub filter: Option<BoundPredicate>,  // WHERE, later.
+    /// The resolved `WHERE` predicate, or `None` for an unfiltered scan.
+    pub filter: Option<BoundPredicate>,
 }
 
 /// A resolved `INSERT` — the row type-checked and reordered to schema order.
@@ -265,6 +302,13 @@ pub struct BoundSearch {
     /// compiler now emits from exactly this list; the split that existed while
     /// `RETURNING` was recorded-but-not-executed is gone.
     pub projection: Vec<Projected>,
+    /// The resolved `WHERE` predicate, or `None` for an unfiltered search.
+    ///
+    /// This is a PREFILTER: the ranking runs over the rows the predicate
+    /// admits, so `TOP 5 ... WHERE z < 2` returns the five nearest rows *among
+    /// those with `z < 2`*. Ranking first and filtering after would return
+    /// fewer than five rows and look entirely plausible.
+    pub filter: Option<BoundPredicate>,
 }
 
 /// A resolved `CREATE COLLECTION`.
@@ -328,6 +372,20 @@ pub enum BindError {
         /// The requested count.
         k: i64,
     },
+    /// A `WHERE` expression is well-formed but outside V-SQL's predicate
+    /// subset — comparing two columns, ordering a TEXT column, filtering on
+    /// the embedding.
+    UnsupportedPredicate {
+        /// What was attempted, phrased for the message.
+        what: String,
+    },
+    /// A `WHERE` expression is not a predicate at all: a bare column or
+    /// literal, with no comparison. V-SQL has no boolean columns and no
+    /// truthiness, so there is nothing to interpret.
+    NotAPredicate {
+        /// What appeared where a predicate was expected.
+        what: String,
+    },
     /// The statement is valid V-SQL, but this layer does not bind it yet.
     ///
     /// Present so a newly-parseable statement cannot reach an unhandled match
@@ -373,6 +431,12 @@ impl fmt::Display for BindError {
             ),
             BindError::InvalidTopK { k } => {
                 write!(f, "TOP must be at least 1, found {k}")
+            }
+            BindError::UnsupportedPredicate { what } => {
+                write!(f, "unsupported predicate: {what}")
+            }
+            BindError::NotAPredicate { what } => {
+                write!(f, "expected a comparison in WHERE, found {what}")
             }
             BindError::Unbound { statement } => {
                 write!(f, "{statement} is parsed but not implemented yet")
@@ -508,12 +572,20 @@ fn bind_search(stmt: SearchStmt, catalog: &impl Catalog) -> Result<BoundSearch, 
         }
     };
 
+    // 5. The predicate — a PREFILTER, narrowing the candidate set the ranking
+    //    runs over. See `BoundSearch::filter`.
+    let filter = stmt
+        .filter
+        .map(|expr| bind_predicate(expr, &schema))
+        .transpose()?;
+
     Ok(BoundSearch {
         from: stmt.collection,
         schema,
         k,
         query,
         projection: returning,
+        filter,
     })
 }
 
@@ -556,11 +628,18 @@ fn bind_select(stmt: SelectStmt, catalog: &impl Catalog) -> Result<BoundSelect, 
         }
     };
 
+    // 4. The predicate, resolved against the SAME schema the projection used.
+    let filter = stmt
+        .filter
+        .map(|expr| bind_predicate(expr, &schema))
+        .transpose()?;
+
     Ok(BoundSelect {
         from: stmt.from,
         schema,
         projection,
         include_vector,
+        filter,
     })
 }
 
@@ -705,6 +784,115 @@ fn typecheck(column: &ColumnSchema, value: Literal) -> Result<TypedValue, BindEr
     }
 }
 
+// ---------------------------------------------------------------------------
+// predicates
+// ---------------------------------------------------------------------------
+
+/// Bind a `WHERE` expression into the restricted [`BoundPredicate`] form.
+///
+/// This is where the parser's permissive [`Expr`] is narrowed to what the
+/// metadata index can actually answer: `column <op> literal`, combined with
+/// `AND`/`OR`. Everything else is rejected HERE, with an error naming what was
+/// wrong, rather than surviving into a plan no executor can run.
+fn bind_predicate(expr: Expr, schema: &Schema) -> Result<BoundPredicate, BindError> {
+    match expr {
+        Expr::And(l, r) => Ok(BoundPredicate::And(
+            Box::new(bind_predicate(*l, schema)?),
+            Box::new(bind_predicate(*r, schema)?),
+        )),
+        Expr::Or(l, r) => Ok(BoundPredicate::Or(
+            Box::new(bind_predicate(*l, schema)?),
+            Box::new(bind_predicate(*r, schema)?),
+        )),
+        Expr::Compare { left, op, right } => bind_comparison(*left, op, *right, schema),
+        // A bare column or literal is not a predicate. V-SQL has no boolean
+        // columns and no truthiness, so `WHERE author` cannot mean anything —
+        // and guessing (non-empty? non-zero?) would be inventing semantics.
+        Expr::Column(name) => Err(BindError::NotAPredicate {
+            what: format!("column {name:?}"),
+        }),
+        Expr::Literal(_) => Err(BindError::NotAPredicate {
+            what: "a literal".to_string(),
+        }),
+    }
+}
+
+/// Bind one `left <op> right` into a resolved comparison.
+///
+/// Accepts the comparison written either way round — `z < 2` and `2 > z` mean
+/// the same thing — by NORMALIZING to `column <op> literal`. Normalizing here
+/// is what lets every later stage assume the column is on the left, so the
+/// compiler never has to think about operand order.
+fn bind_comparison(
+    left: Expr,
+    op: CompareOp,
+    right: Expr,
+    schema: &Schema,
+) -> Result<BoundPredicate, BindError> {
+    let (name, op, literal) = match (left, right) {
+        (Expr::Column(name), Expr::Literal(lit)) => (name, op, lit),
+        // Flipped: `2 > z` becomes `z < 2`. The OPERATOR flips with the
+        // operands — reusing it unchanged would silently invert the meaning.
+        (Expr::Literal(lit), Expr::Column(name)) => (name, op.flipped(), lit),
+        // Out of scope, and each says so specifically. A generic "invalid
+        // predicate" would leave the user guessing which half is the problem.
+        (Expr::Column(a), Expr::Column(b)) => {
+            return Err(BindError::UnsupportedPredicate {
+                what: format!("comparing two columns ({a:?} and {b:?})"),
+            });
+        }
+        (Expr::Literal(_), Expr::Literal(_)) => {
+            return Err(BindError::UnsupportedPredicate {
+                what: "comparing two literals".to_string(),
+            });
+        }
+        // A parenthesized AND/OR used as a comparison operand, e.g.
+        // `(a = 1) < 2`.
+        _ => {
+            return Err(BindError::UnsupportedPredicate {
+                what: "a compound expression as a comparison operand".to_string(),
+            });
+        }
+    };
+
+    let column = schema
+        .column(&name)
+        .ok_or_else(|| BindError::ColumnNotFound(name.clone()))?;
+
+    // The embedding is not filterable: it lives in the flat index, which has no
+    // per-value postings to consult. Similarity is what `SEARCH` is for.
+    if column.is_vector {
+        return Err(BindError::UnsupportedPredicate {
+            what: format!("filtering on the vector column {name:?}"),
+        });
+    }
+
+    // Ordered comparisons on TEXT are refused rather than answered.
+    // `lookup_range` returns EMPTY for a text column by design, so accepting
+    // `author < 'm'` would produce zero rows and look exactly like a
+    // collection with no matching data — a wrong answer that reads as a right
+    // one. Equality is fine: that is a dictionary lookup.
+    if column.ty == ColumnType::Text && !matches!(op, CompareOp::Eq | CompareOp::Ne) {
+        return Err(BindError::UnsupportedPredicate {
+            what: format!("ordered comparison on the TEXT column {name:?}"),
+        });
+    }
+
+    // Reuses the INSERT type check, so `f < 2` against a FLOAT column coerces
+    // exactly the way `INSERT ... VALUES (2)` into that column does. One rule,
+    // one place.
+    let value = typecheck(column, literal)?;
+
+    Ok(BoundPredicate::Compare {
+        column: ColumnRef {
+            name: column.name.clone(),
+            ordinal: column.ordinal,
+        },
+        op,
+        value,
+    })
+}
+
 /// The [`ColumnType`] a literal presents as, for a [`BindError::TypeMismatch`]
 /// diagnostic. A vector literal reports its own length as the dimension.
 fn literal_type(lit: &Literal) -> ColumnType {
@@ -828,6 +1016,179 @@ mod tests {
         ]
     }
 
+    // -- WHERE / predicates -------------------------------------------------
+
+    /// Bind a `SELECT ... WHERE` against `docs` and return the predicate.
+    fn pred(where_clause: &str) -> BoundPredicate {
+        let sql = format!("SELECT author FROM docs WHERE {where_clause};");
+        match analyze_ok(&sql, &docs_catalog()) {
+            BoundStatement::Select(s) => s.filter.expect("a WHERE clause binds to Some"),
+            other => panic!("expected a SELECT, got {other:?}"),
+        }
+    }
+
+    /// Bind a `SELECT ... WHERE` expecting failure.
+    fn pred_err(where_clause: &str) -> BindError {
+        let sql = format!("SELECT author FROM docs WHERE {where_clause};");
+        analyze_err(&sql, &docs_catalog())
+    }
+
+    fn compare(name: &str, ordinal: usize, op: CompareOp, value: Literal) -> BoundPredicate {
+        let ty = match value {
+            Literal::Int(_) => ColumnType::Int,
+            Literal::Float(_) => ColumnType::Float,
+            Literal::Str(_) => ColumnType::Text,
+            Literal::Vector(ref v) => ColumnType::Vector(v.len()),
+        };
+        BoundPredicate::Compare {
+            column: colref(name, ordinal),
+            op,
+            value: TypedValue { value, ty },
+        }
+    }
+
+    #[test]
+    fn a_comparison_binds_its_column_to_an_ordinal() {
+        assert_eq!(
+            pred("published_at < 2"),
+            compare("published_at", 3, CompareOp::Lt, Literal::Int(2))
+        );
+    }
+
+    #[test]
+    fn a_flipped_comparison_is_normalized_to_column_first() {
+        // `2 > published_at` means `published_at < 2`. The OPERATOR flips with
+        // the operands — carrying it through unchanged would invert the
+        // meaning of every predicate written this way round.
+        assert_eq!(pred("2 > published_at"), pred("published_at < 2"));
+        assert_eq!(pred("2 >= published_at"), pred("published_at <= 2"));
+        assert_eq!(pred("2 < published_at"), pred("published_at > 2"));
+        assert_eq!(pred("2 <= published_at"), pred("published_at >= 2"));
+        // Symmetric operators map to themselves.
+        assert_eq!(pred("2 = published_at"), pred("published_at = 2"));
+        assert_eq!(pred("2 != published_at"), pred("published_at != 2"));
+    }
+
+    #[test]
+    fn and_or_bind_recursively() {
+        assert_eq!(
+            pred("published_at < 4 AND published_at = 2"),
+            BoundPredicate::And(
+                Box::new(compare("published_at", 3, CompareOp::Lt, Literal::Int(4))),
+                Box::new(compare("published_at", 3, CompareOp::Eq, Literal::Int(2))),
+            )
+        );
+        assert!(matches!(
+            pred("published_at < 4 OR published_at = 9"),
+            BoundPredicate::Or(..)
+        ));
+    }
+
+    #[test]
+    fn a_predicate_literal_is_type_checked_against_its_column() {
+        // The same check an INSERT gets, so one rule governs both.
+        assert_eq!(
+            pred_err("published_at = 'alice'"),
+            BindError::TypeMismatch {
+                column: "published_at".to_string(),
+                expected: ColumnType::Int,
+                found: ColumnType::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn an_int_comparand_coerces_into_a_float_column() {
+        // `x < 2` against a FLOAT column must work — people do not write `2.0`.
+        // Reusing the INSERT typecheck is what gives this for free.
+        let cat = TestCatalog::new().with("nums", nums_schema());
+        let bound = match analyze_ok("SELECT x FROM nums WHERE x < 2;", &cat) {
+            BoundStatement::Select(s) => s.filter.expect("bound"),
+            other => panic!("expected a SELECT, got {other:?}"),
+        };
+        assert_eq!(
+            bound,
+            compare("x", 1, CompareOp::Lt, Literal::Float(2.0)),
+            "the INT literal is canonicalized to a float"
+        );
+    }
+
+    #[test]
+    fn an_unknown_column_in_where_is_the_same_error_as_in_a_projection() {
+        assert_eq!(pred_err("nope < 2"), BindError::ColumnNotFound("nope".into()));
+    }
+
+    #[test]
+    fn ordered_comparison_on_text_is_refused_rather_than_answered() {
+        // THE trap this check exists for: `lookup_range` returns EMPTY for a
+        // TEXT column by design, so binding `author < 'm'` would produce zero
+        // rows — indistinguishable from a collection with no matching data.
+        // A wrong answer that reads as a right one is worse than an error.
+        assert!(matches!(
+            pred_err("author < 'm'"),
+            BindError::UnsupportedPredicate { .. }
+        ));
+        // Equality and inequality on TEXT are fine — that is a dict lookup.
+        assert_eq!(
+            pred("author = 'alice'"),
+            compare("author", 1, CompareOp::Eq, Literal::Str("alice".into()))
+        );
+        assert!(matches!(pred("author != 'alice'"), BoundPredicate::Compare { .. }));
+    }
+
+    #[test]
+    fn filtering_on_the_embedding_is_refused() {
+        // The flat index has no per-value postings to consult; similarity is
+        // what SEARCH is for.
+        assert!(matches!(
+            pred_err("vector = 'x'"),
+            BindError::UnsupportedPredicate { .. }
+        ));
+    }
+
+    #[test]
+    fn out_of_scope_predicate_shapes_are_rejected_specifically() {
+        // Each names WHICH half is the problem, rather than a generic
+        // "invalid predicate" that leaves the user guessing.
+        assert!(matches!(
+            pred_err("author = title"),
+            BindError::UnsupportedPredicate { .. }
+        ));
+        assert!(matches!(
+            pred_err("1 = 2"),
+            BindError::UnsupportedPredicate { .. }
+        ));
+        // A bare column is not a predicate: V-SQL has no boolean columns and
+        // no truthiness, so there is nothing to interpret.
+        assert!(matches!(
+            pred_err("author"),
+            BindError::NotAPredicate { .. }
+        ));
+    }
+
+    #[test]
+    fn search_binds_its_filter_as_a_prefilter() {
+        let search = bound_search(&format!(
+            "SEARCH TOP 5 NEAREST TO {} FROM docs WHERE published_at < 2 RETURNING id, score;",
+            vec_lit(768)
+        ));
+        assert_eq!(
+            search.filter,
+            Some(compare("published_at", 3, CompareOp::Lt, Literal::Int(2)))
+        );
+        assert_eq!(search.k, 5, "the filter does not disturb TOP");
+    }
+
+    #[test]
+    fn a_statement_without_where_binds_no_filter() {
+        let sql = format!("SEARCH TOP 5 NEAREST TO {} FROM docs;", vec_lit(768));
+        assert_eq!(bound_search(&sql).filter, None);
+        match analyze_ok("SELECT author FROM docs;", &docs_catalog()) {
+            BoundStatement::Select(s) => assert_eq!(s.filter, None),
+            other => panic!("expected a SELECT, got {other:?}"),
+        }
+    }
+
     fn analyze_ok(src: &str, cat: &impl Catalog) -> BoundStatement {
         analyze(parse(src).expect("test SQL must parse"), cat).expect("expected a successful bind")
     }
@@ -845,6 +1206,7 @@ mod tests {
             schema: docs_schema(),
             projection,
             include_vector,
+            filter: None,
         })
     }
 

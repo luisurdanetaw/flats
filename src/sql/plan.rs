@@ -25,7 +25,7 @@
 // Every node derives Debug + Clone + PartialEq: the planner tests assert whole
 // plans with `assert_eq!`, so structural equality is load-bearing.
 
-use crate::sql::bind::{Projected, Schema, TypedValue};
+use crate::sql::bind::{BoundPredicate, Projected, Schema, TypedValue};
 
 /// One resolved query plan — the relational-algebra root the compiler consumes.
 #[derive(Debug, Clone, PartialEq)]
@@ -41,18 +41,30 @@ pub enum LogicalPlan {
     /// Rank a collection's rows by similarity to a query vector (leaf of a
     /// ranked read tree).
     Knn(Knn),
-    // EXTEND: Filter(Filter) for WHERE — a new variant plus a match arm in the
-    // planner, without reworking the core.
 }
 
-/// Read every live row of a collection. The leaf of a read plan.
+// NOTE: there is deliberately no `Filter` node. A `WHERE` predicate in V-SQL is
+// always answerable by the metadata index, so it belongs ON the leaf that
+// produces ordinals ([`Scan::predicate`], [`Knn::predicate`]) rather than in a
+// node above it. A separate `Filter` would exist only to be pushed down into
+// the leaf immediately — an optimizer rule with nothing to decide. If a
+// predicate the index CANNOT answer ever lands (arithmetic, column-to-column),
+// that is when a `Filter` node with real per-row evaluation earns its place.
+
+/// Read a collection's rows — every live one, or those a predicate admits.
+/// The leaf of a read plan.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scan {
     /// The collection name (already confirmed to exist by the binder).
     pub collection: String,
     /// Its resolved schema — carried so downstream nodes share its ordinals.
     pub schema: Schema,
-    // EXTEND: predicate: Option<Predicate>  // pushed-down WHERE / bitmap mask.
+    /// The pushed-down `WHERE`, or `None` to scan every live row.
+    ///
+    /// It sits on the leaf because the leaf is what produces ordinals, and the
+    /// predicate's whole job is to produce a narrower set of them — the
+    /// metadata index answers it as a bitmap, which the cursor then walks.
+    pub predicate: Option<BoundPredicate>,
 }
 
 /// Rank a collection's rows by similarity to a query vector, nearest first.
@@ -75,8 +87,12 @@ pub struct Knn {
     pub k: u64,
     /// The query vector, already checked against the collection's dimension.
     pub query: Vec<f32>,
-    // EXTEND: prefilter: Option<Predicate> — the WHERE-mask a `BitmapFrom`
-    // would supply, narrowing the candidate set before ranking.
+    /// The pushed-down `WHERE`, or `None` to rank every live row.
+    ///
+    /// A PREFILTER: it narrows the candidate set the ranking runs over, so
+    /// `TOP k` counts rows that satisfy it. Applying it after the ranking
+    /// would quietly return fewer than `k` rows.
+    pub predicate: Option<BoundPredicate>,
 }
 
 /// Project a column list out of `input`. Wraps a [`Scan`].

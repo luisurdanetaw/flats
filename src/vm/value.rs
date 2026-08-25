@@ -137,7 +137,8 @@ pub fn to_literal(value: &RegValue) -> Option<Literal> {
         RegValue::Real(f) => Some(Literal::Float(*f)),
         RegValue::Str(s) => Some(Literal::Str(s.clone())),
         RegValue::Vector(v) => Some(Literal::Vector(v.to_vec())),
-        RegValue::Unset | RegValue::Record(_) => None,
+        // A bitmap is a WHERE intermediate, never a stored value.
+        RegValue::Unset | RegValue::Record(_) | RegValue::Bitmap(_) => None,
     }
 }
 

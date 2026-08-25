@@ -61,7 +61,7 @@ mod imp {
     const SIGINT: c_int = 2;
 
     /// `sigset_t` is 1024 bits on Linux, whatever the architecture.
-    const SIGSET_WORDS: usize = 1024 / (8 * size_of::<u64>());
+    const SIGSET_WORDS: usize = 1024 / u64::BITS as usize;
 
     /// Linux's `struct sigaction`, as declared in `<bits/sigaction.h>`.
     ///
