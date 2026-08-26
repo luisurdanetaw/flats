@@ -98,6 +98,27 @@ const MAX_OBSERVATIONS: usize = 8;
 /// headroom so a loaded CI box can never fail this for the wrong reason.
 const RETRY_BUDGET: Duration = Duration::from_secs(5);
 
+/// Which world this build implements.
+///
+/// **A** — liveness has three independent owners (the flat index's tombstone
+/// bitset, the metadata index's `live` bitmap, the tuple store's
+/// `Slot::Tombstone`), updated at three different moments during apply. A
+/// reader can therefore observe an ordinal in `live()` before the tuple store
+/// holds it.
+///
+/// **B** — liveness is unified behind one versioned snapshot published after
+/// every store already holds the row, so the window is closed structurally.
+///
+/// The snapshot-isolation work flips this constant to [`World::B`]. It is the
+/// single line that changes: the decider reads the verdict from here.
+#[allow(dead_code)] // `B` is unconstructed until liveness unification lands.
+enum World {
+    A,
+    B,
+}
+
+const EXPECTED_WORLD: World = World::A;
+
 /// xorshift64* — same generator `chaos.rs` uses, so a failure reproduces from
 /// the seed alone.
 struct Rng(u64);
@@ -293,8 +314,17 @@ fn assert_settled(meta: &meta::Reader, tuples: &tuples::Reader, live: &[u64], ne
 // Observation tally
 // ---------------------------------------------------------------------------
 
-/// What the reader threads saw. Counters only — the decider does NOT assert on
-/// `missing_*`; it reports them, and the reported result picks the policy.
+/// What the reader threads saw. The `missing_*` counters are the instrument the
+/// decider asserts against; which of them, and in which direction, is dictated
+/// by [`EXPECTED_WORLD`].
+/// `Missing`-on-live sightings from one run, kept split by reader role.
+struct Sightings {
+    /// Sightings from the full-scan role — the cursor's exact future loop.
+    scan: u64,
+    /// Sightings from the frontier-probe role.
+    probe: u64,
+}
+
 #[derive(Default)]
 struct Tally {
     /// `live()` snapshots taken.
@@ -322,8 +352,12 @@ impl Tally {
         }
     }
 
-    /// Print the tally and return the total `Missing`-on-live count.
-    fn report(&self, label: &str) -> u64 {
+    /// Print the tally and return the `Missing`-on-live counts, split by role.
+    ///
+    /// Split on purpose: the two roles trip the window at wildly different rates
+    /// (see the header), so collapsing them into one number would hand the
+    /// decider a statistic it cannot safely assert on.
+    fn report(&self, label: &str) -> Sightings {
         let missing_scan = self.missing_scan.load(Ordering::Relaxed);
         let missing_probe = self.missing_probe.load(Ordering::Relaxed);
         eprintln!(
@@ -344,7 +378,10 @@ impl Tally {
         {
             eprintln!("  {line}");
         }
-        missing_scan + missing_probe
+        Sightings {
+            scan: missing_scan,
+            probe: missing_probe,
+        }
     }
 }
 
@@ -369,9 +406,11 @@ impl Tally {
 /// scanner answers "does the cursor's own access pattern reach it?" — and it
 /// does, rarely (see the header).
 ///
-/// Returns the total `Missing`-on-live count. The caller reports; nothing here
-/// asserts a world.
-fn run_decider(seed: u64) -> u64 {
+/// Returns the `Missing`-on-live counts split by role. This function asserts
+/// the invariants that hold in BOTH worlds — that the run did real work, and
+/// that every value it did see was correct — and leaves the world verdict to
+/// the caller, which asserts it against [`EXPECTED_WORLD`].
+fn run_decider(seed: u64) -> Sightings {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path(), &cfgs(), opts()).unwrap();
 
@@ -469,33 +508,84 @@ fn run_decider(seed: u64) -> u64 {
         acked.load(Ordering::Relaxed),
         live.len()
     );
-    let missing = tally.report(&format!("seed {seed:#x}"));
+    let sightings = tally.report(&format!("seed {seed:#x}"));
     db.close().unwrap();
-    missing
+    sightings
 }
 
-/// THE DECIDER. Runs the race hard and reports whether `Missing` on a live
-/// ordinal is observable. Asserts only the invariants that hold in BOTH worlds
-/// — the tally, not this test's pass/fail, picked the cursor's policy.
+/// THE DECIDER. Runs the race hard and **asserts** whether `Missing` on a live
+/// ordinal is observable, against whatever [`EXPECTED_WORLD`] says this build
+/// owes. Today: **WORLD A**, ~20-28k sightings per run. See the file header.
 ///
-/// Result: **WORLD A**, ~20-28k sightings per run. See the file header.
+/// The assertion is deliberately asymmetric between the two worlds, because the
+/// evidence is:
+///
+///   * **World A checks the PROBER only.** The scanner trips the window about
+///     once in three million gets (header), so a run in which it saw nothing
+///     proves nothing — asserting on the combined total would be asserting on a
+///     coin flip. The prober sees thousands per run; that is the instrument.
+///   * **World B checks BOTH roles for zero.** Once liveness is unified behind
+///     a single versioned snapshot published after every store already holds
+///     the row, the window is closed *structurally* rather than statistically.
+///     One sighting from either role is then a real regression, and a rare
+///     signal is exactly the one worth keeping.
+///
+/// The `run_decider` guards (`snapshots > 1_000`, `live_hits > 1_000`,
+/// `next > SEED_ROWS`) are what make the World B direction meaningful rather
+/// than vacuous: they prove the readers and writer actually ran before silence
+/// is allowed to count as evidence.
 #[test]
 fn live_then_get_under_concurrent_writes() {
+    // A genuinely serial host cannot be relied on to interleave two threads
+    // across two independent mutexes. Report and bail rather than fail for a
+    // reason that has nothing to do with the code under test — the same posture
+    // `RETRY_BUDGET` takes toward a loaded box. (Note this cannot reuse
+    // `reader_threads()`, which is floored at 4 regardless of the hardware.)
+    let parallelism = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if parallelism < 2 {
+        eprintln!(
+            "SKIP: available_parallelism() == {parallelism}; the cross-store \
+             window is not demonstrable on a serial host"
+        );
+        return;
+    }
+
     let a = run_decider(0x9E37_79B9_7F4A_7C15);
     let b = run_decider(0xD1B5_4A32_D192_ED03);
-    let total = a + b;
+    let scan = a.scan + b.scan;
+    let probe = a.probe + b.probe;
+    let total = scan + probe;
 
     eprintln!(
         "\n================ VERDICT ================\n\
-         Missing-on-live observations: {total}\n\
-         {}\n\
+         Missing-on-live observations: {total} (scan {scan}, probe {probe})\n\
+         expected: {}\n\
          =========================================\n",
-        if total == 0 {
-            "WORLD B on this host: the meta->tuple window was not observed."
-        } else {
-            "WORLD A: the window IS observable; Missing is a legal transient."
+        match EXPECTED_WORLD {
+            World::A => "WORLD A — the window IS observable; Missing is a legal transient.",
+            World::B => "WORLD B — liveness is unified; the window is closed.",
         }
     );
+
+    match EXPECTED_WORLD {
+        World::A => assert!(
+            probe > 0,
+            "EXPECTED_WORLD is A, so liveness still has three independent owners \
+             and the meta->tuple window must be observable — but the prober saw \
+             0 Missing-on-live across both seeds (scanner saw {scan}). Either the \
+             window closed without EXPECTED_WORLD being updated, or the readers \
+             never reached the write frontier."
+        ),
+        World::B => assert_eq!(
+            total, 0,
+            "EXPECTED_WORLD is B, so no reader may observe an ordinal in live() \
+             before the tuple store holds it — but there were {scan} scanner and \
+             {probe} prober sightings. See the captured observations above for \
+             the offending ordinals."
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
