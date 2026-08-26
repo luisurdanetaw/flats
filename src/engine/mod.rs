@@ -783,32 +783,27 @@ impl Db {
         }) {
             Ok(_lsn) => Ok(Ordinal(ordinal as u32)),
             Err(e) => {
-                // The append never became durable, so there is nothing to log —
-                // but the allocator already burned `ordinal`, leaving a
-                // zero-filled slot that a later insert will pull into search
-                // range and surface with score 0 (a phantom). Tombstone it in
-                // memory: a pure bit-flip, NOT a WAL Delete (the ordinal was
-                // never durable, so there is nothing to replay). Best-effort —
-                // if the lock is poisoned we still surface the original error.
+                // The append never became durable, so there is nothing to undo
+                // and nothing to hide. The allocator already burned `ordinal`,
+                // leaving a zero-filled slot in the flat index below the
+                // high-water mark — but a burned ordinal is in no WAL record,
+                // so it is in `live` on no path, and every read (search, scan,
+                // cursor) filters through the liveness snapshot. The hole is
+                // unreachable by construction rather than by a tombstone.
                 //
-                // TODO(durability): this in-memory tombstone is lost on a crash
-                // before the next checkpoint flushes the bitset. It fully covers
-                // the common case (a WAL append failure is effectively terminal —
-                // no later append succeeds, so the high-water mark never advances
-                // past `ordinal` and the gap is unreachable). The residual hole:
-                // a *transient* append failure, followed by a *successful* insert
-                // (which advances the high-water mark past `ordinal`), followed by
-                // a crash before any checkpoint — recovery would then rebuild the
-                // high-water mark over the gap with no tombstone, resurfacing the
-                // phantom. Closing it requires making the tombstone durable
-                // (e.g. logging a WAL `Delete { ordinal }` here, or persisting a
-                // "burned ordinals" set), which we deliberately deferred. Revisit
-                // if WAL failures ever become recoverable/retryable mid-session.
+                // This used to flip the flat index's tombstone bit from the
+                // CALLER's thread, the one place outside the WAL thread that
+                // mutated index state. It also left a durability hole: the bit
+                // was in-memory only, so a transient failure followed by a
+                // successful insert and a crash before checkpoint would
+                // resurface the phantom. Both went away with the snapshot —
+                // `live` is rebuilt from metadata.snap plus WAL replay, and the
+                // burned ordinal was never in either.
                 //
-                // The Writer lives on the WAL thread, so we flip the bit through
-                // the Reader — sound because the tombstone bitset is atomic (see
-                // `Reader::tombstone_uncommitted`).
-                let _ = coll.reader.tombstone_uncommitted(ordinal);
+                // NOTE FOR COMPACTION: `ordinal` is permanently burned — the
+                // allocator never reuses it, so every failed append costs the
+                // collection one slot of its capacity. Compaction renumbers
+                // ordinals and reclaims these gaps for free; nothing else does.
                 Err(Error::from(e))
             }
         }
