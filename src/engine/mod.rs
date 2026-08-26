@@ -1150,6 +1150,7 @@ mod tests {
         ColumnDef, ColumnSpec, ColumnType, DeclarationOrdinal, RangeOp, Value,
     };
     use crate::metadata::tuples::RowGet;
+    use std::collections::BTreeSet;
     use std::num::NonZeroUsize;
 
     /// Vector-only collection: empty schema, inserts pass an empty row.
@@ -1319,6 +1320,97 @@ mod tests {
             ids,
             [0u32, 1, 3].into_iter().collect(),
             "only the real ordinals are visible"
+        );
+        db.close().unwrap();
+    }
+
+    /// The burned slot is hidden by the SNAPSHOT, not by a tombstone — and the
+    /// flat index is left physically untouched to prove it.
+    ///
+    /// `Db::insert`'s error path used to flip the flat index's tombstone bit
+    /// from the CALLER's thread: the one place outside the WAL thread that
+    /// mutated index state. It is unnecessary, because a burned ordinal is in
+    /// no WAL record and therefore in `live` on no path, and every read filters
+    /// through the liveness snapshot.
+    #[test]
+    fn burned_ordinal_is_hidden_without_touching_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap(); // ord 0
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap(); // ord 1
+
+        db.wal.as_ref().unwrap().fail_next_append();
+        assert!(db.insert(0, &[9.0, 9.0], vec![]).is_err(), "must surface");
+
+        // A later success pulls the burned slot into search range.
+        assert_eq!(db.insert(0, &[1.0, 0.0], vec![]).unwrap(), Ordinal(3));
+
+        // THE POINT: the flat index still holds ordinal 2, zero-filled and
+        // UNTOMBSTONED. Nothing mutated it — `vector_at` would return None if
+        // anything had.
+        let flat = db.reader(0).expect("reader");
+        assert_eq!(
+            flat.vector_at(Ordinal(2)),
+            Some(&[0.0, 0.0][..]),
+            "the burned slot must be left exactly as the allocator left it"
+        );
+
+        // ...and it is invisible anyway, because the snapshot never admitted it.
+        assert!(!db.live_snapshot(0).unwrap().contains(2));
+        let ids: BTreeSet<u32> = db
+            .search(0, &[1.0, 1.0], 64)
+            .unwrap()
+            .iter()
+            .map(|h| h.id.0)
+            .collect();
+        assert_eq!(ids, [0u32, 1, 3].into_iter().collect());
+
+        // The scan path agrees — one authority, one answer.
+        let mut cursor = db.scan(0).unwrap();
+        let mut scanned = Vec::new();
+        let mut has = cursor.seek_first().unwrap();
+        while has {
+            scanned.push(cursor.ordinal().unwrap().0);
+            has = cursor.next().unwrap();
+        }
+        assert_eq!(scanned, vec![0, 1, 3]);
+
+        db.close().unwrap();
+    }
+
+    /// The durability hole the old TODO deferred, now closed.
+    ///
+    /// The in-memory tombstone was lost on reopen, so a TRANSIENT append
+    /// failure, then a successful insert (pushing the high-water mark past the
+    /// gap), then a crash before any checkpoint would rebuild the mark over an
+    /// untombstoned zero slot and resurface the phantom. `live` is rebuilt from
+    /// metadata.snap plus WAL replay instead, and the burned ordinal is in
+    /// neither — so there is nothing to lose.
+    #[test]
+    fn burned_ordinal_stays_hidden_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap();
+        db.wal.as_ref().unwrap().fail_next_append();
+        assert!(db.insert(0, &[9.0, 9.0], vec![]).is_err());
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap(); // ord 2, mark -> 3
+
+        // NO checkpoint: reopen replays the WAL from the last durable snapshot,
+        // which is exactly the window the old mechanism could not survive.
+        db.close().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+
+        assert!(!db.live_snapshot(0).unwrap().contains(1));
+        let ids: BTreeSet<u32> = db
+            .search(0, &[1.0, 1.0], 64)
+            .unwrap()
+            .iter()
+            .map(|h| h.id.0)
+            .collect();
+        assert_eq!(
+            ids,
+            [0u32, 2].into_iter().collect(),
+            "the burned ordinal came back after recovery"
         );
         db.close().unwrap();
     }
