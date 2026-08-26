@@ -2059,6 +2059,43 @@ mod tests {
         db.close().unwrap();
     }
 
+    /// A snapshot resolved over a real collection agrees with the authority it
+    /// was copied from, and reading it costs exactly one materialization no
+    /// matter how many times it is resolved.
+    #[test]
+    fn resolve_matches_the_live_bitmap() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        let live = live_handle(&db, 0);
+        let meta = db.metadata_reader(0).unwrap();
+
+        for i in 0..8 {
+            db.insert(0, &[i as f32, 0.0], vec![]).unwrap();
+        }
+        db.delete(0, 3).unwrap();
+
+        let set = live.resolve();
+        assert_eq!(set.bitmap(), &meta.live(), "snapshot must match the authority");
+        assert_eq!(set.len(), 7);
+        assert!(!set.contains(3));
+        assert_eq!(set.version(), 9, "8 inserts + 1 delete");
+
+        // Re-resolving at an unchanged version is a pointer clone.
+        assert!(Arc::ptr_eq(&set, &live.resolve()));
+        assert_eq!(live.materializations(), 1);
+
+        // A write invalidates it, and the OLD snapshot is unmoved — the row it
+        // could see when it was taken, it can still see.
+        db.delete(0, 4).unwrap();
+        let newer = live.resolve();
+        assert_eq!(newer.len(), 6);
+        assert_eq!(set.len(), 7, "an outstanding snapshot never mutates");
+        assert!(set.contains(4));
+        assert_eq!(live.materializations(), 2);
+
+        db.close().unwrap();
+    }
+
     /// THE write-path gate: writing must never build a snapshot. Rebuilding a
     /// LiveSet per statement would cost a ~125KB bitmap copy per million rows,
     /// on the write path — the whole reason the version counter exists.

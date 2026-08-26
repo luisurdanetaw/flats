@@ -666,9 +666,7 @@ impl LiveSet {
     /// see [`LiveHandle`]'s "Version labeling".
     ///
     /// Deliberately NOT public: a caller outside this module cannot honour that
-    /// rule, and a forged version label poisons the cache permanently. Unused
-    /// outside tests until `resolve()` lands; the allow comes off with it.
-    #[allow(dead_code)]
+    /// rule, and a forged version label poisons the cache permanently.
     pub(crate) fn new(version: u64, live: RoaringBitmap) -> LiveSet {
         LiveSet { version, live }
     }
@@ -740,9 +738,7 @@ impl LiveSet {
 /// Whatever materializes a snapshot must read the counter and the bitmap in
 /// one critical section. There is no cheaper ordering that is still correct.
 pub struct LiveHandle {
-    /// The state a snapshot is materialized FROM. Unread until `resolve()`
-    /// lands with the lazy materialization; the allow comes off with it.
-    #[allow(dead_code)]
+    /// The state a snapshot is materialized FROM.
     inner: Arc<Mutex<MetadataInner>>,
     /// Bumped once per liveness-changing record by the applier.
     version: AtomicU64,
@@ -775,10 +771,55 @@ impl LiveHandle {
         self.lock_cache().clone()
     }
 
-    /// Publish `set` as the cached snapshot, replacing any previous one.
-    pub fn store(&self, set: Arc<LiveSet>) {
-        *self.lock_cache() = Some(set);
+    /// The snapshot for the current version, materializing it if no reader has
+    /// needed this version yet.
+    ///
+    /// A query calls this ONCE, at open, and carries the returned `Arc` for its
+    /// whole life: the rows it can see are then fixed, because a `LiveSet` is
+    /// immutable and a later publish swaps the cache rather than editing it.
+    ///
+    /// # Why the counter is read under the metadata lock
+    ///
+    /// Holding that lock freezes `live`, so the version read beside it is
+    /// bounded by the state being copied — the conservative label "Version
+    /// labeling" above requires. Reading the counter after releasing the lock
+    /// would let a bump the bitmap does not reflect slip into the label, and a
+    /// snapshot labeled one AHEAD is cached forever: nothing will ever
+    /// invalidate it.
+    ///
+    /// # Why the cache lock is held across the materialization
+    ///
+    /// That is what makes it at most once per version. Two readers racing a
+    /// stale cache do not both build: one wins the lock, the other blocks and
+    /// then finds a fresh entry. Lock order is CACHE then METADATA and must
+    /// stay that way — `bump()` touches only the atomic and takes neither, so
+    /// the applier can never close the cycle.
+    pub fn resolve(&self) -> Arc<LiveSet> {
+        // Fast path: the common case is an unchanged version, and it must not
+        // touch the metadata lock the applier is contending for.
+        let want = self.version();
+        if let Some(cached) = self.cached() {
+            if cached.version() == want {
+                return cached;
+            }
+        }
+
+        let mut cache = self.lock_cache();
+        // Re-check: a reader that beat us to the lock may have just filled it.
+        if let Some(cached) = cache.as_ref() {
+            if cached.version() == self.version() {
+                return Arc::clone(cached);
+            }
+        }
+
+        let set = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            // Both reads in ONE critical section. See above.
+            Arc::new(LiveSet::new(self.version(), inner.live.clone()))
+        };
         self.materializations.fetch_add(1, Ordering::Relaxed);
+        *cache = Some(Arc::clone(&set));
+        set
     }
 
     /// How many snapshots have been built over this handle's life.
@@ -1269,8 +1310,21 @@ mod tests {
 
     /// Build a handle over a throwaway index, without touching the filesystem.
     fn live_handle() -> LiveHandle {
+        live_handle_with_state().0
+    }
+
+    /// As above, but also hands back the inner state so a test can play the
+    /// applier: mutate `live` under the lock, then bump. No IO, so a synthetic
+    /// writer bumps on a microsecond scale — the engine's own write path is
+    /// fsync-bound at ~1.5ms and could never race a reader hard enough to be
+    /// evidence of anything.
+    fn live_handle_with_state() -> (LiveHandle, Arc<Mutex<MetadataInner>>) {
         let inner = Arc::new(Mutex::new(MetadataInner::empty(test_schema())));
-        Reader { inner }.live_handle()
+        let handle = Reader {
+            inner: Arc::clone(&inner),
+        }
+        .live_handle();
+        (handle, inner)
     }
 
     #[test]
@@ -1293,34 +1347,43 @@ mod tests {
     /// assertion that actually proves we never memcpy'd it — a value-equality
     /// check would pass just as happily on a clone.
     #[test]
-    fn resolving_twice_clones_a_pointer_not_a_bitmap() {
-        let handle = live_handle();
-        handle.store(Arc::new(LiveSet::new(1, bm(&[0, 1, 2]))));
+    fn resolving_twice_at_one_version_reuses_the_arc() {
+        let (handle, inner) = live_handle_with_state();
+        inner.lock().unwrap().live = bm(&[0, 1, 2]);
 
-        let a = handle.cached().expect("a snapshot was stored");
-        let b = handle.cached().expect("a snapshot was stored");
+        let a = handle.resolve();
+        let b = handle.resolve();
 
         assert!(Arc::ptr_eq(&a, &b), "readers must share one allocation");
+        assert_eq!(a.len(), 3);
+        assert_eq!(
+            handle.materializations(),
+            1,
+            "an unchanged version must not rebuild"
+        );
     }
 
     #[test]
-    fn publishing_swaps_the_arc() {
-        let handle = live_handle();
+    fn a_bump_forces_a_new_snapshot() {
+        let (handle, inner) = live_handle_with_state();
+        inner.lock().unwrap().live = bm(&[0]);
+        let first = handle.resolve();
 
-        handle.store(Arc::new(LiveSet::new(1, bm(&[0]))));
-        let first = handle.cached().expect("first snapshot");
+        // Play the applier: mutate under the lock, THEN bump.
+        inner.lock().unwrap().live = bm(&[0, 1]);
+        handle.bump();
+        let second = handle.resolve();
 
-        handle.store(Arc::new(LiveSet::new(2, bm(&[0, 1]))));
-        let second = handle.cached().expect("second snapshot");
-
-        assert!(!Arc::ptr_eq(&first, &second), "publish must swap the Arc");
-        assert_eq!(second.version(), 2);
+        assert!(!Arc::ptr_eq(&first, &second), "a bump must swap the Arc");
+        assert_eq!(second.version(), 1);
         assert_eq!(second.len(), 2);
+        assert_eq!(handle.materializations(), 2);
 
-        // The old snapshot stays alive for whoever still holds it — that is the
-        // whole basis of snapshot isolation — and dies with the last handle.
+        // The old snapshot stays alive and UNCHANGED for whoever still holds
+        // it — that is the whole basis of snapshot isolation.
         assert_eq!(Arc::strong_count(&first), 1);
         assert_eq!(first.len(), 1, "an old snapshot is unaffected by the swap");
+        assert_eq!(first.version(), 0);
     }
 
     #[test]
@@ -1346,6 +1409,112 @@ mod tests {
         assert_eq!(handle.version(), 1_001);
     }
 
+    /// THE subtle one. A snapshot's version label must never LEAD the state it
+    /// holds — see `LiveHandle`'s "Version labeling".
+    ///
+    /// The assertion works because the writer is insert-only and dense from 0:
+    /// after k inserts the version is k and the bitmap holds k rows, so a
+    /// correct label lags or matches (`version <= len`). An implementation that
+    /// reads the counter AFTER releasing the metadata lock can pick up a bump
+    /// the copied bitmap does not reflect, and that shows up here — and only
+    /// here — as `version > len`.
+    ///
+    /// Verified falsifiable by moving the counter read out of the critical
+    /// section, which fails this in well under a second.
+    #[test]
+    fn snapshot_version_never_leads_its_contents() {
+        const WRITES: u32 = 20_000;
+
+        let (handle, inner) = live_handle_with_state();
+        let handle = Arc::new(handle);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let handle = Arc::clone(&handle);
+            let stop = Arc::clone(&stop);
+            readers.push(std::thread::spawn(move || {
+                let mut seen = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let set = handle.resolve();
+                    assert!(
+                        set.version() <= set.len(),
+                        "snapshot labeled v{} holds only {} rows — the label LEADS \
+                         its contents, so the counter was read outside the lock",
+                        set.version(),
+                        set.len()
+                    );
+                    seen += 1;
+                }
+                seen
+            }));
+        }
+
+        // The applier's order: mutate under the lock, drop it, then bump.
+        for o in 0..WRITES {
+            inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .live
+                .insert(o);
+            handle.bump();
+        }
+        stop.store(true, Ordering::Relaxed);
+
+        let total: u64 = readers
+            .into_iter()
+            .map(|h| h.join().expect("reader panicked"))
+            .sum();
+
+        assert_eq!(handle.version(), WRITES as u64);
+        assert!(total > 1_000, "readers barely ran ({total}); proves nothing");
+    }
+
+    /// Two readers racing a stale cache must not both build. At-most-once is
+    /// structural — the cache lock is held across the materialization — so this
+    /// is exact, not statistical.
+    #[test]
+    fn racing_readers_materialize_once_per_version() {
+        const READERS: usize = 8;
+
+        let (handle, inner) = live_handle_with_state();
+        inner.lock().unwrap().live = bm(&[0, 1, 2, 3]);
+        let handle = Arc::new(handle);
+
+        // Release them all onto a cold cache at the same instant.
+        let go = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut threads = Vec::new();
+        for _ in 0..READERS {
+            let handle = Arc::clone(&handle);
+            let go = Arc::clone(&go);
+            threads.push(std::thread::spawn(move || {
+                while !go.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                handle.resolve()
+            }));
+        }
+        go.store(true, Ordering::Release);
+
+        let sets: Vec<_> = threads
+            .into_iter()
+            .map(|t| t.join().expect("reader panicked"))
+            .collect();
+
+        assert_eq!(
+            handle.materializations(),
+            1,
+            "{READERS} readers on one version must build exactly one snapshot"
+        );
+        for set in &sets {
+            assert!(
+                Arc::ptr_eq(set, &sets[0]),
+                "every racing reader must get the same allocation"
+            );
+            assert_eq!(set.len(), 4);
+        }
+    }
+
     /// Baseline for the standing gate: a handle nobody has read materializes
     /// nothing. Every commit after the applier starts bumping must keep this
     /// true for write-only workloads.
@@ -1363,7 +1532,7 @@ mod tests {
             "bumping a version must not build a snapshot"
         );
 
-        handle.store(Arc::new(LiveSet::new(2, bm(&[3]))));
-        assert_eq!(handle.materializations(), 1);
+        handle.resolve();
+        assert_eq!(handle.materializations(), 1, "a read builds one snapshot");
     }
 }
