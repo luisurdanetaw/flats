@@ -119,10 +119,11 @@ struct Collection {
     /// bumps its version once per liveness-changing record; readers resolve an
     /// `Arc<LiveSet>` and carry it for the life of a query.
     ///
-    /// Unread until the applier starts bumping and readers start resolving;
-    /// the allow comes off then.
+    /// Shared with this collection's `CollectionWriters` on the WAL thread,
+    /// which is the only side that bumps. Unread from HERE until readers start
+    /// resolving snapshots; the allow comes off then.
     #[allow(dead_code)]
-    live: meta::LiveHandle,
+    live: Arc<meta::LiveHandle>,
 }
 
 impl Collection {
@@ -189,14 +190,19 @@ fn open_collection(dir: &Path, cfg: &CollectionConfig) -> Result<(CollectionWrit
     let (tuple_w, tuple_r, tuple_lsn) = TupleStore::open_or_create(&cdir, cfg.schema.clone())?;
 
     let watermark = flat_w.checkpoint_lsn().min(meta_lsn.0).min(tuple_lsn.0);
+    // ONE handle, shared by both sides. The applier could reach the read-side
+    // Collection through the catalog instead, but that is an RwLock read plus a
+    // HashMap lookup per record, on the write path, forever.
+    let live = Arc::new(meta_r.live_handle());
     Ok((
         CollectionWriters {
             flat: flat_w,
             meta: meta_w,
             tuple: tuple_w,
+            live: Arc::clone(&live),
         },
         Collection {
-            live: meta_r.live_handle(),
+            live,
             reader: flat_r,
             meta: meta_r,
             tuple: tuple_r,
@@ -218,6 +224,10 @@ struct CollectionWriters {
     flat: Writer,
     meta: meta::Writer,
     tuple: tuples::Writer,
+    /// Liveness version counter, shared with the read-side `Collection`. Bumped
+    /// once per liveness-changing record — the WAL thread is the only bumper,
+    /// which is the same single-writer argument the three writers above rest on.
+    live: Arc<meta::LiveHandle>,
 }
 
 /// Owns every collection's writers. Lives entirely on the WAL commit thread,
@@ -260,6 +270,17 @@ impl Apply for IndexApplier {
     /// replay. Watermarks advance LAST, only after every write succeeded: a
     /// watermark must never claim an apply that didn't happen, or checkpoint
     /// could persist it and recovery would skip the record forever.
+    ///
+    /// The liveness version is bumped once per liveness-changing record
+    /// (`Insert`/`Delete`, not DDL — a new collection has no rows), and
+    /// unconditionally: an idempotent replay of a delete bumps too. Over-
+    /// invalidation costs one re-materialization; the branch that avoided it
+    /// would cost a correctness argument.
+    ///
+    /// NOTE the bump currently sits between the metadata and tuple writes,
+    /// which is still inside the cross-store window `concurrent_stores.rs`
+    /// measures. Moving it after ALL THREE stores is what closes that window,
+    /// and it lands as its own change with its own test.
     fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<()> {
         match record {
             Record::Insert {
@@ -272,6 +293,7 @@ impl Apply for IndexApplier {
                 let ord32 = ordinal32(*ordinal)?;
                 w.flat.write_at(*ordinal, vector).map_err(to_io)?;
                 w.meta.insert_row(ord32, metadata).map_err(to_io)?;
+                w.live.bump();
                 w.tuple.write_row(ord32, metadata).map_err(to_io)?;
                 w.flat.advance_applied_lsn(lsn.0);
                 w.meta.advance_applied_lsn(lsn);
@@ -285,6 +307,7 @@ impl Apply for IndexApplier {
                 let ord32 = ordinal32(*ordinal)?;
                 w.flat.delete(*ordinal).map_err(to_io)?;
                 w.meta.remove_row(ord32).map_err(to_io)?;
+                w.live.bump();
                 w.tuple.delete_row(ord32).map_err(to_io)?;
                 w.flat.advance_applied_lsn(lsn.0);
                 w.meta.advance_applied_lsn(lsn);
@@ -1146,6 +1169,19 @@ mod tests {
         vec![(0, Value::Int(a)), (1, Value::Text(c.into()))]
     }
 
+    /// Rows written by `writes_materialize_nothing`. Each insert is its own
+    /// group-commit batch (one writer, one record) and therefore its own fsync,
+    /// so this trades coverage against wall clock. Override to push it harder:
+    /// `FLATS_WRITE_ONLY_ROWS=100000 cargo test writes_materialize_nothing`.
+    fn write_only_rows() -> usize {
+        std::env::var("FLATS_WRITE_ONLY_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_WRITE_ONLY_ROWS)
+    }
+
+    const DEFAULT_WRITE_ONLY_ROWS: usize = 2_000;
+
     // Large interval => the background flusher never fires; tests drive
     // checkpoints explicitly for determinism.
     fn manual_opts() -> DbOptions {
@@ -1952,6 +1988,109 @@ mod tests {
         // `create_collection`: if "C0" resolved to "c0" here, two names that
         // `create_collection` considers distinct would collide at execution.
         assert!(db.collection_id("C0").is_err());
+
+        db.close().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Liveness versioning
+    // -----------------------------------------------------------------------
+
+    /// The collection's shared liveness handle. Tests live in this module, so
+    /// they reach it directly rather than widening the public API.
+    fn live_handle(db: &Db, id: u32) -> Arc<meta::LiveHandle> {
+        Arc::clone(
+            &catalog_snapshot(&db.catalog)
+                .get(&id)
+                .expect("collection exists")
+                .live,
+        )
+    }
+
+    /// One bump per liveness-changing record, no more and no less. The counter
+    /// is what invalidates every cached snapshot, so a missed bump makes writes
+    /// permanently invisible and a doubled bump throws away a good snapshot.
+    #[test]
+    fn insert_and_delete_bump_the_version_once_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        let live = live_handle(&db, 0);
+
+        let before = live.version();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap();
+        assert_eq!(live.version(), before + 1, "insert bumps exactly once");
+
+        db.insert(0, &[2.0, 0.0], vec![]).unwrap();
+        db.insert(0, &[3.0, 0.0], vec![]).unwrap();
+        assert_eq!(live.version(), before + 3);
+
+        db.delete(0, 1).unwrap();
+        assert_eq!(live.version(), before + 4, "delete bumps exactly once");
+
+        // Deleting an already-dead ordinal still bumps: the applier does not
+        // branch on whether liveness actually moved. Over-invalidation is a
+        // wasted re-materialization, never a correctness problem.
+        db.delete(0, 1).unwrap();
+        assert_eq!(live.version(), before + 5);
+
+        db.close().unwrap();
+    }
+
+    /// DDL is a mutation, but not a LIVENESS mutation — a fresh collection has
+    /// no rows. Bumping here would invalidate every other collection's readers
+    /// for nothing.
+    #[test]
+    fn create_collection_does_not_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        let live = live_handle(&db, 0);
+
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap();
+        let after_insert = live.version();
+
+        let id = db.create_collection("fresh", 64, vec_only(2)).unwrap();
+        assert_eq!(live.version(), after_insert, "DDL must not bump");
+        assert_eq!(
+            live_handle(&db, id).version(),
+            0,
+            "a new collection starts at version 0"
+        );
+
+        db.close().unwrap();
+    }
+
+    /// THE write-path gate: writing must never build a snapshot. Rebuilding a
+    /// LiveSet per statement would cost a ~125KB bitmap copy per million rows,
+    /// on the write path — the whole reason the version counter exists.
+    ///
+    /// This cannot fail today: nothing in the crate materializes yet. It is a
+    /// tripwire planted before the code that could trip it, and it becomes
+    /// load-bearing the moment lazy resolution lands.
+    #[test]
+    fn writes_materialize_nothing() {
+        let rows = write_only_rows();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, rows + 8)], manual_opts()).unwrap();
+        let live = live_handle(&db, 0);
+
+        for i in 0..rows {
+            db.insert(0, &[i as f32, 0.0], vec![]).unwrap();
+        }
+        for o in 0..(rows as u64 / 4) {
+            db.delete(0, o).unwrap();
+        }
+
+        assert_eq!(
+            live.version(),
+            (rows + rows / 4) as u64,
+            "one bump per write"
+        );
+        assert_eq!(
+            live.materializations(),
+            0,
+            "a write-only workload must not build a single snapshot"
+        );
+        assert!(live.cached().is_none(), "nothing should be cached");
 
         db.close().unwrap();
     }
