@@ -18,9 +18,10 @@
 //!   * `RowGet::Missing` for an ordinal enumerated from a liveness snapshot is
 //!     a BUG — in the applier's ordering, not in the reader. It is no longer a
 //!     transient to skip past. Treat it loudly.
-//!   * `RowGet::Deleted` for an enumerated ordinal remains legal: the row can
-//!     be deleted after the snapshot is taken, and today's delete destroys the
-//!     values. Skip it.
+//!   * There is no longer a `Deleted` verdict to handle. Retiring a row clears
+//!     one bit in the metadata index and destroys nothing, so a row retired
+//!     after a snapshot was taken still reads back with its values — which is
+//!     what stops it vanishing out from under an open cursor.
 //!   * A row whose VALUES are wrong is loud in every world, and is asserted
 //!     throughout here.
 //!
@@ -276,22 +277,13 @@ fn assert_settled(meta: &meta::Reader, tuples: &tuples::Reader, live: &[u64], ne
     let got_live: BTreeSet<u64> = meta.live().iter().map(u64::from).collect();
     assert_eq!(got_live, want_live, "live bitmap diverged from the writer");
 
+    // Every ordinal ever written reads back with the right values, retired or
+    // not: the tuple store is not a visibility authority and destroys nothing.
+    // Whether a row is VISIBLE was already decided by the `live` check above.
     for o in 0..next {
         match tuples.get(Ordinal(o as u32), &COLS).expect("get") {
-            RowGet::Live(values) => {
-                verify_values(o, &values);
-                assert!(
-                    want_live.contains(&o),
-                    "ordinal {o} is live but absent from live()"
-                );
-            }
-            RowGet::Deleted => {
-                assert!(
-                    !want_live.contains(&o),
-                    "ordinal {o} is in live() but tombstoned"
-                );
-            }
-            RowGet::Missing => panic!("ordinal {o} still Missing after the run quiesced"),
+            RowGet::Live(values) => verify_values(o, &values),
+            other => panic!("ordinal {o} was written but reads back {other:?}"),
         }
     }
 }
@@ -319,9 +311,6 @@ struct Tally {
     gets: AtomicU64,
     /// …of those, how many returned a live row (values verified).
     live_hits: AtomicU64,
-    /// …how many returned the deleted-marker. LEGAL: the row can be deleted
-    /// between the snapshot and the get.
-    deleted_on_live: AtomicU64,
     /// …how many returned `Missing` from the full-scan role.
     missing_scan: AtomicU64,
     /// …how many returned `Missing` from the frontier-probe role.
@@ -348,11 +337,10 @@ impl Tally {
         let missing_probe = self.missing_probe.load(Ordering::Relaxed);
         eprintln!(
             "\n[{label}]\n  snapshots        {}\n  gets on live     {}\n  live rows        {}\n  \
-             deleted-on-live  {}\n  MISSING (scan)   {}\n  MISSING (probe)  {}",
+             MISSING (scan)   {}\n  MISSING (probe)  {}",
             self.snapshots.load(Ordering::Relaxed),
             self.gets.load(Ordering::Relaxed),
             self.live_hits.load(Ordering::Relaxed),
-            self.deleted_on_live.load(Ordering::Relaxed),
             missing_scan,
             missing_probe,
         );
@@ -443,11 +431,6 @@ fn run_decider(seed: u64) -> Sightings {
                         RowGet::Live(values) => {
                             verify_values(o64, &values);
                             tally.live_hits.fetch_add(1, Ordering::Relaxed);
-                        }
-                        // Legal in every world: the writer may have deleted
-                        // this ordinal after the snapshot was taken.
-                        RowGet::Deleted => {
-                            tally.deleted_on_live.fetch_add(1, Ordering::Relaxed);
                         }
                         // THE observation this whole file exists to count.
                         RowGet::Missing => {
@@ -603,19 +586,17 @@ fn live_then_get_under_concurrent_writes() {
 /// Probes the snapshot's MAXIMUM ordinal, for the same reason the prober does:
 /// it is the one the applier just published, so it aims straight at the window.
 ///
-/// SCOPE: this is the INSERT-side property — a row must not become enumerable
-/// before it is written. The delete side is deliberately not asserted here.
-/// `flat.delete` tombstones before `tuple.delete_row` clears the row, so a
-/// snapshot taken before a delete can briefly see the flat index and the tuple
-/// store disagree about it (measured: ~50 sightings per 3s run). That skew is
-/// inherent to a DESTRUCTIVE delete and closes only when retiring a row stops
-/// destroying its values; agreement between bare SEARCH and a snapshot is its
-/// own separate property.
+/// Both stores are checked. An earlier revision could only assert the tuple
+/// store, because `flat.delete` tombstoned before `tuple.delete_row` cleared the
+/// row and a snapshot could catch them disagreeing (~50 sightings per 3s run).
+/// Retiring a row now touches neither store, so the skew has nowhere to come
+/// from.
 #[test]
 fn snapshot_never_contains_an_unwritten_row() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path(), &cfgs(), opts()).unwrap();
     let tuples = db.tuple_reader(0).expect("tuple reader");
+    let flat = db.reader(0).expect("flat reader");
     seed_rows(&db);
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -630,6 +611,7 @@ fn snapshot_never_contains_an_unwritten_row() {
     for _ in 0..reader_threads() {
         let db = &db;
         let tuples = tuples.clone();
+        let flat = flat.clone();
         let stop = stop.clone();
         let violations = violations.clone();
         let resolves = resolves.clone();
@@ -645,9 +627,18 @@ fn snapshot_never_contains_an_unwritten_row() {
                 checks.fetch_add(1, Ordering::Relaxed);
 
                 match tuples.get(Ordinal(max), &COLS).expect("get") {
-                    RowGet::Live(values) => verify_values(max as u64, &values),
-                    // Legal: the row was deleted after this snapshot was taken.
-                    RowGet::Deleted => {}
+                    RowGet::Live(values) => {
+                        verify_values(max as u64, &values);
+                        // The flat index must hold it too. This was dropped
+                        // while `flat.delete` still ran before `tuple.delete_row`
+                        // — a snapshot could then catch the two stores
+                        // disagreeing. Neither call exists now: retiring a row
+                        // touches only `live`, so all three stores agree about
+                        // every ordinal a snapshot admits.
+                        if flat.vector_at(Ordinal(max)).is_none() {
+                            violations.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     RowGet::Missing => {
                         violations.fetch_add(1, Ordering::Relaxed);
                         let mut n = notes.lock().unwrap_or_else(|e| e.into_inner());

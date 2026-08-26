@@ -310,14 +310,12 @@ impl Apply for IndexApplier {
             } => {
                 let w = self.writers(*collection)?;
                 let ord32 = ordinal32(*ordinal)?;
-                // The mirror image: liveness FIRST on the way out, so nothing
-                // can enumerate a row whose values are being destroyed. (An
-                // OLDER snapshot still holding this ordinal will read the
-                // tombstone `delete_row` leaves — retiring rows without
-                // destroying their values is a later change.)
-                w.flat.delete(*ordinal).map_err(to_io)?;
+                // Retiring a row clears ONE bit. The vector stays in the flat
+                // index and the values stay in the tuple store, so a reader
+                // holding an older snapshot can still read the row it was
+                // promised; compaction reclaims both later. Liveness has one
+                // owner, so a delete has exactly one place to happen.
                 w.meta.remove_row(ord32).map_err(to_io)?;
-                w.tuple.delete_row(ord32).map_err(to_io)?;
                 w.live.bump();
                 w.flat.advance_applied_lsn(lsn.0);
                 w.meta.advance_applied_lsn(lsn);
@@ -1457,7 +1455,9 @@ mod tests {
         db.delete(0, 0).unwrap();
         let filter = meta.lookup_eq(1, &Value::Text("alice".into())).unwrap();
         assert_eq!(filter.iter().collect::<Vec<u32>>(), vec![2]);
-        assert_eq!(tuples.get(Ordinal(0), &[0]).unwrap(), RowGet::Deleted);
+        // Retiring a row clears its live bit and touches nothing else — the
+        // values are still there for anyone holding an older snapshot.
+        assert!(matches!(tuples.get(Ordinal(0), &[0]).unwrap(), RowGet::Live(_)));
         assert_eq!(meta.live_count(), 2);
 
         db.close().unwrap();
@@ -1490,7 +1490,9 @@ mod tests {
         for ord in [0u32, 1, 2, 4] {
             assert!(matches!(tuples.get(Ordinal(ord), &[0]).unwrap(), RowGet::Live(_)));
         }
-        assert_eq!(tuples.get(Ordinal(3), &[0]).unwrap(), RowGet::Deleted);
+        // Retired, so absent from `live` — but its values survive.
+        assert!(matches!(tuples.get(Ordinal(3), &[0]).unwrap(), RowGet::Live(_)));
+        assert!(!meta.live().contains(3));
 
         // Spot-check lookups and values.
         let evens = meta.lookup_eq(1, &Value::Text("even".into())).unwrap();
@@ -1564,7 +1566,7 @@ mod tests {
                 vec![1],
                 "victim {victim}"
             );
-            assert_eq!(tuples.get(Ordinal(0), &[1]).unwrap(), RowGet::Deleted);
+            assert!(matches!(tuples.get(Ordinal(0), &[1]).unwrap(), RowGet::Live(_)));
             assert_eq!(
                 tuples.get(Ordinal(1), &[1]).unwrap(),
                 RowGet::Live(vec![Value::Text("y".into())]),
@@ -1710,10 +1712,11 @@ mod tests {
         assert_eq!(db.search(0, &[1.0, 0.0], 10).unwrap().len(), 1);
         let meta0 = db.metadata_reader(0).unwrap();
         assert_eq!(meta0.live_count(), 1);
-        assert_eq!(
+        assert!(matches!(
             db.tuple_reader(0).unwrap().get(Ordinal(0), &[0]).unwrap(),
-            RowGet::Deleted
-        );
+            RowGet::Live(_)
+        ));
+        assert!(!meta0.live().contains(0), "retired, so out of `live`");
 
         // Collection 1: untouched by collection 0's delete; both rows live.
         assert_eq!(db.search(1, &[1.0, 0.0, 0.0, 0.0], 10).unwrap().len(), 2);

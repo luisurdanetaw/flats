@@ -12,6 +12,17 @@
 //! True torn-page writes can't be reproduced in-process, so the interrupted
 //! header-flush boundary is modelled by corrupting a slot on disk and asserting
 //! the double-buffered header falls back to the previous good slot.
+//!
+//! # What used to be here
+//!
+//! Three tests proved the flat index's TOMBSTONE BITSET was made durable before
+//! the watermark advanced, so a delete survived a crash at every checkpoint
+//! boundary. That bitset no longer exists: this index has no opinion about
+//! visibility, and `Record::Delete` clears one bit in the metadata index and
+//! nothing else. The equivalent durability property now belongs to
+//! `metadata.snap` — see `metadata::index`'s snapshot tests for the write
+//! protocol and `tests/chaos.rs` for delete-survives-reopen across random
+//! checkpoint and reopen boundaries.
 
 use std::io;
 use std::num::NonZeroUsize;
@@ -65,7 +76,9 @@ impl Apply for WriterApplier {
             Record::Insert {
                 ordinal, vector, ..
             } => self.writer.write_at(*ordinal, vector).map_err(to_io)?,
-            Record::Delete { ordinal, .. } => self.writer.delete(*ordinal).map_err(to_io)?,
+            // The flat index no longer participates in a delete: retiring a
+            // row clears a bit in the metadata index and nothing else.
+            Record::Delete { .. } => {}
             Record::CreateCollection { .. } => {
                 unreachable!("this test never logs CreateCollection records")
             }
@@ -88,7 +101,7 @@ fn log_and_apply(h: &WalHandle, w: &mut Writer, rec: Record) {
         Record::Insert {
             ordinal, vector, ..
         } => w.write_at(*ordinal, vector).expect("write_at"),
-        Record::Delete { ordinal, .. } => w.delete(*ordinal).expect("delete"),
+        Record::Delete { .. } => {}
         Record::CreateCollection { .. } => {
             unreachable!("this test never logs CreateCollection records")
         }
@@ -120,14 +133,6 @@ fn assert_exactly(r: &Reader, expected: u64) {
     let mut ids: Vec<u32> = hits.iter().map(|h| h.id.0).collect();
     ids.sort_unstable();
     assert_eq!(ids, (0..expected as u32).collect::<Vec<_>>());
-}
-
-fn assert_ordinal_dead(r: &Reader, dead: u32) {
-    let hits = r.search(&[0.0, 1.0], 1024).expect("search");
-    assert!(
-        hits.iter().all(|h| h.id.0 != dead),
-        "ordinal {dead} must not surface"
-    );
 }
 
 #[test]
@@ -271,114 +276,4 @@ fn crash_after_d_e_truncated_wal_converges() {
     let (replayed, reader) = recover(&idx_path, &wal_path);
     assert_eq!(replayed, 0, "truncated WAL has no tail to replay");
     assert_exactly(&reader, 3);
-}
-
-#[test]
-fn delete_replays_idempotently() {
-    let dir = tempfile::tempdir().unwrap();
-    let idx_path = dir.path().join("c0.idx");
-    let wal_path = dir.path().join("wal.log");
-
-    {
-        let (mut w, _r) = FlatIndex::create(&idx_path, dim(2), 64).unwrap();
-        let wal = Wal::start(&wal_path, LogOnly, 0).unwrap();
-        let h = wal.handle();
-        for ord in 0..3 {
-            log_and_apply(&h, &mut w, insert_rec(ord));
-        }
-        log_and_apply(
-            &h,
-            &mut w,
-            Record::Delete {
-                collection: 0,
-                ordinal: 1,
-            },
-        );
-        // No checkpoint: the whole log (inserts + delete) replays on reopen.
-        drop(h);
-        wal.shutdown();
-        drop(w);
-    }
-
-    let (_replayed, reader) = recover(&idx_path, &wal_path);
-    assert_eq!(reader.len(), 3, "high-water unchanged by delete");
-    let hits = reader.search(&[0.0, 1.0], 1024).unwrap();
-    let ids: Vec<u32> = hits.iter().map(|h| h.id.0).collect();
-    assert!(!ids.contains(&1), "tombstoned ordinal stays hidden after replay");
-    assert_eq!(hits.len(), 2);
-    assert!(ids.contains(&0) && ids.contains(&2));
-}
-
-#[test]
-fn tombstone_consistent_when_crash_before_watermark() {
-    // insert 0..6, delete 5, sync_data (a) only, crash before watermark.
-    // INVARIANT (not mechanism): ordinal 5 ends dead — here because the watermark
-    // never advanced, so the Delete replays from the WAL.
-    let dir = tempfile::tempdir().unwrap();
-    let idx_path = dir.path().join("c0.idx");
-    let wal_path = dir.path().join("wal.log");
-
-    {
-        let (mut w, _r) = FlatIndex::create(&idx_path, dim(2), 64).unwrap();
-        let wal = Wal::start(&wal_path, LogOnly, 0).unwrap();
-        let h = wal.handle();
-        for ord in 0..6 {
-            log_and_apply(&h, &mut w, insert_rec(ord));
-        }
-        log_and_apply(
-            &h,
-            &mut w,
-            Record::Delete {
-                collection: 0,
-                ordinal: 5,
-            },
-        );
-        w.sync_data().unwrap(); // step a only; crash before b
-        drop(h);
-        wal.shutdown();
-        drop(w);
-    }
-
-    let (_replayed, reader) = recover(&idx_path, &wal_path);
-    assert_ordinal_dead(&reader, 5);
-    assert_eq!(reader.search(&[0.0, 1.0], 1024).unwrap().len(), 5);
-}
-
-#[test]
-fn tombstone_durable_before_watermark_isolated() {
-    // Strict ordering proof: checkpoint PAST the delete AND truncate the WAL, so
-    // the Delete is gone from the log. After a reopen with nothing to replay,
-    // ordinal 5 can only be dead if sync_data made the bitset durable BEFORE the
-    // watermark advanced.
-    let dir = tempfile::tempdir().unwrap();
-    let idx_path = dir.path().join("c0.idx");
-    let wal_path = dir.path().join("wal.log");
-
-    {
-        let (mut w, _r) = FlatIndex::create(&idx_path, dim(2), 64).unwrap();
-        let wal = Wal::start(&wal_path, LogOnly, 0).unwrap();
-        let h = wal.handle();
-        for ord in 0..6 {
-            log_and_apply(&h, &mut w, insert_rec(ord));
-        }
-        log_and_apply(
-            &h,
-            &mut w,
-            Record::Delete {
-                collection: 0,
-                ordinal: 5,
-            },
-        );
-        let watermark = w.sync().unwrap(); // a, b, c — bitset durable, then watermark
-        h.truncate(watermark).unwrap(); // WAL drops inserts + the Delete
-        drop(h);
-        wal.shutdown();
-        drop(w);
-    }
-
-    let (replayed, reader) = recover(&idx_path, &wal_path);
-    assert_eq!(replayed, 0, "WAL truncated past the delete; nothing replays");
-    assert_eq!(reader.len(), 6, "high-water includes slot 5");
-    assert_ordinal_dead(&reader, 5); // dead purely from the persisted bitset
-    assert_eq!(reader.search(&[0.0, 1.0], 1024).unwrap().len(), 5);
 }

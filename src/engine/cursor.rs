@@ -26,8 +26,7 @@
 //!
 //! # Skip policy: `Missing`/`Deleted` are transients, never errors
 //!
-//! An enumerated ordinal can fail to produce a row for two ROUTINE reasons, and
-//! the cursor skips both:
+//! An enumerated ordinal can fail to produce a row, and the cursor skips it:
 //!
 //!   * [`RowGet::Missing`] — historically the row was mid-apply: the fan-out
 //!     wrote flat → meta → tuple across three independent mutexes, so a reader
@@ -41,10 +40,11 @@
 //!     ordinal). For a scan of a snapshot, `Missing` is now a bug in the
 //!     applier's ordering rather than a transient — read the file's rewritten
 //!     `WORLD VERDICT` header before changing anything here.
-//!   * [`RowGet::Deleted`] — deleted after the ordinal source was snapshotted.
-//!     The symmetric case, equally routine.
+//!   * There is no `Deleted` verdict any more. A row retired after the ordinal
+//!     source was snapshotted still reads back with its values, which is
+//!     exactly what stops it vanishing out from under an open cursor.
 //!
-//! When the window was real, turning either into an error would have been a
+//! When the window was real, turning this into an error would have been a
 //! once-in-millions production panic: an ascending walk reaches the frontier
 //! long after the window usually shuts, so the full-scan pattern hit `Missing`
 //! just ONCE in ~3.1M gets on one seed and zero on the next — rare enough to
@@ -157,8 +157,8 @@ impl<'a> Cursor<'a> {
                     self.fetched += 1;
                     return Ok(true);
                 }
-                // World A: both are routine. Skip, count, keep going.
-                RowGet::Missing | RowGet::Deleted => {
+                // Skip, count, keep going — see the module header.
+                RowGet::Missing => {
                     self.skipped += 1;
                 }
             }
@@ -595,6 +595,84 @@ mod tests {
         );
     }
 
+    /// The gap that snapshot isolation was missing: a row DELETED while a
+    /// cursor is open must still be yielded, with its values intact.
+    ///
+    /// Its insert-only sibling above could not assert this, because deleting
+    /// used to destroy the row's values — the cursor would enumerate the
+    /// ordinal from its snapshot and then find nothing to read, so the row
+    /// vanished mid-scan. Retiring a row now clears one bit in the metadata
+    /// index and touches neither the vector nor the values, so a snapshot means
+    /// what it says.
+    #[test]
+    fn cursor_result_set_is_fixed_at_open_under_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(open(dir.path()));
+        let seed = 64u64;
+        insert_n(&db, seed);
+
+        let mut cursor = db.scan(0).expect("scan");
+
+        // Delete from the FRONT of the snapshot while the cursor walks it, so
+        // the deletes land on rows the cursor has not reached yet.
+        let stop = Arc::new(AtomicBool::new(false));
+        let deleted = Arc::new(AtomicU64::new(0));
+        let writer = {
+            let db = Arc::clone(&db);
+            let stop = Arc::clone(&stop);
+            let deleted = Arc::clone(&deleted);
+            std::thread::spawn(move || {
+                for o in 0..seed {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    db.delete(0, o).expect("delete");
+                    deleted.fetch_add(1, Ordering::Release);
+                }
+            })
+        };
+
+        while deleted.load(Ordering::Acquire) < 4 {
+            std::thread::yield_now();
+        }
+
+        let deleted_at_drain_start = deleted.load(Ordering::Acquire);
+        let mut seen = Vec::new();
+        let mut has_row = cursor.seek_first().unwrap();
+        while has_row {
+            let o = cursor.ordinal().expect("parked on a row").0 as u64;
+            assert_eq!(
+                cursor.row().unwrap(),
+                values_for(o).as_slice(),
+                "row {o} was retired mid-scan and lost its values"
+            );
+            seen.push(o);
+            std::thread::sleep(Duration::from_micros(200));
+            has_row = cursor.next().unwrap();
+        }
+        let deleted_at_drain_end = deleted.load(Ordering::Acquire);
+
+        stop.store(true, Ordering::Relaxed);
+        writer.join().expect("deleter panicked");
+
+        assert_eq!(
+            seen,
+            (0..seed).collect::<Vec<_>>(),
+            "the cursor lost rows that were deleted after it opened"
+        );
+        assert!(
+            deleted_at_drain_end > deleted_at_drain_start,
+            "no rows were deleted during the drain ({deleted_at_drain_start} -> \
+             {deleted_at_drain_end}); this test would prove nothing"
+        );
+        assert_eq!(cursor.skipped(), 0, "nothing should have been skipped");
+
+        // A cursor opened AFTER the deletes sees the smaller set — the snapshot
+        // excluded them, it did not fail to notice them.
+        let mut after = db.scan(0).expect("scan after");
+        assert!(ordinals(&mut after).len() < seen.len());
+    }
+
     /// Two cursors opened at the same version see exactly the same rows —
     /// they resolve the same snapshot rather than each taking their own read of
     /// mutable state.
@@ -740,24 +818,25 @@ mod tests {
             "settled scan must be exactly the writer's live set"
         );
 
-        // …and nothing in the allocated range is left Missing: every ordinal is
-        // either a live row with the right values or a tombstone.
+        // …and EVERY ordinal ever written is still readable with the right
+        // values, retired or not. The tuple store no longer says anything about
+        // visibility — that is `live`'s job alone, and the scan above already
+        // checked the scan agrees with it.
         let tuples = db.tuple_reader(0).unwrap();
-        let live_set: std::collections::BTreeSet<u64> = want.iter().copied().collect();
+        let live_now = db.metadata_reader(0).unwrap().live();
         for o in 0..frontier {
             match tuples.get(Ordinal(o as u32), &ALL).unwrap() {
                 crate::metadata::tuples::RowGet::Live(values) => {
-                    assert_eq!(values, values_for(o));
-                    assert!(live_set.contains(&o), "ordinal {o} live but not scanned");
+                    assert_eq!(values, values_for(o), "ordinal {o} came back wrong");
                 }
-                crate::metadata::tuples::RowGet::Deleted => {
-                    assert!(!live_set.contains(&o), "ordinal {o} scanned but tombstoned");
-                }
-                crate::metadata::tuples::RowGet::Missing => {
-                    panic!("ordinal {o} still Missing after the run quiesced")
-                }
+                other => panic!("ordinal {o} was written but reads back {other:?}"),
             }
         }
+        assert_eq!(
+            live_now.iter().map(u64::from).collect::<Vec<_>>(),
+            want,
+            "the one liveness authority must match the writer's live set"
+        );
 
         // A run where the readers never got going would prove nothing.
         assert!(scans.load(Ordering::Relaxed) > 1_000, "readers barely ran");

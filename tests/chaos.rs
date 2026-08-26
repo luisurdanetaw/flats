@@ -266,14 +266,28 @@ fn verify_metadata(db: &Db, model: &Model, rng: &mut Rng) {
             "tuple values for ordinal {ord}"
         );
     }
-    // …and a random deleted ordinal reports the deleted-marker.
+    // …and a random RETIRED ordinal is out of `live` but still readable.
+    //
+    // This assertion changed when liveness got a single owner. It used to
+    // require `RowGet::Deleted`: the tuple store destroyed a row's values on
+    // delete and reported the tombstone, making it a second authority on
+    // visibility. It no longer is. A retired row keeps its values so a reader
+    // holding an older liveness snapshot can still read the row it was
+    // promised, and `live` alone decides what is visible. Compaction, not
+    // `delete`, reclaims the space.
     if !model.deleted.is_empty() {
         let pick = rng.below(model.deleted.len() as u64) as usize;
         let &ord = model.deleted.iter().nth(pick).unwrap();
-        assert_eq!(
-            tuples.get(Ordinal(ord as u32), &[0]).expect("get deleted"),
-            RowGet::Deleted,
-            "deleted marker for ordinal {ord}"
+        assert!(
+            !meta.live().contains(ord as u32),
+            "retired ordinal {ord} is still live"
+        );
+        assert!(
+            matches!(
+                tuples.get(Ordinal(ord as u32), &[0]).expect("get retired"),
+                RowGet::Live(_)
+            ),
+            "retired ordinal {ord} lost its values"
         );
     }
 }
