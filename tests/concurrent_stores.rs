@@ -2,42 +2,33 @@
 //! metadata index and the tuple store.
 //!
 //! ============================================================================
-//! WORLD VERDICT: **WORLD A — `Missing` on a live ordinal is a LEGAL TRANSIENT.**
+//! WORLD VERDICT: **WORLD B — `Missing` on a live ordinal is IMPOSSIBLE.**
 //!
-//! The race is not theoretical and it is not rare. `live_then_get_under_
-//! concurrent_writes` observes it **~20-28k times in ~6 seconds** across two
-//! seeds on an 8-thread dev box. `missing_is_transient_not_corruption` then
-//! proves every sighting resolves: worst observed transient **83 retry
-//! attempts / ~920µs**, typically far less.
+//! It was not always. This file's original run observed the meta->tuple window
+//! **~20-28k times in ~6 seconds** across two seeds, and that measurement is
+//! why the fan-out order in `IndexApplier::apply` is what it is. Liveness is
+//! now published LAST on the way in: `flat.write_at` and `tuple.write_row`
+//! both complete before `meta.insert_row` sets the live bit, so an ordinal
+//! cannot be enumerable before the stores hold it. `live_then_get_under_
+//! concurrent_writes` asserts the window is gone; it reports 0 sightings where
+//! it used to report tens of thousands.
 //!
 //! POLICY THE CURSOR MUST IMPLEMENT:
 //!
-//!   * `RowGet::Missing` for an ordinal enumerated from `live()` is **NOT an
-//!     error and NOT corruption**. The cursor must **SKIP the row** and keep
-//!     going. It must never propagate an error, panic, or abort the scan.
-//!   * Skipping is *semantically* correct, not just pragmatic: apply runs
-//!     BEFORE the ack (`wal.rs`, `commit_batch` — "COMMIT POINT crossed. Now
-//!     apply (post-fsync) then ack"), so an ordinal that is in `live()` while
-//!     the tuple store still says `Missing` belongs to an insert **whose ack
-//!     has not yet been sent to its caller**. No query is obliged to observe a
-//!     write that hasn't returned to the writer yet.
-//!   * A bounded retry is also sound — `missing_is_transient_not_corruption`
-//!     proves every sighting resolves — but it buys nothing except latency: it
-//!     would pull in a write that was still in flight when the scan started.
-//!     **Prefer skip.**
-//!   * `RowGet::Deleted` for an enumerated ordinal is likewise legal (deleted
-//!     after the snapshot) — skip that too.
-//!   * What the cursor may still treat as loud: a row whose VALUES are wrong.
-//!     That invariant holds in every world and is asserted throughout here.
+//!   * `RowGet::Missing` for an ordinal enumerated from a liveness snapshot is
+//!     a BUG — in the applier's ordering, not in the reader. It is no longer a
+//!     transient to skip past. Treat it loudly.
+//!   * `RowGet::Deleted` for an enumerated ordinal remains legal: the row can
+//!     be deleted after the snapshot is taken, and today's delete destroys the
+//!     values. Skip it.
+//!   * A row whose VALUES are wrong is loud in every world, and is asserted
+//!     throughout here.
 //!
-//! Note for whoever writes the enumeration loop: the two reader roles hit this
-//! at wildly different rates, and the difference is a trap. The frontier PROBER
-//! sees thousands per run; the SCANNER — the cursor's exact future loop — saw
-//! **1 sighting in ~3.1M gets** on one run and 0 on the next. An ascending walk
-//! usually reaches the frontier long after the window shut, so the plain loop
-//! *rarely* notices. **Rarely is not never**: the scan role demonstrably trips
-//! it. A cursor that treats `Missing` as an error would be a once-in-millions
-//! production panic — the worst possible failure shape. Handle it.
+//! WHAT IS STILL OPEN: the DELETE side. `flat.delete` tombstones before
+//! `tuple.delete_row` clears the row, so a snapshot taken before a delete can
+//! see the two stores disagree (~50 sightings per 3s run, measured). That skew
+//! is inherent to a destructive delete and closes only when retiring a row
+//! stops destroying its values.
 //! ============================================================================
 //!
 //! # Why this file exists
@@ -93,11 +84,6 @@ const WRITE_FOR: Duration = Duration::from_secs(3);
 /// Cap on captured `Missing` observations — enough to characterize the race
 /// without an unbounded log.
 const MAX_OBSERVATIONS: usize = 8;
-/// How long a `Missing` ordinal may stay missing before we call it a lost row.
-/// Measured resolve time is microseconds; this is ~6 orders of magnitude of
-/// headroom so a loaded CI box can never fail this for the wrong reason.
-const RETRY_BUDGET: Duration = Duration::from_secs(5);
-
 /// Which world this build implements.
 ///
 /// **A** — liveness has three independent owners (the flat index's tombstone
@@ -117,7 +103,7 @@ enum World {
     B,
 }
 
-const EXPECTED_WORLD: World = World::A;
+const EXPECTED_WORLD: World = World::B;
 
 /// xorshift64* — same generator `chaos.rs` uses, so a failure reproduces from
 /// the seed alone.
@@ -589,113 +575,110 @@ fn live_then_get_under_concurrent_writes() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. WORLD A LOCK-IN — the contract the cursor relies on
+// 3. SNAPSHOT SAFETY — no snapshot admits a row the stores don't hold
 // ---------------------------------------------------------------------------
 
-/// World A's regression guard: a `Missing` observed on a live ordinal is a row
-/// **mid-apply**, never a lost one. Every sighting must become gettable within
-/// `RETRY_BUDGET`.
+/// The snapshot-based analogue of the PROBER, and the property the whole
+/// liveness-unification exists to buy:
 ///
-/// This is the assertion that licenses the cursor to skip `Missing` instead of
-/// erroring. If a future change to the apply fan-out ever leaves a row
-/// permanently missing from the tuple store while it is live in the metadata
-/// index, this test fails — loudly, with the ordinal.
+/// **Every ordinal in a resolved `LiveSet` is fully written in every store.**
 ///
-/// Every reader is a PROBER here: the scan role provably never trips the window
-/// (see the header), so it would only dilute the sample.
+/// A `LiveSet` is immutable, so unlike a raw `live()` + `get()` sighting this
+/// cannot resolve by retrying — a row admitted early is wrong for as long as
+/// the snapshot lives. That makes the ordering rule strict: liveness must be
+/// published only after flat AND tuple already hold the row.
+///
+/// Probes the snapshot's MAXIMUM ordinal, for the same reason the prober does:
+/// it is the one the applier just published, so it aims straight at the window.
+///
+/// SCOPE: this is the INSERT-side property — a row must not become enumerable
+/// before it is written. The delete side is deliberately not asserted here.
+/// `flat.delete` tombstones before `tuple.delete_row` clears the row, so a
+/// snapshot taken before a delete can briefly see the flat index and the tuple
+/// store disagree about it (measured: ~50 sightings per 3s run). That skew is
+/// inherent to a DESTRUCTIVE delete and closes only when retiring a row stops
+/// destroying its values; agreement between bare SEARCH and a snapshot is its
+/// own separate property.
 #[test]
-fn missing_is_transient_not_corruption() {
+fn snapshot_never_contains_an_unwritten_row() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path(), &cfgs(), opts()).unwrap();
-    let meta = db.metadata_reader(0).expect("metadata reader");
     let tuples = db.tuple_reader(0).expect("tuple reader");
     seed_rows(&db);
 
     let stop = Arc::new(AtomicBool::new(false));
-    let observed = Arc::new(AtomicU64::new(0));
+    let violations = Arc::new(AtomicU64::new(0));
+    let resolves = Arc::new(AtomicU64::new(0));
+    let checks = Arc::new(AtomicU64::new(0));
+    let notes = Arc::new(Mutex::new(Vec::<String>::new()));
     let acked = Arc::new(AtomicU64::new(SEED_ROWS));
-    // How hard the retries had to work — reported so the cursor's author knows
-    // the real magnitude of the window rather than guessing at it.
-    let max_attempts = Arc::new(AtomicU64::new(0));
-    let max_nanos = Arc::new(AtomicU64::new(0));
 
+    let next = std::thread::scope(|scope| {
     let mut handles = Vec::new();
     for _ in 0..reader_threads() {
-        let meta = meta.clone();
+        let db = &db;
         let tuples = tuples.clone();
         let stop = stop.clone();
-        let observed = observed.clone();
-        let max_attempts = max_attempts.clone();
-        let max_nanos = max_nanos.clone();
-        handles.push(std::thread::spawn(move || {
+        let violations = violations.clone();
+        let resolves = resolves.clone();
+        let checks = checks.clone();
+        let notes = notes.clone();
+        handles.push(scope.spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                let live = meta.live();
-                let Some(frontier) = live.max() else { continue };
-                if !matches!(
-                    tuples.get(Ordinal(frontier), &COLS).expect("get"),
-                    RowGet::Missing
-                ) {
+                let set = db.live_snapshot(0).expect("collection 0");
+                resolves.fetch_add(1, Ordering::Relaxed);
+                let Some(max) = set.iter().max() else {
                     continue;
-                }
-                observed.fetch_add(1, Ordering::Relaxed);
-
-                // Caught one mid-apply. Retry until it resolves — to a live row
-                // (the insert's `write_row` landed) or to the deleted-marker
-                // (the writer deleted it afterwards; applies are sequential on
-                // the WAL thread, so that too proves `write_row` ran).
-                let start = Instant::now();
-                let mut attempts = 0u64;
-                let resolved = loop {
-                    attempts += 1;
-                    match tuples.get(Ordinal(frontier), &COLS).expect("get") {
-                        RowGet::Live(values) => {
-                            verify_values(frontier as u64, &values);
-                            break true;
-                        }
-                        RowGet::Deleted => break true,
-                        RowGet::Missing => {}
-                    }
-                    if start.elapsed() > RETRY_BUDGET {
-                        break false;
-                    }
-                    std::thread::yield_now();
                 };
-                let elapsed = start.elapsed();
-                assert!(
-                    resolved,
-                    "ordinal {frontier} was in live() but stayed Missing for {elapsed:?} across \
-                     {attempts} attempts — that is a LOST ROW, not a mid-apply transient. The \
-                     cursor's skip-on-Missing policy is no longer safe; see this file's header."
-                );
-                max_attempts.fetch_max(attempts, Ordering::Relaxed);
-                max_nanos.fetch_max(elapsed.as_nanos() as u64, Ordering::Relaxed);
+                checks.fetch_add(1, Ordering::Relaxed);
+
+                match tuples.get(Ordinal(max), &COLS).expect("get") {
+                    RowGet::Live(values) => verify_values(max as u64, &values),
+                    // Legal: the row was deleted after this snapshot was taken.
+                    RowGet::Deleted => {}
+                    RowGet::Missing => {
+                        violations.fetch_add(1, Ordering::Relaxed);
+                        let mut n = notes.lock().unwrap_or_else(|e| e.into_inner());
+                        if n.len() < MAX_OBSERVATIONS {
+                            n.push(format!(
+                                "ordinal {max} is in a v{} snapshot (len={}) but the tuple \
+                                 store says Missing",
+                                set.version(),
+                                set.len()
+                            ));
+                        }
+                    }
+                }
             }
         }));
     }
 
-    let (live, next) = drive_writer(&db, 0x5DEE_CE66_D1B5_4A32, &acked);
+    let (_live, next) = drive_writer(&db, 0x51A2_7E31_0C4D_9B77, &acked);
     stop.store(true, Ordering::Relaxed);
     for h in handles {
         h.join().expect("reader thread panicked");
     }
+    next
+    });
 
-    assert_settled(&meta, &tuples, &live, next);
-
-    let seen = observed.load(Ordering::Relaxed);
-    eprintln!(
-        "\n[transience] {seen} Missing sightings, all resolved. \
-         worst case: {} retry attempts / {:?}",
-        max_attempts.load(Ordering::Relaxed),
-        Duration::from_nanos(max_nanos.load(Ordering::Relaxed)),
-    );
-
-    // Guard against a vacuous pass. The decider sees thousands of sightings per
-    // second, so a run that sees none did not exercise the contract at all.
-    // (If this ever proves flaky on a very small CI runner, raise `WRITE_FOR`
-    // rather than dropping the assertion — a silent no-op test is worse.)
+    // The same meaningfulness guards the decider uses: silence is only evidence
+    // if the readers and the writer actually ran.
     assert!(
-        seen > 0,
-        "no Missing was observed, so the retry contract went untested — the race is known \
-         reachable on this codebase (see live_then_get_under_concurrent_writes)"
+        resolves.load(Ordering::Relaxed) > 1_000,
+        "readers barely ran; the result would not be meaningful"
     );
+    assert!(checks.load(Ordering::Relaxed) > 1_000, "readers saw no rows");
+    assert!(next > SEED_ROWS, "writer made no progress");
+
+    let violations = violations.load(Ordering::Relaxed);
+    for note in notes.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        eprintln!("  {note}");
+    }
+    assert_eq!(
+        violations, 0,
+        "{violations} snapshot(s) admitted a row the stores did not hold — \
+         liveness was published before the data"
+    );
+
+    db.close().unwrap();
 }

@@ -120,9 +120,7 @@ struct Collection {
     /// `Arc<LiveSet>` and carry it for the life of a query.
     ///
     /// Shared with this collection's `CollectionWriters` on the WAL thread,
-    /// which is the only side that bumps. Unread from HERE until readers start
-    /// resolving snapshots; the allow comes off then.
-    #[allow(dead_code)]
+    /// which is the only side that bumps.
     live: Arc<meta::LiveHandle>,
 }
 
@@ -277,10 +275,11 @@ impl Apply for IndexApplier {
     /// invalidation costs one re-materialization; the branch that avoided it
     /// would cost a correctness argument.
     ///
-    /// NOTE the bump currently sits between the metadata and tuple writes,
-    /// which is still inside the cross-store window `concurrent_stores.rs`
-    /// measures. Moving it after ALL THREE stores is what closes that window,
-    /// and it lands as its own change with its own test.
+    /// Fan-out ORDER is load-bearing, not incidental: a row becomes visible
+    /// when `meta.insert_row` sets its live bit, so every store a reader can
+    /// consult must already hold it by then. Inserts publish liveness last,
+    /// deletes publish it first. Do not reorder — `concurrent_stores.rs`
+    /// asserts the resulting property directly.
     fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<()> {
         match record {
             Record::Insert {
@@ -291,10 +290,16 @@ impl Apply for IndexApplier {
             } => {
                 let w = self.writers(*collection)?;
                 let ord32 = ordinal32(*ordinal)?;
+                // DATA FIRST, LIVENESS LAST. `meta.insert_row` is what makes
+                // the ordinal enumerable, so it must not run until every store
+                // that a reader will consult for that row already holds it —
+                // otherwise a snapshot can admit a row the tuple store has
+                // never seen, and a LiveSet is immutable, so that reader is
+                // wrong for as long as it holds the snapshot.
                 w.flat.write_at(*ordinal, vector).map_err(to_io)?;
+                w.tuple.write_row(ord32, metadata).map_err(to_io)?;
                 w.meta.insert_row(ord32, metadata).map_err(to_io)?;
                 w.live.bump();
-                w.tuple.write_row(ord32, metadata).map_err(to_io)?;
                 w.flat.advance_applied_lsn(lsn.0);
                 w.meta.advance_applied_lsn(lsn);
                 w.tuple.advance_applied_lsn(lsn);
@@ -305,10 +310,15 @@ impl Apply for IndexApplier {
             } => {
                 let w = self.writers(*collection)?;
                 let ord32 = ordinal32(*ordinal)?;
+                // The mirror image: liveness FIRST on the way out, so nothing
+                // can enumerate a row whose values are being destroyed. (An
+                // OLDER snapshot still holding this ordinal will read the
+                // tombstone `delete_row` leaves — retiring rows without
+                // destroying their values is a later change.)
                 w.flat.delete(*ordinal).map_err(to_io)?;
                 w.meta.remove_row(ord32).map_err(to_io)?;
-                w.live.bump();
                 w.tuple.delete_row(ord32).map_err(to_io)?;
+                w.live.bump();
                 w.flat.advance_applied_lsn(lsn.0);
                 w.meta.advance_applied_lsn(lsn);
                 w.tuple.advance_applied_lsn(lsn);
@@ -888,6 +898,18 @@ impl Db {
         };
         self.wal_handle()?.append(Record::CreateCollection { config })?;
         Ok(id)
+    }
+
+    /// The current liveness snapshot for `collection`, materializing it if no
+    /// reader has needed this version yet. `None` for an unknown collection.
+    ///
+    /// Resolve ONCE and hold the returned `Arc` for the life of a query: a
+    /// `LiveSet` is immutable, so the rows it admits never change underneath
+    /// the caller. Calling this per row would defeat the point.
+    pub fn live_snapshot(&self, collection: u32) -> Option<Arc<meta::LiveSet>> {
+        catalog_snapshot(&self.catalog)
+            .get(&collection)
+            .map(|c| c.live.resolve())
     }
 
     /// A cloneable read handle for `collection`, for issuing searches from other
