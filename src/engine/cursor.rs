@@ -9,36 +9,48 @@
 //!
 //! # The ordinal source is a seam, deliberately
 //!
-//! A cursor is built over *any* iterator of ordinals — it is NOT wired to
-//! `live()`. [`Db::scan`](crate::Db::scan) happens to feed it `live()` for a
-//! full scan; a `WHERE`-filtered bitmap (`lookup_range(..) & live`) or a ranked
-//! KNN result feeds the SAME cursor later, with no new type. That is the whole
-//! reason `Cursor::over` takes an iterator instead of a `&MetadataIndex`.
+//! A cursor is built over *any* iterator of ordinals — it is NOT wired to a
+//! liveness source. [`Db::scan`](crate::Db::scan) happens to feed it a resolved
+//! [`LiveSet`](crate::metadata::index::LiveSet) for a full scan; a
+//! `WHERE`-filtered bitmap or a ranked KNN result feeds the SAME cursor later,
+//! with no new type. That is the whole reason `Cursor::over` takes an iterator
+//! instead of a `&MetadataIndex`.
+//!
+//! # The result set is fixed when the cursor opens
+//!
+//! `Db::scan` resolves ONE liveness snapshot and iterates it. Rows written
+//! while the cursor is being drained are invisible to it, however slowly it
+//! walks, and two cursors opened at the same version see exactly the same rows.
+//! Deleting is still destructive, so a row can vanish from an open cursor
+//! mid-scan; that is the one hole left in the isolation story.
 //!
 //! # Skip policy: `Missing`/`Deleted` are transients, never errors
 //!
 //! An enumerated ordinal can fail to produce a row for two ROUTINE reasons, and
 //! the cursor skips both:
 //!
-//!   * [`RowGet::Missing`] — the row is mid-apply. The engine's fan-out writes
-//!     flat → meta → tuple across three independent mutexes, so a reader can
-//!     catch an ordinal already published into the metadata index whose tuple
-//!     has not landed yet. `tests/concurrent_stores.rs` fires this window
-//!     ~20-28k times in ~6s of writing; its `WORLD VERDICT` header is the
-//!     evidence behind this policy — READ IT before changing anything here.
-//!     Skipping is not a fudge: apply runs BEFORE the ack (`wal.rs`,
-//!     `commit_batch`), so such a row belongs to an insert whose ack has not
-//!     reached its caller. No query owes visibility to a write that has not
-//!     returned to the writer.
+//!   * [`RowGet::Missing`] — historically the row was mid-apply: the fan-out
+//!     wrote flat → meta → tuple across three independent mutexes, so a reader
+//!     could catch an ordinal published into the metadata index whose tuple had
+//!     not landed. `tests/concurrent_stores.rs` fired that window ~20-28k times
+//!     in ~6s of writing. **It no longer exists**: the applier now publishes
+//!     liveness LAST, after flat and tuple both hold the row, and that same
+//!     test asserts zero sightings. The skip is kept for now because the
+//!     cursor also serves ordinal sources that are not liveness snapshots
+//!     (`scan_over` takes any iterator, including one naming a never-written
+//!     ordinal). For a scan of a snapshot, `Missing` is now a bug in the
+//!     applier's ordering rather than a transient — read the file's rewritten
+//!     `WORLD VERDICT` header before changing anything here.
 //!   * [`RowGet::Deleted`] — deleted after the ordinal source was snapshotted.
 //!     The symmetric case, equally routine.
 //!
-//! Turning either into an error would be a once-in-millions production panic:
-//! an ascending walk reaches the frontier long after the window usually shuts,
-//! so the full-scan pattern hit `Missing` just ONCE in ~3.1M gets on one seed
-//! and zero on the next — rare enough to pass casual testing, never rare enough
-//! to be safe. The skip lives inside [`Cursor::seek_first`] / [`Cursor::next`],
-//! so the VM's `Column` only ever sees a materialized row.
+//! When the window was real, turning either into an error would have been a
+//! once-in-millions production panic: an ascending walk reaches the frontier
+//! long after the window usually shuts, so the full-scan pattern hit `Missing`
+//! just ONCE in ~3.1M gets on one seed and zero on the next — rare enough to
+//! pass casual testing, never rare enough to be safe. The skip lives inside
+//! [`Cursor::seek_first`] / [`Cursor::next`], so the VM's `Column` only ever
+//! sees a materialized row.
 //!
 //! # One `get` per row, not per column
 //!
@@ -490,6 +502,123 @@ mod tests {
     }
 
     // ---- 7: the World A property under concurrency -------------------------
+
+    // ---- snapshot isolation ------------------------------------------------
+
+    /// A cursor's result set is decided ONCE, when it opens. Rows inserted
+    /// while it is being drained are invisible to it, however slowly it walks.
+    ///
+    /// The writer here is INSERT-ONLY on purpose. A delete destroys the row's
+    /// values, so a mixed workload would make rows vanish from an open cursor
+    /// mid-scan and this assertion would be false — not because isolation is
+    /// broken, but because retiring a row is still destructive. That gap closes
+    /// when retirement stops destroying values; asserting it now would mean
+    /// writing a test that tolerates the thing it is supposed to catch.
+    #[test]
+    fn cursor_result_set_is_fixed_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(open(dir.path()));
+        let seed = 64u64;
+        insert_n(&db, seed);
+
+        let mut cursor = db.scan(0).expect("scan");
+
+        // Hammer the collection while the cursor is open, and keep writing
+        // while it is drained: the writer only stops once the scan is done.
+        let stop = Arc::new(AtomicBool::new(false));
+        let written = Arc::new(AtomicU64::new(0));
+        let writer = {
+            let db = Arc::clone(&db);
+            let stop = Arc::clone(&stop);
+            let written = Arc::clone(&written);
+            std::thread::spawn(move || {
+                let mut next = seed;
+                while !stop.load(Ordering::Relaxed) {
+                    db.insert(0, &vector_for(next), row_for(next))
+                        .expect("insert");
+                    next += 1;
+                    written.fetch_add(1, Ordering::Release);
+                }
+                next
+            })
+        };
+
+        // An insert costs ~1.5ms (one fsync); draining 64 rows costs
+        // microseconds. Without waiting, the scan would finish before the
+        // writer landed a single row and the test would pass vacuously.
+        while written.load(Ordering::Acquire) < 4 {
+            std::thread::yield_now();
+        }
+
+        // Walk deliberately slowly so more rows land DURING the drain, not just
+        // before it.
+        let written_at_drain_start = written.load(Ordering::Acquire);
+        let mut seen = Vec::new();
+        let mut has_row = cursor.seek_first().unwrap();
+        while has_row {
+            let o = cursor.ordinal().expect("parked on a row").0 as u64;
+            assert_eq!(cursor.row().unwrap(), values_for(o).as_slice());
+            seen.push(o);
+            std::thread::sleep(Duration::from_micros(200));
+            has_row = cursor.next().unwrap();
+        }
+
+        let written_at_drain_end = written.load(Ordering::Acquire);
+        stop.store(true, Ordering::Relaxed);
+        let wrote_through = writer.join().expect("writer panicked");
+
+        // Without this the test could pass vacuously: a cursor that re-read
+        // liveness mid-scan only picks up rows that land WHILE it walks, so
+        // there must have been some.
+        assert!(
+            written_at_drain_end > written_at_drain_start,
+            "no rows landed during the drain ({written_at_drain_start} -> \
+             {written_at_drain_end}); a cursor that re-read liveness would have \
+             had nothing to pick up and this test would prove nothing"
+        );
+
+        assert_eq!(
+            seen,
+            (0..seed).collect::<Vec<_>>(),
+            "the cursor yielded rows outside the snapshot it opened on"
+        );
+        assert!(
+            wrote_through > seed,
+            "writer made no progress ({wrote_through}); the test proves nothing"
+        );
+        // The rows the writer landed are real and visible to a LATER cursor —
+        // the snapshot excluded them, it did not lose them.
+        let mut after = db.scan(0).expect("scan after");
+        assert!(
+            ordinals(&mut after).len() > seen.len(),
+            "a cursor opened after the writes must see them"
+        );
+    }
+
+    /// Two cursors opened at the same version see exactly the same rows —
+    /// they resolve the same snapshot rather than each taking their own read of
+    /// mutable state.
+    #[test]
+    fn two_cursors_at_one_version_see_the_same_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path());
+        insert_n(&db, 32);
+        db.delete(0, 7).unwrap();
+
+        let mut a = db.scan(0).expect("scan a");
+        let mut b = db.scan(0).expect("scan b");
+        let (a, b) = (ordinals(&mut a), ordinals(&mut b));
+
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 31);
+        assert!(!a.contains(&7));
+
+        // A write after both opened is invisible to a THIRD cursor's peers but
+        // visible to the third itself — the version moved.
+        db.insert(0, &vector_for(32), row_for(32)).unwrap();
+        let mut c = db.scan(0).expect("scan c");
+        assert_eq!(ordinals(&mut c).len(), 32);
+    }
 
     /// The settled World A behaviour: with a writer running, a cursor never
     /// errors on an ordinal that transiently `get`s `Missing`/`Deleted` — it

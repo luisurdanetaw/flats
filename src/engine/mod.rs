@@ -950,7 +950,16 @@ impl Db {
     /// [`Cursor::over`].
     pub fn scan(&self, collection: u32) -> Result<Cursor<'static>> {
         let coll = self.collection(collection)?;
-        let live = coll.meta.live();
+        // The SNAPSHOT, not a fresh read of `live`. Two readers that resolve at
+        // the same version get the same set, which is what lets a scan and a
+        // filtered search agree about what is live; `meta.live()` is a read of
+        // mutable state and two calls a microsecond apart can differ.
+        //
+        // The bitmap is cloned out because `Cursor<'static>` needs an owning
+        // iterator and `LiveSet::iter` borrows. That clone is the same cost as
+        // the `live()` call it replaces — and next to a brute-force scan over
+        // the vectors themselves, it is noise.
+        let live = coll.live.resolve().bitmap().clone();
         self.scan_over(collection, live.into_iter().map(Ordinal))
     }
 
