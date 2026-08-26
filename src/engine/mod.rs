@@ -115,6 +115,14 @@ struct Collection {
     /// Next ordinal to hand out. Seeded from the index high-water after
     /// recovery; advanced once per insert.
     next_ordinal: AtomicU64,
+    /// Version-tagged liveness snapshots for this collection. The applier
+    /// bumps its version once per liveness-changing record; readers resolve an
+    /// `Arc<LiveSet>` and carry it for the life of a query.
+    ///
+    /// Unread until the applier starts bumping and readers start resolving;
+    /// the allow comes off then.
+    #[allow(dead_code)]
+    live: meta::LiveHandle,
 }
 
 impl Collection {
@@ -188,6 +196,7 @@ fn open_collection(dir: &Path, cfg: &CollectionConfig) -> Result<(CollectionWrit
             tuple: tuple_w,
         },
         Collection {
+            live: meta_r.live_handle(),
             reader: flat_r,
             meta: meta_r,
             tuple: tuple_r,

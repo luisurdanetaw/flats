@@ -80,6 +80,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use roaring::RoaringBitmap;
@@ -619,8 +620,174 @@ impl Reader {
         self.lock().live.len()
     }
 
+    /// A [`LiveHandle`] over the same inner state, for publishing and
+    /// resolving version-tagged liveness snapshots.
+    pub fn live_handle(&self) -> LiveHandle {
+        LiveHandle {
+            inner: Arc::clone(&self.inner),
+            version: AtomicU64::new(0),
+            cached: Mutex::new(None),
+            materializations: AtomicU64::new(0),
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, MetadataInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Liveness snapshots
+// ---------------------------------------------------------------------------
+
+/// An immutable, version-tagged snapshot of one collection's liveness.
+///
+/// Handed to readers as an `Arc<LiveSet>`: a query resolves one at open and
+/// iterates it for its whole life, so the rows it can see never change
+/// underneath it. Cloning is a pointer bump — the bitmap is never copied per
+/// reader.
+///
+/// The representation is PRIVATE on purpose. Bare `SEARCH` wants a raw bitset
+/// for its one-AND inner loop while `WHERE` wants the roaring form to
+/// intersect with posting lists; keeping both behind accessors means that
+/// second representation can be added without touching a single caller.
+pub struct LiveSet {
+    /// The [`LiveHandle`] version this snapshot reflects. See that type's
+    /// "Version labeling" section — this may LAG the state below, never lead
+    /// it.
+    version: u64,
+    live: RoaringBitmap,
+}
+
+impl LiveSet {
+    /// Build a snapshot of `live` labeled `version`.
+    ///
+    /// Callers must read `version` and `live` under the SAME metadata lock —
+    /// see [`LiveHandle`]'s "Version labeling".
+    ///
+    /// Deliberately NOT public: a caller outside this module cannot honour that
+    /// rule, and a forged version label poisons the cache permanently. Unused
+    /// outside tests until `resolve()` lands; the allow comes off with it.
+    #[allow(dead_code)]
+    pub(crate) fn new(version: u64, live: RoaringBitmap) -> LiveSet {
+        LiveSet { version, live }
+    }
+
+    /// The version this snapshot reflects.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Is `ordinal` alive in this snapshot?
+    pub fn contains(&self, ordinal: u32) -> bool {
+        self.live.contains(ordinal)
+    }
+
+    /// How many ordinals are alive.
+    pub fn len(&self) -> u64 {
+        self.live.len()
+    }
+
+    /// Were no ordinals alive at this version?
+    pub fn is_empty(&self) -> bool {
+        self.live.is_empty()
+    }
+
+    /// The roaring form, for intersecting with posting lists.
+    pub fn bitmap(&self) -> &RoaringBitmap {
+        &self.live
+    }
+
+    /// Live ordinals in ascending order.
+    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.live.iter()
+    }
+}
+
+/// The publish point for one collection's liveness: a version counter the
+/// applier bumps, plus the lazily materialized newest snapshot.
+///
+/// # Why lazy
+///
+/// Rebuilding a [`LiveSet`] on every write would cost a ~125KB bitmap copy per
+/// million rows, on the write path, per statement — ruinous for single-row
+/// inserts. So the applier only bumps a counter (no allocation, no copy), and a
+/// reader materializes at most once per version, on demand. A write-only
+/// workload materializes nothing at all, which is what
+/// [`materializations`](Self::materializations) exists to let tests prove.
+///
+/// # Version labeling
+///
+/// **A snapshot's version label may LAG the state it holds. It must never LEAD
+/// it.**
+///
+/// The applier's order is: take the metadata lock → mutate `live` → drop the
+/// lock → `version.fetch_add`. The counter is therefore bumped strictly AFTER
+/// its mutation is visible, so at every instant
+/// `version <= mutations-reflected-in-the-bitmap`.
+///
+/// A reader that reads the counter *inside* the metadata lock inherits that
+/// inequality and gets a conservative label — possibly one behind, never one
+/// ahead:
+///
+///   * Label one behind → the next reader sees a version mismatch and
+///     re-materializes. Wasteful, correct.
+///   * Label one ahead → the cache serves stale liveness **forever**, because
+///     nothing will ever invalidate it. This is the bug, and it is exactly
+///     what happens if a reader copies the bitmap, releases the lock, and
+///     THEN reads the counter.
+///
+/// Whatever materializes a snapshot must read the counter and the bitmap in
+/// one critical section. There is no cheaper ordering that is still correct.
+pub struct LiveHandle {
+    /// The state a snapshot is materialized FROM. Unread until `resolve()`
+    /// lands with the lazy materialization; the allow comes off with it.
+    #[allow(dead_code)]
+    inner: Arc<Mutex<MetadataInner>>,
+    /// Bumped once per liveness-changing record by the applier.
+    version: AtomicU64,
+    /// The newest materialized snapshot, if any reader has needed one yet.
+    cached: Mutex<Option<Arc<LiveSet>>>,
+    /// How many times a snapshot has actually been built. The standing gate on
+    /// the snapshot-isolation work: this must stay at ZERO for any write-only
+    /// workload.
+    materializations: AtomicU64,
+}
+
+impl LiveHandle {
+    /// The current version. Cheap — no lock.
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    /// Advance the version, invalidating every cached snapshot.
+    ///
+    /// Called by the applier AFTER the mutation is visible in every store —
+    /// see "Version labeling" above. `Release` so a reader that observes the
+    /// new version also observes the writes that preceded it.
+    pub fn bump(&self) {
+        self.version.fetch_add(1, Ordering::Release);
+    }
+
+    /// The cached snapshot, if one has been materialized. Does NOT check
+    /// whether it is current.
+    pub fn cached(&self) -> Option<Arc<LiveSet>> {
+        self.lock_cache().clone()
+    }
+
+    /// Publish `set` as the cached snapshot, replacing any previous one.
+    pub fn store(&self, set: Arc<LiveSet>) {
+        *self.lock_cache() = Some(set);
+        self.materializations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many snapshots have been built over this handle's life.
+    pub fn materializations(&self) -> u64 {
+        self.materializations.load(Ordering::Relaxed)
+    }
+
+    fn lock_cache(&self) -> MutexGuard<'_, Option<Arc<LiveSet>>> {
+        self.cached.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -800,6 +967,10 @@ mod tests {
     // Writer must stay the single mutator — type-level half of the invariant.
     static_assertions::assert_not_impl_any!(Writer: Clone);
     static_assertions::assert_impl_all!(Reader: Clone, Send);
+    // A snapshot that cannot cross a thread boundary is useless to us: readers
+    // resolve one and carry it for the life of a query, on their own thread.
+    static_assertions::assert_impl_all!(LiveSet: Send, Sync);
+    static_assertions::assert_impl_all!(LiveHandle: Send, Sync);
 
     #[test]
     fn insert_lookup_round_trip_each_type() {
@@ -1090,5 +1261,109 @@ mod tests {
             MetadataIndex::open(dir.path(), other),
             Err(Error::SchemaMismatch)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Liveness snapshots
+    // -----------------------------------------------------------------------
+
+    /// Build a handle over a throwaway index, without touching the filesystem.
+    fn live_handle() -> LiveHandle {
+        let inner = Arc::new(Mutex::new(MetadataInner::empty(test_schema())));
+        Reader { inner }.live_handle()
+    }
+
+    #[test]
+    fn live_set_carries_its_version() {
+        let set = LiveSet::new(7, bm(&[1, 4, 9]));
+
+        assert_eq!(set.version(), 7);
+        assert_eq!(set.len(), 3);
+        assert!(!set.is_empty());
+        assert!(set.contains(4));
+        assert!(!set.contains(5));
+        assert_eq!(set.iter().collect::<Vec<_>>(), vec![1, 4, 9]);
+        assert_eq!(set.bitmap(), &bm(&[1, 4, 9]));
+
+        assert!(LiveSet::new(0, RoaringBitmap::new()).is_empty());
+    }
+
+    /// THE point of the Arc: two readers of the same published snapshot get the
+    /// same ALLOCATION, not two copies of the bitmap. `ptr_eq` is the only
+    /// assertion that actually proves we never memcpy'd it — a value-equality
+    /// check would pass just as happily on a clone.
+    #[test]
+    fn resolving_twice_clones_a_pointer_not_a_bitmap() {
+        let handle = live_handle();
+        handle.store(Arc::new(LiveSet::new(1, bm(&[0, 1, 2]))));
+
+        let a = handle.cached().expect("a snapshot was stored");
+        let b = handle.cached().expect("a snapshot was stored");
+
+        assert!(Arc::ptr_eq(&a, &b), "readers must share one allocation");
+    }
+
+    #[test]
+    fn publishing_swaps_the_arc() {
+        let handle = live_handle();
+
+        handle.store(Arc::new(LiveSet::new(1, bm(&[0]))));
+        let first = handle.cached().expect("first snapshot");
+
+        handle.store(Arc::new(LiveSet::new(2, bm(&[0, 1]))));
+        let second = handle.cached().expect("second snapshot");
+
+        assert!(!Arc::ptr_eq(&first, &second), "publish must swap the Arc");
+        assert_eq!(second.version(), 2);
+        assert_eq!(second.len(), 2);
+
+        // The old snapshot stays alive for whoever still holds it — that is the
+        // whole basis of snapshot isolation — and dies with the last handle.
+        assert_eq!(Arc::strong_count(&first), 1);
+        assert_eq!(first.len(), 1, "an old snapshot is unaffected by the swap");
+    }
+
+    #[test]
+    fn bump_advances_the_version() {
+        let handle = Arc::new(live_handle());
+        assert_eq!(handle.version(), 0);
+
+        handle.bump();
+        assert_eq!(handle.version(), 1);
+
+        // Across a thread, so the Release/Acquire pairing is exercised rather
+        // than assumed: the applier bumps on the WAL thread, readers load on
+        // their own.
+        let writer = Arc::clone(&handle);
+        std::thread::spawn(move || {
+            for _ in 0..1_000 {
+                writer.bump();
+            }
+        })
+        .join()
+        .expect("bumper panicked");
+
+        assert_eq!(handle.version(), 1_001);
+    }
+
+    /// Baseline for the standing gate: a handle nobody has read materializes
+    /// nothing. Every commit after the applier starts bumping must keep this
+    /// true for write-only workloads.
+    #[test]
+    fn materialization_counter_starts_at_zero() {
+        let handle = live_handle();
+        assert_eq!(handle.materializations(), 0);
+        assert!(handle.cached().is_none());
+
+        handle.bump();
+        handle.bump();
+        assert_eq!(
+            handle.materializations(),
+            0,
+            "bumping a version must not build a snapshot"
+        );
+
+        handle.store(Arc::new(LiveSet::new(2, bm(&[3]))));
+        assert_eq!(handle.materializations(), 1);
     }
 }
