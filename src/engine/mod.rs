@@ -830,7 +830,13 @@ impl Db {
     /// lock-free against the reader; concurrent searches do not serialize.
     pub fn search(&self, collection: u32, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
         let coll = self.collection(collection)?;
-        coll.reader.search(query, k)
+        // The SNAPSHOT is the authority, not the flat index's own view of what
+        // exists. `flat.write_at` runs first in the fan-out, so without this a
+        // bare SEARCH could rank a vector that a scan issued at the same instant
+        // would not show — one collection, two answers.
+        let live = coll.live.resolve();
+        coll.reader
+            .search_filtered(query, k, Some(live.bits()), None)
     }
 
     /// Brute-force top-`k` search within `collection`, restricted to `allowed`.
@@ -847,7 +853,9 @@ impl Db {
         allowed: &RoaringBitmap,
     ) -> Result<Vec<SearchResult>> {
         let coll = self.collection(collection)?;
-        coll.reader.search_filtered(query, k, Some(allowed))
+        let live = coll.live.resolve();
+        coll.reader
+            .search_filtered(query, k, Some(live.bits()), Some(allowed))
     }
 
     /// Create a new collection through the WAL (Phase 6): DDL is a mutation,

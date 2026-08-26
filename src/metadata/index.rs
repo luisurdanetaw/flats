@@ -657,6 +657,14 @@ pub struct LiveSet {
     /// it.
     version: u64,
     live: RoaringBitmap,
+    /// The same set as a flat bitset, ordinal-indexed, LSB-first within each
+    /// word. Built once per snapshot so the brute-force search loop keeps a
+    /// single AND as its inner liveness test: a roaring `contains` per ordinal
+    /// would put a search structure lookup in front of every dot product.
+    ///
+    /// Sized to the highest live ordinal, not to capacity — an ordinal past the
+    /// end is simply not live.
+    bits: Box<[u64]>,
 }
 
 impl LiveSet {
@@ -668,7 +676,16 @@ impl LiveSet {
     /// Deliberately NOT public: a caller outside this module cannot honour that
     /// rule, and a forged version label poisons the cache permanently.
     pub(crate) fn new(version: u64, live: RoaringBitmap) -> LiveSet {
-        LiveSet { version, live }
+        let words = live.max().map_or(0, |m| m as usize / 64 + 1);
+        let mut bits = vec![0u64; words];
+        for o in live.iter() {
+            bits[o as usize / 64] |= 1 << (o % 64);
+        }
+        LiveSet {
+            version,
+            live,
+            bits: bits.into_boxed_slice(),
+        }
     }
 
     /// The version this snapshot reflects.
@@ -678,7 +695,16 @@ impl LiveSet {
 
     /// Is `ordinal` alive in this snapshot?
     pub fn contains(&self, ordinal: u32) -> bool {
-        self.live.contains(ordinal)
+        let word = ordinal as usize / 64;
+        self.bits.get(word).is_some_and(|w| w >> (ordinal % 64) & 1 == 1)
+    }
+
+    /// The flat bitset form, ordinal-indexed, LSB-first within each word.
+    ///
+    /// For scan loops that test liveness per ordinal and cannot afford a
+    /// roaring lookup. An ordinal at or past `bits().len() * 64` is not live.
+    pub fn bits(&self) -> &[u64] {
+        &self.bits
     }
 
     /// How many ordinals are alive.
@@ -1513,6 +1539,39 @@ mod tests {
             );
             assert_eq!(set.len(), 4);
         }
+    }
+
+    /// A `LiveSet` carries the same set twice — roaring for intersecting with
+    /// posting lists, a flat bitset for the search loop's inner test. Two
+    /// representations of one truth is a correctness risk in itself, so they
+    /// are pinned against each other across sparse, dense, and word-boundary
+    /// ordinals.
+    #[test]
+    fn bits_and_bitmap_agree() {
+        let ords = [0u32, 1, 63, 64, 65, 127, 128, 4_095, 100_000];
+        let set = LiveSet::new(1, ords.iter().copied().collect());
+
+        for o in 0..=200u32 {
+            assert_eq!(
+                set.contains(o),
+                set.bitmap().contains(o),
+                "representations disagree at ordinal {o}"
+            );
+        }
+        for o in ords {
+            assert!(set.contains(o), "ordinal {o} should be live");
+        }
+        // Past the end of the bitset is simply not live, not a panic.
+        assert!(!set.contains(100_001));
+        assert!(!set.contains(u32::MAX));
+
+        // Sized to the highest live ordinal, not to some capacity.
+        assert_eq!(set.bits().len(), 100_000 / 64 + 1);
+
+        // An empty set has no words at all and still answers.
+        let empty = LiveSet::new(0, RoaringBitmap::new());
+        assert!(empty.bits().is_empty());
+        assert!(!empty.contains(0));
     }
 
     /// Baseline for the standing gate: a handle nobody has read materializes

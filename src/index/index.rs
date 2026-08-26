@@ -605,10 +605,16 @@ impl Reader {
         Some(&vectors[start..end])
     }
 
-    /// Brute-force top-`k` search. Tombstoned ordinals are skipped. Results are
-    /// most-similar (highest dot product) first.
+    /// Brute-force top-`k` search over EVERY committed vector, minus this
+    /// index's own tombstones. Results are most-similar first.
+    ///
+    /// This form consults no liveness snapshot, so it can rank a row that the
+    /// rest of the engine does not consider live yet. Callers that answer user
+    /// queries want [`search_filtered`](Self::search_filtered) with the
+    /// collection's snapshot; this stays for tests and for index-level work
+    /// that has no snapshot to speak of.
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
-        self.search_filtered(query, k, None)
+        self.search_filtered(query, k, None, None)
     }
 
     /// Brute-force top-`k` search restricted to `allowed`.
@@ -619,7 +625,15 @@ impl Reader {
     /// nearest neighbours happen not to match — and would look entirely
     /// plausible while doing it.
     ///
-    /// `None` means "no restriction" and is exactly [`Reader::search`].
+    /// `live` is the collection's liveness snapshot as a flat bitset (LSB-first
+    /// within each word, indexed by ordinal). It is a SECOND prefilter and the
+    /// authoritative one: an ordinal past the end of the slice, or with its bit
+    /// clear, is not live. Passing a raw slice rather than the snapshot type
+    /// keeps this module free of any dependency on the metadata layer, and
+    /// keeps the inner test to one shift and one AND.
+    ///
+    /// Both filters `None` means "no restriction" and is exactly
+    /// [`Reader::search`].
     ///
     /// Still a full pass over the vectors. A very selective filter would be
     /// better served by iterating the bitmap and fetching those rows directly,
@@ -629,6 +643,7 @@ impl Reader {
         &self,
         query: &[f32],
         k: usize,
+        live: Option<&[u64]>,
         allowed: Option<&RoaringBitmap>,
     ) -> Result<Vec<SearchResult>> {
         let dim = self.inner.dim.get();
@@ -654,6 +669,14 @@ impl Reader {
 
         for (id, v) in vectors.chunks_exact(dim).enumerate() {
             if self.inner.is_deleted(id) {
+                continue;
+            }
+            // The liveness snapshot: one shift and one AND, in front of the dot
+            // product. A row the snapshot does not admit is not this query's to
+            // return, however close it happens to be.
+            if let Some(live) = live
+                && live.get(id / 64).is_none_or(|w| w >> (id % 64) & 1 == 0)
+            {
                 continue;
             }
             // The prefilter, applied BEFORE the distance is even computed —
@@ -983,6 +1006,125 @@ mod tests {
         );
 
         assert_visibility_parity(&r, 2);
+    }
+
+    /// Bare search must obey the liveness snapshot, not just its own
+    /// tombstones. The flat index still HOLDS every one of these vectors and
+    /// has tombstoned none of them; the snapshot alone decides.
+    ///
+    /// This is the split-authority fix in its smallest form. Before it,
+    /// `search` had no snapshot to consult and would happily rank a row the
+    /// rest of the engine did not consider live — a vector is searchable the
+    /// instant `write_at` lands, which is strictly before the metadata index
+    /// hears about it.
+    #[test]
+    fn search_obeys_the_liveness_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.idx");
+        let (mut w, r) = FlatIndex::create(&path, NonZeroUsize::new(2).unwrap(), 8).unwrap();
+        for (o, v) in [[1.0, 0.0], [0.9, 0.1], [0.8, 0.2], [0.7, 0.3]]
+            .into_iter()
+            .enumerate()
+        {
+            w.write_at(o as u64, &v).unwrap();
+        }
+
+        // No snapshot: every vector is fair game.
+        let all = r.search(&[1.0, 0.0], 4).unwrap();
+        assert_eq!(ids(&all), vec![0, 1, 2, 3]);
+
+        // A snapshot that omits the two best matches. They are NOT tombstoned —
+        // `search` must exclude them purely on the snapshot's say-so.
+        let live = bits(&[2, 3]);
+        let filtered = r.search_filtered(&[1.0, 0.0], 4, Some(&live), None).unwrap();
+        assert_eq!(ids(&filtered), vec![2, 3]);
+        assert!(
+            r.vector_at(Ordinal(0)).is_some(),
+            "ordinal 0 is still in the index and untombstoned — only the \
+             snapshot excluded it"
+        );
+
+        // An empty snapshot admits nothing, however close the vectors are.
+        let none: [u64; 0] = [];
+        assert!(r.search_filtered(&[1.0, 0.0], 4, Some(&none), None).unwrap().is_empty());
+    }
+
+    /// The two prefilters compose: `k` counts rows that pass BOTH, and neither
+    /// can smuggle a row past the other.
+    #[test]
+    fn snapshot_and_predicate_prefilters_compose() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.idx");
+        let (mut w, r) = FlatIndex::create(&path, NonZeroUsize::new(2).unwrap(), 8).unwrap();
+        for (o, v) in [[1.0, 0.0], [0.9, 0.1], [0.8, 0.2], [0.7, 0.3]]
+            .into_iter()
+            .enumerate()
+        {
+            w.write_at(o as u64, &v).unwrap();
+        }
+
+        let live = bits(&[0, 1, 2]);
+        let allowed: RoaringBitmap = [1u32, 2, 3].into_iter().collect();
+
+        // Intersection is {1, 2}: 0 fails the predicate, 3 fails liveness.
+        let hits = r
+            .search_filtered(&[1.0, 0.0], 4, Some(&live), Some(&allowed))
+            .unwrap();
+        assert_eq!(ids(&hits), vec![1, 2]);
+
+        // With a snapshot covering everything, only the predicate bites — and
+        // the result matches the predicate-only search exactly.
+        let all_live = bits(&[0, 1, 2, 3]);
+        let a = r.search_filtered(&[1.0, 0.0], 4, Some(&all_live), Some(&allowed)).unwrap();
+        let b = r.search_filtered(&[1.0, 0.0], 4, None, Some(&allowed)).unwrap();
+        assert_eq!(ids(&a), ids(&b));
+        assert_eq!(ids(&a), vec![1, 2, 3]);
+    }
+
+    /// A tombstone and the snapshot are ANDed, not alternatives: either one
+    /// excludes a row on its own.
+    #[test]
+    fn tombstone_and_snapshot_both_exclude() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.idx");
+        let (mut w, r) = FlatIndex::create(&path, NonZeroUsize::new(2).unwrap(), 8).unwrap();
+        for (o, v) in [[1.0, 0.0], [0.9, 0.1], [0.8, 0.2]].into_iter().enumerate() {
+            w.write_at(o as u64, &v).unwrap();
+        }
+        w.delete(1).unwrap();
+
+        // 1 is tombstoned but present in the snapshot; 2 is live but absent.
+        let live = bits(&[0, 1]);
+        let hits = r.search_filtered(&[1.0, 0.0], 3, Some(&live), None).unwrap();
+        assert_eq!(ids(&hits), vec![0]);
+    }
+
+    /// Ordinal-indexed, LSB-first within each word — the layout
+    /// `search_filtered` decodes. A mismatch here silently filters the wrong
+    /// rows, so it is pinned rather than assumed.
+    #[test]
+    fn live_bits_layout_is_ordinal_indexed_lsb_first() {
+        assert_eq!(bits(&[0]), vec![1u64]);
+        assert_eq!(bits(&[1]), vec![2u64]);
+        assert_eq!(bits(&[63]), vec![1u64 << 63]);
+        assert_eq!(bits(&[64]), vec![0u64, 1]);
+        assert_eq!(bits(&[0, 64, 65]), vec![1u64, 0b11]);
+    }
+
+    /// Build a liveness bitset the way `LiveSet` does.
+    fn bits(ordinals: &[u32]) -> Vec<u64> {
+        let words = ordinals.iter().max().map_or(0, |m| *m as usize / 64 + 1);
+        let mut out = vec![0u64; words];
+        for o in ordinals {
+            out[*o as usize / 64] |= 1 << (o % 64);
+        }
+        out
+    }
+
+    fn ids(hits: &[SearchResult]) -> Vec<u32> {
+        let mut v: Vec<u32> = hits.iter().map(|h| h.id.0).collect();
+        v.sort_unstable();
+        v
     }
 
     #[test]

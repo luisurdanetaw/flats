@@ -574,6 +574,18 @@ fn live_then_get_under_concurrent_writes() {
     }
 }
 
+// NOTE: bare SEARCH's liveness is NOT tested here, deliberately.
+//
+// A concurrent version of it was written and thrown away: with the applier
+// publishing liveness last, the interval in which a vector is searchable but
+// not yet live is a few microseconds, and a single `search` call takes longer
+// than that. The test scored **578,524 searches / 2,314,096 hits / 0
+// violations** against the KNOWN-BROKEN implementation — it could not tell the
+// two apart, and an always-green test is worse than no test.
+//
+// The property is asserted deterministically instead, in `index.rs`, by handing
+// `search_filtered` a snapshot that excludes a row the flat index still holds.
+
 // ---------------------------------------------------------------------------
 // 3. SNAPSHOT SAFETY — no snapshot admits a row the stores don't hold
 // ---------------------------------------------------------------------------
