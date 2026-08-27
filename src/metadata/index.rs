@@ -583,31 +583,50 @@ impl Writer {
 // ---------------------------------------------------------------------------
 
 impl Reader {
-    /// Ordinals where `col == value`, tombstones already masked out.
+    /// Ordinals where `col == value`, masked to `live`.
     ///
-    /// The `& live` mask is THE correctness rule: tombstoned ordinals must
-    /// never leak out of this module. Applied here, centrally, so no
-    /// ColumnStore can forget it.
-    pub fn lookup_eq(&self, col: ColumnId, value: &Value) -> Result<RoaringBitmap> {
+    /// The mask is THE correctness rule: retired ordinals must never leak out
+    /// of this module. Applied here, centrally, so no ColumnStore can forget
+    /// it.
+    ///
+    /// The snapshot is REQUIRED, and that is the point. Masking against the
+    /// index's current liveness instead would make every lookup in a query
+    /// answer as of a different instant — two predicates ORed together could
+    /// then produce a row set matching no single moment in time. A caller must
+    /// say which snapshot its answer is relative to, and use that same one for
+    /// the whole query.
+    pub fn lookup_eq(
+        &self,
+        col: ColumnId,
+        value: &Value,
+        live: &LiveSet,
+    ) -> Result<RoaringBitmap> {
         let inner = self.lock();
         let store = inner
             .columns
             .get(col as usize)
             .ok_or(Error::UnknownColumn { column: col })?;
         let bm = store.lookup_eq(col, value)?;
-        Ok(bm & &inner.live)
+        Ok(bm & live.bitmap())
     }
 
-    /// Ordinals where `col <op> value`, tombstones masked. TEXT columns
-    /// yield empty (defense-in-depth).
-    pub fn lookup_range(&self, col: ColumnId, op: RangeOp, value: &Value) -> Result<RoaringBitmap> {
+    /// Ordinals where `col <op> value`, masked to `live`. TEXT columns yield
+    /// empty (defense-in-depth). Snapshot required — see
+    /// [`lookup_eq`](Self::lookup_eq).
+    pub fn lookup_range(
+        &self,
+        col: ColumnId,
+        op: RangeOp,
+        value: &Value,
+        live: &LiveSet,
+    ) -> Result<RoaringBitmap> {
         let inner = self.lock();
         let store = inner
             .columns
             .get(col as usize)
             .ok_or(Error::UnknownColumn { column: col })?;
         let bm = store.lookup_range(col, op, value)?;
-        Ok(bm & &inner.live)
+        Ok(bm & live.bitmap())
     }
 
     /// Clone of the live bitmap. The executor (later) uses this as the
@@ -620,8 +639,16 @@ impl Reader {
         self.lock().live.len()
     }
 
-    /// A [`LiveHandle`] over the same inner state, for publishing and
-    /// resolving version-tagged liveness snapshots.
+    /// A NEW [`LiveHandle`] over the same inner state.
+    ///
+    /// **Creates a fresh handle with its own version counter starting at zero,
+    /// and its own cache.** Only whoever owns the applier bumps a counter, so a
+    /// second handle over a live collection would never be invalidated and
+    /// would serve its first snapshot forever. Exactly one is created per
+    /// collection, when the collection is opened.
+    ///
+    /// To observe an open collection's liveness, ask the engine for a snapshot
+    /// (`Db::live_snapshot`) rather than minting a handle here.
     pub fn live_handle(&self) -> LiveHandle {
         LiveHandle {
             inner: Arc::clone(&self.inner),
@@ -1027,6 +1054,11 @@ mod tests {
         ]
     }
 
+    /// A snapshot of whatever is live right now — what a query would resolve.
+    fn live_now(r: &Reader) -> LiveSet {
+        LiveSet::new(0, r.live())
+    }
+
     fn bm(ords: &[u32]) -> RoaringBitmap {
         ords.iter().copied().collect()
     }
@@ -1048,14 +1080,14 @@ mod tests {
         w.insert_row(Ordinal(1), &row(2, 2.5, "y")).unwrap();
         w.insert_row(Ordinal(2), &row(3, 3.5, "x")).unwrap(); // "x" repeats
 
-        assert_eq!(r.lookup_eq(0, &Value::Int(2)).unwrap(), bm(&[1]));
-        assert_eq!(r.lookup_eq(1, &Value::Float(3.5)).unwrap(), bm(&[2]));
-        assert_eq!(r.lookup_eq(2, &Value::Text("x".into())).unwrap(), bm(&[0, 2]));
+        assert_eq!(r.lookup_eq(0, &Value::Int(2), &live_now(&r)).unwrap(), bm(&[1]));
+        assert_eq!(r.lookup_eq(1, &Value::Float(3.5), &live_now(&r)).unwrap(), bm(&[2]));
+        assert_eq!(r.lookup_eq(2, &Value::Text("x".into()), &live_now(&r)).unwrap(), bm(&[0, 2]));
 
         // Never-inserted values → empty bitmap, not Err.
-        assert_eq!(r.lookup_eq(0, &Value::Int(99)).unwrap(), bm(&[]));
-        assert_eq!(r.lookup_eq(1, &Value::Float(9.9)).unwrap(), bm(&[]));
-        assert_eq!(r.lookup_eq(2, &Value::Text("zzz".into())).unwrap(), bm(&[]));
+        assert_eq!(r.lookup_eq(0, &Value::Int(99), &live_now(&r)).unwrap(), bm(&[]));
+        assert_eq!(r.lookup_eq(1, &Value::Float(9.9), &live_now(&r)).unwrap(), bm(&[]));
+        assert_eq!(r.lookup_eq(2, &Value::Text("zzz".into()), &live_now(&r)).unwrap(), bm(&[]));
     }
 
     #[test]
@@ -1069,37 +1101,37 @@ mod tests {
 
         // INT against 2.
         let v = Value::Int(2);
-        assert_eq!(r.lookup_range(0, RangeOp::Lt, &v).unwrap(), bm(&[0]));
-        assert_eq!(r.lookup_range(0, RangeOp::Le, &v).unwrap(), bm(&[0, 1]));
-        assert_eq!(r.lookup_range(0, RangeOp::Gt, &v).unwrap(), bm(&[2]));
-        assert_eq!(r.lookup_range(0, RangeOp::Ge, &v).unwrap(), bm(&[1, 2]));
+        assert_eq!(r.lookup_range(0, RangeOp::Lt, &v, &live_now(&r)).unwrap(), bm(&[0]));
+        assert_eq!(r.lookup_range(0, RangeOp::Le, &v, &live_now(&r)).unwrap(), bm(&[0, 1]));
+        assert_eq!(r.lookup_range(0, RangeOp::Gt, &v, &live_now(&r)).unwrap(), bm(&[2]));
+        assert_eq!(r.lookup_range(0, RangeOp::Ge, &v, &live_now(&r)).unwrap(), bm(&[1, 2]));
 
         // FLOAT against 2.0.
         let v = Value::Float(2.0);
-        assert_eq!(r.lookup_range(1, RangeOp::Lt, &v).unwrap(), bm(&[0]));
-        assert_eq!(r.lookup_range(1, RangeOp::Le, &v).unwrap(), bm(&[0, 1]));
-        assert_eq!(r.lookup_range(1, RangeOp::Gt, &v).unwrap(), bm(&[2]));
-        assert_eq!(r.lookup_range(1, RangeOp::Ge, &v).unwrap(), bm(&[1, 2]));
+        assert_eq!(r.lookup_range(1, RangeOp::Lt, &v, &live_now(&r)).unwrap(), bm(&[0]));
+        assert_eq!(r.lookup_range(1, RangeOp::Le, &v, &live_now(&r)).unwrap(), bm(&[0, 1]));
+        assert_eq!(r.lookup_range(1, RangeOp::Gt, &v, &live_now(&r)).unwrap(), bm(&[2]));
+        assert_eq!(r.lookup_range(1, RangeOp::Ge, &v, &live_now(&r)).unwrap(), bm(&[1, 2]));
 
         // Bound BETWEEN keys.
         let v = Value::Float(2.5);
-        assert_eq!(r.lookup_range(1, RangeOp::Lt, &v).unwrap(), bm(&[0, 1]));
-        assert_eq!(r.lookup_range(1, RangeOp::Gt, &v).unwrap(), bm(&[2]));
+        assert_eq!(r.lookup_range(1, RangeOp::Lt, &v, &live_now(&r)).unwrap(), bm(&[0, 1]));
+        assert_eq!(r.lookup_range(1, RangeOp::Gt, &v, &live_now(&r)).unwrap(), bm(&[2]));
 
         // Bounds OUTSIDE the key range.
-        assert_eq!(r.lookup_range(0, RangeOp::Lt, &Value::Int(0)).unwrap(), bm(&[]));
-        assert_eq!(r.lookup_range(0, RangeOp::Ge, &Value::Int(0)).unwrap(), bm(&[0, 1, 2]));
-        assert_eq!(r.lookup_range(0, RangeOp::Gt, &Value::Int(100)).unwrap(), bm(&[]));
-        assert_eq!(r.lookup_range(0, RangeOp::Le, &Value::Int(100)).unwrap(), bm(&[0, 1, 2]));
+        assert_eq!(r.lookup_range(0, RangeOp::Lt, &Value::Int(0), &live_now(&r)).unwrap(), bm(&[]));
+        assert_eq!(r.lookup_range(0, RangeOp::Ge, &Value::Int(0), &live_now(&r)).unwrap(), bm(&[0, 1, 2]));
+        assert_eq!(r.lookup_range(0, RangeOp::Gt, &Value::Int(100), &live_now(&r)).unwrap(), bm(&[]));
+        assert_eq!(r.lookup_range(0, RangeOp::Le, &Value::Int(100), &live_now(&r)).unwrap(), bm(&[0, 1, 2]));
 
         // -0.0 and +0.0 land on the same normalized key.
         let mut w2 = w;
         w2.insert_row(Ordinal(3), &row(0, -0.0, "z")).unwrap();
-        assert_eq!(r.lookup_eq(1, &Value::Float(0.0)).unwrap(), bm(&[3]));
-        assert_eq!(r.lookup_eq(1, &Value::Float(-0.0)).unwrap(), bm(&[3]));
+        assert_eq!(r.lookup_eq(1, &Value::Float(0.0), &live_now(&r)).unwrap(), bm(&[3]));
+        assert_eq!(r.lookup_eq(1, &Value::Float(-0.0), &live_now(&r)).unwrap(), bm(&[3]));
         // And range bounds treat them identically: nothing is < -0.0 here.
-        assert_eq!(r.lookup_range(1, RangeOp::Lt, &Value::Float(-0.0)).unwrap(), bm(&[]));
-        assert_eq!(r.lookup_range(1, RangeOp::Le, &Value::Float(-0.0)).unwrap(), bm(&[3]));
+        assert_eq!(r.lookup_range(1, RangeOp::Lt, &Value::Float(-0.0), &live_now(&r)).unwrap(), bm(&[]));
+        assert_eq!(r.lookup_range(1, RangeOp::Le, &Value::Float(-0.0), &live_now(&r)).unwrap(), bm(&[3]));
     }
 
     #[test]
@@ -1113,10 +1145,10 @@ mod tests {
         }
         w.remove_row(Ordinal(1)).unwrap();
 
-        assert_eq!(r.lookup_eq(2, &Value::Text("same".into())).unwrap(), bm(&[0, 2]));
-        assert_eq!(r.lookup_eq(0, &Value::Int(1)).unwrap(), bm(&[]));
+        assert_eq!(r.lookup_eq(2, &Value::Text("same".into()), &live_now(&r)).unwrap(), bm(&[0, 2]));
+        assert_eq!(r.lookup_eq(0, &Value::Int(1), &live_now(&r)).unwrap(), bm(&[]));
         assert_eq!(
-            r.lookup_range(0, RangeOp::Ge, &Value::Int(0)).unwrap(),
+            r.lookup_range(0, RangeOp::Ge, &Value::Int(0), &live_now(&r)).unwrap(),
             bm(&[0, 2])
         );
         assert_eq!(r.live(), bm(&[0, 2]));
@@ -1132,14 +1164,14 @@ mod tests {
         w.insert_row(Ordinal(0), &the_row).unwrap();
         // Insert twice with the identical row: set semantics, same state.
         w.insert_row(Ordinal(0), &the_row).unwrap();
-        assert_eq!(r.lookup_eq(0, &Value::Int(7)).unwrap(), bm(&[0]));
+        assert_eq!(r.lookup_eq(0, &Value::Int(7), &live_now(&r)).unwrap(), bm(&[0]));
         assert_eq!(r.live_count(), 1);
 
         // Remove twice → same state, no Err.
         w.remove_row(Ordinal(0)).unwrap();
         w.remove_row(Ordinal(0)).unwrap();
         assert_eq!(r.live_count(), 0);
-        assert_eq!(r.lookup_eq(0, &Value::Int(7)).unwrap(), bm(&[]));
+        assert_eq!(r.lookup_eq(0, &Value::Int(7), &live_now(&r)).unwrap(), bm(&[]));
 
         // Remove a never-inserted ordinal → no Err.
         w.remove_row(Ordinal(999)).unwrap();
@@ -1158,8 +1190,8 @@ mod tests {
         ));
         // Validate-before-mutate: nothing was half-inserted.
         assert_eq!(r.live_count(), 0);
-        assert_eq!(r.lookup_eq(0, &Value::Int(1)).unwrap(), bm(&[]));
-        assert_eq!(r.lookup_eq(2, &Value::Text("x".into())).unwrap(), bm(&[]));
+        assert_eq!(r.lookup_eq(0, &Value::Int(1), &live_now(&r)).unwrap(), bm(&[]));
+        assert_eq!(r.lookup_eq(2, &Value::Text("x".into()), &live_now(&r)).unwrap(), bm(&[]));
     }
 
     #[test]
@@ -1169,15 +1201,15 @@ mod tests {
         w.insert_row(Ordinal(0), &row(1, 1.0, "x")).unwrap();
 
         assert!(matches!(
-            r.lookup_eq(99, &Value::Int(1)),
+            r.lookup_eq(99, &Value::Int(1), &live_now(&r)),
             Err(Error::UnknownColumn { column: 99 })
         ));
         assert!(matches!(
-            r.lookup_range(99, RangeOp::Lt, &Value::Int(1)),
+            r.lookup_range(99, RangeOp::Lt, &Value::Int(1), &live_now(&r)),
             Err(Error::UnknownColumn { column: 99 })
         ));
         assert!(matches!(
-            r.lookup_eq(0, &Value::Text("x".into())),
+            r.lookup_eq(0, &Value::Text("x".into()), &live_now(&r)),
             Err(Error::TypeMismatch {
                 column: 0,
                 expected: ColumnType::Int,
@@ -1185,7 +1217,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            r.lookup_range(0, RangeOp::Lt, &Value::Float(1.0)),
+            r.lookup_range(0, RangeOp::Lt, &Value::Float(1.0), &live_now(&r)),
             Err(Error::TypeMismatch { .. })
         ));
 
@@ -1209,7 +1241,7 @@ mod tests {
         w.insert_row(Ordinal(0), &row(1, 1.0, "x")).unwrap();
 
         for op in [RangeOp::Lt, RangeOp::Le, RangeOp::Gt, RangeOp::Ge] {
-            let got = r.lookup_range(2, op, &Value::Text("x".into())).unwrap();
+            let got = r.lookup_range(2, op, &Value::Text("x".into()), &live_now(&r)).unwrap();
             assert_eq!(got, bm(&[]), "range on TEXT must be empty, op {op:?}");
         }
     }
@@ -1229,10 +1261,10 @@ mod tests {
         let (_w, r, lsn) = MetadataIndex::open(dir.path(), test_schema()).unwrap();
         assert_eq!(lsn, Lsn(7));
         assert_eq!(r.live(), bm(&[0, 2]));
-        assert_eq!(r.lookup_eq(2, &Value::Text("x".into())).unwrap(), bm(&[0, 2]));
-        assert_eq!(r.lookup_eq(0, &Value::Int(2)).unwrap(), bm(&[])); // tombstoned
+        assert_eq!(r.lookup_eq(2, &Value::Text("x".into()), &live_now(&r)).unwrap(), bm(&[0, 2]));
+        assert_eq!(r.lookup_eq(0, &Value::Int(2), &live_now(&r)).unwrap(), bm(&[])); // tombstoned
         assert_eq!(
-            r.lookup_range(1, RangeOp::Ge, &Value::Float(2.0)).unwrap(),
+            r.lookup_range(1, RangeOp::Ge, &Value::Float(2.0), &live_now(&r)).unwrap(),
             bm(&[2])
         );
     }
@@ -1251,7 +1283,7 @@ mod tests {
             let (_w, r, lsn) = MetadataIndex::open(dir, test_schema()).unwrap();
             assert_eq!(lsn, Lsn(0));
             assert_eq!(r.live_count(), 0);
-            assert_eq!(r.lookup_eq(0, &Value::Int(1)).unwrap(), bm(&[]));
+            assert_eq!(r.lookup_eq(0, &Value::Int(1), &live_now(&r)).unwrap(), bm(&[]));
         };
 
         // Flip one byte in the middle.
@@ -1286,7 +1318,7 @@ mod tests {
 
         let (mut w, r, lsn) = MetadataIndex::open(dir.path(), test_schema()).unwrap();
         assert_eq!(lsn, Lsn(5), "good snap must load; tmp must be ignored");
-        assert_eq!(r.lookup_eq(0, &Value::Int(1)).unwrap(), bm(&[0]));
+        assert_eq!(r.lookup_eq(0, &Value::Int(1), &live_now(&r)).unwrap(), bm(&[0]));
 
         // A fresh checkpoint overwrites the stale tmp and succeeds.
         w.insert_row(Ordinal(1), &row(2, 2.0, "y")).unwrap();

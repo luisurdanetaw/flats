@@ -58,6 +58,7 @@
 //! [`split_record`] cuts it into the embedding (flat index) and the
 //! `ColumnId`-keyed row (tuple store), because those go to different stores.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -70,7 +71,7 @@ use crate::engine::cursor::Cursor;
 use crate::engine::{CollectionId, Db};
 use crate::error::Error;
 use crate::metadata::common::{Ordinal, Schema, Value};
-use crate::metadata::index as meta;
+use crate::metadata::index::{self as meta, LiveSet};
 use crate::vm::record::{Record, SplitError, split_record};
 use crate::vm::value;
 
@@ -256,6 +257,21 @@ pub struct Vm {
     /// a stream's open cursor survives across `step` calls, which is what lets
     /// the next call resume the scan instead of restarting it.
     cursors: Vec<Slot>,
+    /// ONE liveness snapshot per collection, for the life of this query.
+    ///
+    /// Resolved on first use and reused by every operation afterwards, which is
+    /// what makes a query's answer correspond to a single instant. Without it
+    /// each predicate would mask against whatever was live when IT ran, and a
+    /// two-predicate `WHERE` could return a row set matching no moment in time.
+    ///
+    /// Keyed by collection name because that is what the opcodes carry. Lives
+    /// on the `Vm` rather than in a local so it survives across `step` calls —
+    /// a stream is stepped many times and must not change its mind midway.
+    /// Behind a `RefCell` because the dispatch loop holds a shared borrow of
+    /// `self.program` for the instruction it is running, so the ops cannot take
+    /// `&mut self`. Only the cache-miss path ever borrows it mutably, and never
+    /// across a call that could re-enter.
+    live: RefCell<HashMap<String, Arc<LiveSet>>>,
 }
 
 impl Vm {
@@ -275,6 +291,7 @@ impl Vm {
             pc: 0,
             regs,
             cursors,
+            live: RefCell::new(HashMap::new()),
         })
     }
 
@@ -293,6 +310,7 @@ impl Vm {
             pc: 0,
             regs: Vec::new(),
             cursors: Vec::new(),
+            live: RefCell::new(HashMap::new()),
         }
     }
 
@@ -455,8 +473,11 @@ impl Vm {
                     let (col, value, dst) = (*col, *value, *dst);
                     let db = db.ok_or(ExecError::Detached { op: "BitmapEq" })?;
                     let meta = self.metadata(db, collection)?;
+                    let live = self.live_set(db, collection)?;
                     let needle = self.value(value)?;
-                    let found = meta.lookup_eq(col, &needle).map_err(ExecError::Engine)?;
+                    let found = meta
+                        .lookup_eq(col, &needle, &live)
+                        .map_err(ExecError::Engine)?;
                     self.store(dst, RegValue::Bitmap(Arc::new(found)))?;
                 }
                 Op::BitmapRange {
@@ -469,9 +490,10 @@ impl Vm {
                     let (col, op, value, dst) = (*col, *op, *value, *dst);
                     let db = db.ok_or(ExecError::Detached { op: "BitmapRange" })?;
                     let meta = self.metadata(db, collection)?;
+                    let live = self.live_set(db, collection)?;
                     let needle = self.value(value)?;
                     let found = meta
-                        .lookup_range(col, op, &needle)
+                        .lookup_range(col, op, &needle, &live)
                         .map_err(ExecError::Engine)?;
                     self.store(dst, RegValue::Bitmap(Arc::new(found)))?;
                 }
@@ -494,12 +516,14 @@ impl Vm {
                 } => {
                     let (src, dst) = (*src, *dst);
                     let db = db.ok_or(ExecError::Detached { op: "BitmapNot" })?;
-                    let meta = self.metadata(db, collection)?;
+                    let live = self.live_set(db, collection)?;
                     let inner = self.bitmap(src)?;
-                    // Complement within the LIVE set, not the whole ordinal
-                    // space: a deleted row satisfies no predicate, so negating
-                    // one must not resurrect it.
-                    let out = meta.live() - inner.as_ref();
+                    // Complement within THIS QUERY'S snapshot, not the whole
+                    // ordinal space and not current liveness: a retired row
+                    // satisfies no predicate, so negating one must not
+                    // resurrect it — and the operand it is being subtracted
+                    // from was masked with this same snapshot.
+                    let out = live.bitmap() - inner.as_ref();
                     self.store(dst, RegValue::Bitmap(Arc::new(out)))?;
                 }
 
@@ -512,16 +536,29 @@ impl Vm {
                     let (cur, filter) = (*cur, *filter);
                     let db = db.ok_or(ExecError::Detached { op: "OpenRead" })?;
                     let collection_id = db.collection_id(collection).map_err(ExecError::Engine)?;
-                    // `scan` snapshots `live()` HERE, so the row SET is fixed
-                    // for this scan — but the ROWS are not read yet. The cursor
-                    // is positioned before the first row and fetches one at a
-                    // time, which is what makes the loop below lazy.
+                    // The row SET is fixed HERE, from this query's snapshot —
+                    // but the ROWS are not read yet. The cursor is positioned
+                    // before the first row and fetches one at a time, which is
+                    // what makes the loop below lazy.
+                    //
+                    // Not `Db::scan`, which would resolve a snapshot of its own:
+                    // an unfiltered scan and a filtered one must enumerate the
+                    // same live set, or the presence of a `WHERE` would change
+                    // which instant the query answers as of.
                     //
                     // A `WHERE` replaces that snapshot with the predicate's
-                    // bitmap. Nothing else about the loop changes: a cursor is
-                    // an ordinal source, and both are ordinal sources.
+                    // bitmap — already masked with the same snapshot. Nothing
+                    // else about the loop changes: a cursor is an ordinal
+                    // source, and both are ordinal sources.
                     let cursor = match filter {
-                        None => db.scan(collection_id).map_err(ExecError::Engine)?,
+                        None => {
+                            let live = self.live_set(db, collection)?;
+                            db.scan_over(
+                                collection_id,
+                                live.iter().collect::<Vec<u32>>().into_iter().map(Ordinal),
+                            )
+                            .map_err(ExecError::Engine)?
+                        }
                         Some(reg) => {
                             let bitmap = self.bitmap(reg)?;
                             db.scan_over(
@@ -582,19 +619,31 @@ impl Vm {
                     let collection_id = db.collection_id(collection).map_err(ExecError::Engine)?;
                     let k = usize::try_from(k).map_err(|_| ExecError::TopKOverflow { k })?;
                     // The one coarse opcode: a whole SIMD top-k pass, not a
-                    // per-element interpreted loop. `search` already returns
-                    // most-similar first and excludes tombstones.
+                    // per-element interpreted loop. Results come back
+                    // most-similar first.
+                    //
+                    // Goes to the index reader rather than `Db::search`, which
+                    // would resolve a snapshot of its OWN: the ranking has to
+                    // see the same live set the `WHERE` bitmap was masked with,
+                    // or `TOP k` could rank a row the predicate had already
+                    // ruled out of existence.
                     //
                     // With a `WHERE`, the bitmap goes IN to the ranking rather
                     // than being applied to its output: `TOP k` must count rows
                     // that satisfy the predicate, so filtering afterwards would
                     // return fewer than `k` whenever the nearest neighbours
                     // happen not to match — and look entirely plausible.
+                    let live = self.live_set(db, collection)?;
+                    let reader = db.reader(collection_id).ok_or(ExecError::Engine(
+                        crate::Error::UnknownCollectionName {
+                            name: collection.to_string(),
+                        },
+                    ))?;
                     let hits = match filter {
-                        None => db.search(collection_id, &vector, k),
+                        None => reader.search_filtered(&vector, k, Some(live.bits()), None),
                         Some(reg) => {
                             let bitmap = self.bitmap(reg)?;
-                            db.search_where(collection_id, &vector, k, &bitmap)
+                            reader.search_filtered(&vector, k, Some(live.bits()), Some(&bitmap))
                         }
                     }
                     .map_err(ExecError::Engine)?;
@@ -850,6 +899,26 @@ impl Vm {
     /// The bitmap ops carry a collection NAME rather than a cursor, because a
     /// predicate is evaluated before any cursor is open — its result is what
     /// the cursor will be opened over.
+    /// This query's liveness snapshot for `collection`, resolving it once.
+    ///
+    /// Every operation that needs to know what is live goes through here, so
+    /// they all get the same answer however far apart they run.
+    fn live_set(&self, db: &Db, collection: &str) -> Result<Arc<LiveSet>, ExecError> {
+        if let Some(set) = self.live.borrow().get(collection) {
+            return Ok(Arc::clone(set));
+        }
+        let id = db.collection_id(collection).map_err(ExecError::Engine)?;
+        let set = db.live_snapshot(id).ok_or(ExecError::Engine(
+            crate::Error::UnknownCollectionName {
+                name: collection.to_string(),
+            },
+        ))?;
+        self.live
+            .borrow_mut()
+            .insert(collection.to_string(), Arc::clone(&set));
+        Ok(set)
+    }
+
     fn metadata(&self, db: &Db, collection: &str) -> Result<meta::Reader, ExecError> {
         let id = db.collection_id(collection).map_err(ExecError::Engine)?;
         db.metadata_reader(id).ok_or(ExecError::Engine(
@@ -1158,6 +1227,7 @@ impl std::error::Error for ExecError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use super::{ExecError, OutputRow, RegValue, Vm};
     use crate::compiler::bytecode::{Addr, Cursor, Op, Program, Reg};
     use crate::compiler::constants::{Const, ConstPool};
@@ -1864,6 +1934,47 @@ mod tests {
         let mut vm = Vm::new(select_program()).expect("well-formed");
         assert_eq!(vm.step(&db).expect("reads"), None);
         assert_eq!(vm.pc(), 6, "jumped straight to the Halt");
+        db.close().unwrap();
+    }
+
+    /// A query pins ONE snapshot and keeps it, even when a write lands
+    /// mid-query.
+    ///
+    /// This is the contract that makes a query answer as of a single instant,
+    /// and it cannot be reached from outside: every bitmap op of a `WHERE` runs
+    /// inside one `step`, so a black-box test would have to land a delete in a
+    /// sub-millisecond window between two of them. (Verified the hard way —
+    /// with the cache removed, the entire suite still passes, because
+    /// `LiveHandle::resolve` caches per version and no test can force a write
+    /// between two ops.) So the contract is asserted directly instead.
+    #[test]
+    fn a_query_pins_one_snapshot_across_writes() {
+        let (_dir, db) = docs_db();
+        seed(&db, 8);
+
+        let vm = Vm::new(select_program()).expect("well-formed");
+        let first = vm.live_set(&db, "docs").expect("resolves");
+
+        // Move the version underneath the query.
+        db.delete(0, 0).expect("delete");
+        let fresh = db.live_snapshot(0).expect("collection 0");
+        assert!(
+            fresh.version() > first.version(),
+            "the delete must have moved the version, or this proves nothing"
+        );
+        assert_eq!(fresh.len(), first.len() - 1);
+
+        // A later op in the SAME query still gets the ORIGINAL snapshot.
+        let second = vm.live_set(&db, "docs").expect("resolves");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a second op resolved a different snapshot: v{} then v{} — the query \
+             now answers as of two instants at once",
+            first.version(),
+            second.version()
+        );
+        assert!(second.contains(0), "the pinned snapshot lost a row");
+
         db.close().unwrap();
     }
 

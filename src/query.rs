@@ -1336,6 +1336,73 @@ mod tests {
         authors(db.execute(&sql).expect("the filtered select runs"))
     }
 
+    /// A query answers as of ONE instant, negated predicates included.
+    ///
+    /// `!=` compiles to `BitmapEq` followed by `BitmapNot`, and the complement
+    /// is taken within the live set. Those are two separate reads of liveness
+    /// unless the query pins a snapshot — and if they disagree, the result can
+    /// describe a row set that existed at no moment in time.
+    ///
+    /// Opens the stream, pulls one row so the snapshot is resolved, then
+    /// deletes a row the predicate matches. The stream must still produce it:
+    /// it was live when the query started.
+    #[test]
+    fn a_negated_where_answers_as_of_one_snapshot() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        let mut stream = db
+            .execute("SELECT author FROM docs WHERE published_at != 5;")
+            .expect("compiles");
+
+        // First pull resolves the snapshot; the rest of the scan is pinned to it.
+        let first = stream.next().expect("at least one row").expect("a row");
+        assert!(matches!(&first.0[0], RegValue::Str(s) if s == "alice"));
+
+        // Retire two of the remaining matches out from under the open stream.
+        db.delete(0, 2).expect("delete carol"); // published_at = 1
+        db.delete(0, 3).expect("delete dave"); // published_at = 9
+
+        let mut got = vec!["alice".to_string()];
+        for row in stream {
+            match &row.expect("a row").0[0] {
+                RegValue::Str(s) => got.push(s.clone()),
+                other => panic!("expected an author, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            got,
+            ["alice", "carol", "dave"],
+            "the stream lost rows that were live when it opened"
+        );
+
+        // A query started AFTER the deletes sees the smaller set — the snapshot
+        // held the old rows, it did not fail to notice the deletes.
+        assert_eq!(where_authors(&db, "published_at != 5"), ["alice"]);
+
+        db.close().unwrap();
+    }
+
+    /// A tautological `WHERE` must return exactly what an unfiltered scan does.
+    ///
+    /// `p OR NOT p` exercises both a lookup and a complement in one query, so
+    /// it is the shortest statement that can catch the two disagreeing about
+    /// what is live.
+    #[test]
+    fn a_tautological_where_matches_an_unfiltered_scan() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+        db.delete(0, 1).expect("delete bob");
+
+        let scanned = authors(db.execute("SELECT author FROM docs;").expect("compiles"));
+        let tautology = where_authors(&db, "published_at = 5 OR published_at != 5");
+
+        assert_eq!(tautology, scanned);
+        assert_eq!(scanned, ["alice", "carol", "dave"]);
+
+        db.close().unwrap();
+    }
+
     #[test]
     fn select_where_filters_rows() {
         let (_dir, db) = docs_db();

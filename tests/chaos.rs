@@ -201,7 +201,7 @@ fn verify_metadata(db: &Db, model: &Model, rng: &mut Rng) {
     // lookup_eq on a random INT value and a random TEXT value.
     let a = rng.below(8) as i64;
     let got: BTreeSet<u64> = meta
-        .lookup_eq(0, &Value::Int(a))
+        .lookup_eq(0, &Value::Int(a), &db.live_snapshot(0).unwrap())
         .expect("lookup_eq int")
         .iter()
         .map(u64::from)
@@ -216,7 +216,7 @@ fn verify_metadata(db: &Db, model: &Model, rng: &mut Rng) {
 
     let c = TEXTS[rng.below(TEXTS.len() as u64) as usize];
     let got: BTreeSet<u64> = meta
-        .lookup_eq(2, &Value::Text(c.into()))
+        .lookup_eq(2, &Value::Text(c.into()), &db.live_snapshot(0).unwrap())
         .expect("lookup_eq text")
         .iter()
         .map(u64::from)
@@ -233,7 +233,7 @@ fn verify_metadata(db: &Db, model: &Model, rng: &mut Rng) {
     let bound = rng.below(9) as i64 - 1; // sometimes outside the value range
     let op = [RangeOp::Lt, RangeOp::Le, RangeOp::Gt, RangeOp::Ge][rng.below(4) as usize];
     let got: BTreeSet<u64> = meta
-        .lookup_range(0, op, &Value::Int(bound))
+        .lookup_range(0, op, &Value::Int(bound), &db.live_snapshot(0).unwrap())
         .expect("lookup_range")
         .iter()
         .map(u64::from)

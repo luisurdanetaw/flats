@@ -1433,7 +1433,7 @@ mod tests {
         let tuples = db.tuple_reader(0).unwrap();
 
         // WHERE a < 3 → {0, 1}.
-        let filter = meta.lookup_range(0, RangeOp::Lt, &Value::Int(3)).unwrap();
+        let filter = meta.lookup_range(0, RangeOp::Lt, &Value::Int(3), &db.live_snapshot(0).unwrap()).unwrap();
         assert_eq!(filter.iter().collect::<Vec<u32>>(), vec![0, 1]);
 
         // Intersect with search candidates by hand.
@@ -1453,7 +1453,7 @@ mod tests {
 
         // Delete and re-check exclusion everywhere.
         db.delete(0, 0).unwrap();
-        let filter = meta.lookup_eq(1, &Value::Text("alice".into())).unwrap();
+        let filter = meta.lookup_eq(1, &Value::Text("alice".into()), &db.live_snapshot(0).unwrap()).unwrap();
         assert_eq!(filter.iter().collect::<Vec<u32>>(), vec![2]);
         // Retiring a row clears its live bit and touches nothing else — the
         // values are still there for anyone holding an older snapshot.
@@ -1495,7 +1495,7 @@ mod tests {
         assert!(!meta.live().contains(3));
 
         // Spot-check lookups and values.
-        let evens = meta.lookup_eq(1, &Value::Text("even".into())).unwrap();
+        let evens = meta.lookup_eq(1, &Value::Text("even".into()), &db.live_snapshot(0).unwrap()).unwrap();
         assert_eq!(evens.iter().collect::<Vec<u32>>(), vec![0, 2, 4]);
         assert_eq!(
             tuples.get(Ordinal(4), &[0, 1]).unwrap(),
@@ -1562,7 +1562,7 @@ mod tests {
             let tuples = db.tuple_reader(0).unwrap();
             assert_eq!(meta.live_count(), 1, "victim {victim}");
             assert_eq!(
-                meta.lookup_eq(0, &Value::Int(2)).unwrap().iter().collect::<Vec<u32>>(),
+                meta.lookup_eq(0, &Value::Int(2), &db.live_snapshot(0).unwrap()).unwrap().iter().collect::<Vec<u32>>(),
                 vec![1],
                 "victim {victim}"
             );
@@ -1603,7 +1603,7 @@ mod tests {
         assert_eq!(db.search(1, &[1.0, 0.0, 0.0], 10).unwrap().len(), 1);
         let meta = db.metadata_reader(0).unwrap();
         assert_eq!(
-            meta.lookup_eq(0, &Value::Int(7)).unwrap().iter().collect::<Vec<u32>>(),
+            meta.lookup_eq(0, &Value::Int(7), &db.live_snapshot(0).unwrap()).unwrap().iter().collect::<Vec<u32>>(),
             vec![0]
         );
         // The re-emerged schema still validates inserts.
@@ -1723,7 +1723,7 @@ mod tests {
         let meta1 = db.metadata_reader(1).unwrap();
         assert_eq!(meta1.live_count(), 2);
         assert_eq!(
-            meta1.lookup_eq(0, &Value::Int(20)).unwrap().iter().collect::<Vec<u32>>(),
+            meta1.lookup_eq(0, &Value::Int(20), &db.live_snapshot(0).unwrap()).unwrap().iter().collect::<Vec<u32>>(),
             vec![1]
         );
         assert_eq!(
@@ -1785,7 +1785,7 @@ mod tests {
         assert_eq!(
             db.metadata_reader(id)
                 .unwrap()
-                .lookup_eq(0, &Value::Int(8))
+                .lookup_eq(0, &Value::Int(8), &db.live_snapshot(0).unwrap())
                 .unwrap()
                 .iter()
                 .collect::<Vec<u32>>(),
@@ -2221,6 +2221,68 @@ mod tests {
         assert_eq!(set.len(), 7, "an outstanding snapshot never mutates");
         assert!(set.contains(4));
         assert_eq!(live.materializations(), 2);
+
+        db.close().unwrap();
+    }
+
+    /// A lookup answers as of the SNAPSHOT it is handed, not as of now.
+    ///
+    /// This is what makes a query correspond to one instant. Before the
+    /// snapshot became a parameter, every lookup masked against the metadata
+    /// index's current liveness, so two predicates in one `WHERE` answered as
+    /// of two different moments and their union could describe a row set that
+    /// never existed.
+    #[test]
+    fn a_lookup_answers_as_of_its_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], meta_row(1, "alice")).unwrap(); // ord 0
+        db.insert(0, &[2.0, 0.0], meta_row(2, "alice")).unwrap(); // ord 1
+        db.insert(0, &[3.0, 0.0], meta_row(3, "bob")).unwrap(); // ord 2
+
+        let meta = db.metadata_reader(0).unwrap();
+        let before = db.live_snapshot(0).unwrap();
+
+        db.delete(0, 1).unwrap();
+        let after = db.live_snapshot(0).unwrap();
+        assert!(!Arc::ptr_eq(&before, &after), "the delete moved the version");
+
+        // The OLD snapshot still sees ordinal 1 — a query that opened before
+        // the delete must keep seeing the row it was promised, predicate or no
+        // predicate.
+        let alice = Value::Text("alice".into());
+        assert_eq!(
+            meta.lookup_eq(1, &alice, &before)
+                .unwrap()
+                .iter()
+                .collect::<Vec<u32>>(),
+            vec![0, 1],
+            "a lookup against the old snapshot lost a row it should still see"
+        );
+        // The new one does not.
+        assert_eq!(
+            meta.lookup_eq(1, &alice, &after)
+                .unwrap()
+                .iter()
+                .collect::<Vec<u32>>(),
+            vec![0]
+        );
+
+        // Same for ranges.
+        assert_eq!(
+            meta.lookup_range(0, RangeOp::Lt, &Value::Int(3), &before)
+                .unwrap()
+                .iter()
+                .collect::<Vec<u32>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            meta.lookup_range(0, RangeOp::Lt, &Value::Int(3), &after)
+                .unwrap()
+                .iter()
+                .collect::<Vec<u32>>(),
+            vec![0]
+        );
 
         db.close().unwrap();
     }
