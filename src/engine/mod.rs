@@ -968,9 +968,17 @@ impl Db {
     /// scalar column in `ColumnId` order.
     ///
     /// The general form of [`scan`](Self::scan), and the seam the cursor was
-    /// built around: the ordinal source is a plain iterator, so a full scan
-    /// (`live()`), a ranked KNN result, and a future `WHERE`-filtered bitmap all
-    /// produce the SAME cursor type with no new machinery.
+    /// built around: the ordinal source is a plain iterator, so a full scan, a
+    /// ranked KNN result, and a `WHERE`-filtered bitmap all produce the SAME
+    /// cursor type with no new machinery.
+    ///
+    /// **`ordinals` must come from this collection's liveness snapshot** — a
+    /// full snapshot, or anything derived from one by intersection or ranking.
+    /// An ordinal the tuple store cannot produce is reported as
+    /// [`Error::SnapshotRowMissing`] rather than skipped, because from a
+    /// snapshot it can only mean the stores disagree. To iterate ordinals from
+    /// somewhere else, build a [`Cursor::over`](crate::Cursor::over) directly;
+    /// that one skips.
     ///
     /// **Order is preserved.** The cursor visits ordinals in the order given and
     /// imposes none of its own — which is what lets a KNN result stay in SCORE
@@ -989,7 +997,15 @@ impl Db {
         // ColumnId space), which is what makes `Cursor::column`'s position
         // coincide with the ColumnId for this projection.
         let columns = coll.config.schema.columns.iter().map(|c| c.id).collect();
-        Ok(Cursor::over(ordinals, coll.tuple.clone(), columns))
+        // STRICT: every ordinal source the engine hands a cursor is derived
+        // from a liveness snapshot, so a row the tuple store cannot produce is
+        // a consistency failure rather than something to skip past.
+        Ok(Cursor::over_snapshot(
+            collection,
+            ordinals,
+            coll.tuple.clone(),
+            columns,
+        ))
     }
 
     /// Resolve a collection NAME to the id every other method here is keyed by.

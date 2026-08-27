@@ -34,6 +34,20 @@ pub enum Error {
     #[error("unknown collection: {id}")]
     UnknownCollection { id: u32 },
 
+    /// A scan enumerated an ordinal from a liveness snapshot and the tuple
+    /// store had no row for it.
+    ///
+    /// This is a CONSISTENCY FAILURE, not a transient. A snapshot only ever
+    /// admits rows the applier finished writing — it publishes liveness last,
+    /// after the vector and the values are both in place — so an ordinal that
+    /// is in a snapshot and missing from the tuple store means those two
+    /// disagree. It used to be legal and routine, back when liveness had three
+    /// owners updated at three different moments; it is now a bug in the
+    /// applier's ordering, and silently skipping it would hide exactly the
+    /// class of defect this became an error to catch.
+    #[error("row {ordinal} of collection {collection} is in the liveness snapshot but absent from the tuple store")]
+    SnapshotRowMissing { collection: u32, ordinal: u32 },
+
     /// A collection NAME did not resolve to a registered collection. Distinct
     /// from `UnknownCollection`, which reports an id: here there is no id to
     /// report — failing to produce one is the error. Raised by

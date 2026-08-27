@@ -24,33 +24,42 @@
 //! Deleting is still destructive, so a row can vanish from an open cursor
 //! mid-scan; that is the one hole left in the isolation story.
 //!
-//! # Skip policy: `Missing`/`Deleted` are transients, never errors
+//! # `Missing` is loud from a snapshot, routine from anywhere else
 //!
-//! An enumerated ordinal can fail to produce a row, and the cursor skips it:
+//! An enumerated ordinal can fail to produce a row, and what that means depends
+//! entirely on where the ordinal came from.
 //!
-//!   * [`RowGet::Missing`] — historically the row was mid-apply: the fan-out
-//!     wrote flat → meta → tuple across three independent mutexes, so a reader
-//!     could catch an ordinal published into the metadata index whose tuple had
-//!     not landed. `tests/concurrent_stores.rs` fired that window ~20-28k times
-//!     in ~6s of writing. **It no longer exists**: the applier now publishes
-//!     liveness LAST, after flat and tuple both hold the row, and that same
-//!     test asserts zero sightings. The skip is kept for now because the
-//!     cursor also serves ordinal sources that are not liveness snapshots
-//!     (`scan_over` takes any iterator, including one naming a never-written
-//!     ordinal). For a scan of a snapshot, `Missing` is now a bug in the
-//!     applier's ordering rather than a transient — read the file's rewritten
-//!     `WORLD VERDICT` header before changing anything here.
-//!   * There is no `Deleted` verdict any more. A row retired after the ordinal
-//!     source was snapshotted still reads back with its values, which is
-//!     exactly what stops it vanishing out from under an open cursor.
+//! **From a liveness snapshot it is a bug.** The applier publishes liveness
+//! LAST — the vector and the values are both in place before `meta.insert_row`
+//! sets the live bit — so a snapshot only ever admits rows that are fully
+//! written. An ordinal that is in a snapshot and absent from the tuple store
+//! means the two stores disagree, and [`Cursor::over_snapshot`] reports it as
+//! [`Error::SnapshotRowMissing`](crate::Error::SnapshotRowMissing). Every
+//! ordinal source inside the engine is snapshot-derived — a full scan, a
+//! `WHERE` bitmap masked with the snapshot, a KNN result ranked through it — so
+//! every engine cursor is strict.
 //!
-//! When the window was real, turning this into an error would have been a
-//! once-in-millions production panic: an ascending walk reaches the frontier
-//! long after the window usually shuts, so the full-scan pattern hit `Missing`
-//! just ONCE in ~3.1M gets on one seed and zero on the next — rare enough to
-//! pass casual testing, never rare enough to be safe. The skip lives inside
-//! [`Cursor::seek_first`] / [`Cursor::next`], so the VM's `Column` only ever
-//! sees a materialized row.
+//! **From anywhere else it is routine.** [`Cursor::over`] takes any iterator,
+//! and a caller naming arbitrary ordinals is free to name one that was never
+//! written. That cursor skips and counts.
+//!
+//! This was not always so. Liveness used to have three owners — the flat
+//! index's tombstone bitset, the metadata index's `live` bitmap, the tuple
+//! store's per-slot marker — updated at three different moments during apply,
+//! and a reader could catch an ordinal published into one but not yet the
+//! others. `tests/concurrent_stores.rs` fired that window **~20-28k times in
+//! ~6s** of writing, and the cursor had no choice but to skip: erroring would
+//! have been a once-in-millions production panic, since an ascending walk
+//! reaches the frontier long after the window shuts (the full-scan role hit it
+//! just ONCE in ~3.1M gets on one seed and zero on the next). The window is
+//! gone, measured at ~1.6M scans with 0 skips, and the same rarity that made
+//! erroring dangerous now makes it valuable: if it ever fires again, it is
+//! real.
+//!
+//! There is no `Deleted` verdict to handle. Retiring a row clears one bit in
+//! the metadata index and destroys nothing, so a row retired after a snapshot
+//! was taken still reads back with its values — which is what stops it
+//! vanishing out from under an open cursor.
 //!
 //! # One `get` per row, not per column
 //!
@@ -59,7 +68,7 @@
 //! instead of N: `Op::Column` wants an infallible read, and a re-fetching
 //! `column` could see the row deleted mid-row and hand back a torn projection.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::metadata::common::{ColumnId, Ordinal, Value};
 use crate::metadata::tuples::{self, RowGet};
 
@@ -86,6 +95,10 @@ pub struct Cursor<'a> {
     /// The columns materialized per row, in the order [`row`](Self::row)
     /// returns them. THE PROJECTION, fixed at construction.
     columns: Vec<ColumnId>,
+    /// Set when the ordinal source is a liveness snapshot, in which case a
+    /// `Missing` row is a consistency failure rather than a routine skip. See
+    /// [`over_snapshot`](Self::over_snapshot).
+    snapshot_sourced: Option<u32>,
     /// The ordinal the cursor is parked on, or `None` before the first
     /// `seek_first` and after exhaustion.
     current: Option<Ordinal>,
@@ -116,10 +129,34 @@ impl<'a> Cursor<'a> {
             ordinals: Box::new(ordinals),
             tuples,
             columns,
+            snapshot_sourced: None,
             current: None,
             row: None,
             skipped: 0,
             fetched: 0,
+        }
+    }
+
+    /// A cursor whose ordinals came from `collection`'s liveness snapshot.
+    ///
+    /// Identical to [`over`](Self::over) except in what it does with a row the
+    /// tuple store cannot produce: this one **errors**. A snapshot only admits
+    /// rows the applier finished writing, so a `Missing` here means the stores
+    /// disagree — [`Error::SnapshotRowMissing`].
+    ///
+    /// Use this for any source derived from a snapshot, which is every source
+    /// inside the engine: a full scan, a `WHERE`-filtered bitmap (masked with
+    /// the snapshot), a ranked KNN result (searched through it). Reach for
+    /// `over` only when the ordinals genuinely come from somewhere else.
+    pub fn over_snapshot(
+        collection: u32,
+        ordinals: impl Iterator<Item = Ordinal> + 'a,
+        tuples: tuples::Reader,
+        columns: Vec<ColumnId>,
+    ) -> Cursor<'a> {
+        Cursor {
+            snapshot_sourced: Some(collection),
+            ..Cursor::over(ordinals, tuples, columns)
         }
     }
 
@@ -157,8 +194,17 @@ impl<'a> Cursor<'a> {
                     self.fetched += 1;
                     return Ok(true);
                 }
-                // Skip, count, keep going — see the module header.
                 RowGet::Missing => {
+                    // Loud for a snapshot source: the snapshot promised this
+                    // row exists, so the stores disagree. Routine for any other
+                    // source, which is free to name an ordinal nothing was ever
+                    // written to.
+                    if let Some(collection) = self.snapshot_sourced {
+                        return Err(Error::SnapshotRowMissing {
+                            collection,
+                            ordinal: ordinal.0,
+                        });
+                    }
                     self.skipped += 1;
                 }
             }
@@ -413,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn tombstoned_rows_skipped() {
+    fn retired_rows_are_excluded_by_the_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let db = open(dir.path());
         insert_n(&db, 8);
@@ -421,9 +467,14 @@ mod tests {
             db.delete(0, victim).unwrap();
         }
 
-        // Proves the cursor is driven by `live()`, not a naive `0..len`.
-        let got = ordinals(&mut db.scan(0).unwrap());
+        // Proves the cursor is driven by the snapshot, not a naive `0..len`.
+        // Nothing is SKIPPED here: the retired ordinals never reach the cursor,
+        // because they are not in the snapshot it enumerates. Their values are
+        // still in the tuple store — retiring destroys nothing.
+        let mut cursor = db.scan(0).unwrap();
+        let got = ordinals(&mut cursor);
         assert_eq!(got, vec![0, 2, 3, 5, 7]);
+        assert_eq!(cursor.skipped(), 0, "a snapshot scan skips nothing");
 
         db.close().unwrap();
     }
@@ -595,6 +646,74 @@ mod tests {
         );
     }
 
+    /// A row the snapshot promised but the tuple store cannot produce is an
+    /// ERROR, not a silent skip.
+    ///
+    /// It was routine once. Liveness had three owners updated at three moments,
+    /// so a reader could enumerate an ordinal the tuple store had not caught up
+    /// to — `concurrent_stores.rs` fired that window tens of thousands of times
+    /// per run. Publishing liveness last closed it: a snapshot only admits rows
+    /// the applier finished writing. So a `Missing` from a snapshot now means
+    /// the stores disagree, and skipping past it would hide precisely the class
+    /// of defect worth catching.
+    #[test]
+    fn missing_from_a_snapshot_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path());
+        insert_n(&db, 4);
+        let tuples = db.tuple_reader(0).unwrap();
+
+        // Ordinal 9 was never written, so it stands in for a row a snapshot
+        // admits and the tuple store cannot produce.
+        let mut strict =
+            Cursor::over_snapshot(0, std::iter::once(Ordinal(9)), tuples.clone(), ALL.to_vec());
+        match strict.seek_first() {
+            Err(crate::Error::SnapshotRowMissing {
+                collection: 0,
+                ordinal: 9,
+            }) => {}
+            other => panic!("expected SnapshotRowMissing, got {other:?}"),
+        }
+
+        // It errors MID-SCAN too, not only on the first row — the loud path has
+        // to survive a cursor that has already produced rows.
+        let mut strict = Cursor::over_snapshot(
+            0,
+            [Ordinal(0), Ordinal(1), Ordinal(9)].into_iter(),
+            tuples.clone(),
+            ALL.to_vec(),
+        );
+        assert!(strict.seek_first().unwrap());
+        assert!(strict.next().unwrap());
+        assert!(matches!(
+            strict.next(),
+            Err(crate::Error::SnapshotRowMissing { ordinal: 9, .. })
+        ));
+
+        db.close().unwrap();
+    }
+
+    /// The seam is unchanged: a cursor over ordinals that did NOT come from a
+    /// snapshot still skips. A caller naming arbitrary ordinals is allowed to
+    /// name one nothing was written to.
+    #[test]
+    fn an_arbitrary_source_still_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path());
+        insert_n(&db, 4);
+        let tuples = db.tuple_reader(0).unwrap();
+
+        let mut lenient = Cursor::over(
+            [Ordinal(0), Ordinal(9), Ordinal(2)].into_iter(),
+            tuples,
+            ALL.to_vec(),
+        );
+        assert_eq!(ordinals(&mut lenient), vec![0, 2]);
+        assert_eq!(lenient.skipped(), 1);
+
+        db.close().unwrap();
+    }
+
     /// The gap that snapshot isolation was missing: a row DELETED while a
     /// cursor is open must still be yielded, with its values intact.
     ///
@@ -709,7 +828,7 @@ mod tests {
     /// is asserted at QUIESCENCE, once the writer has stopped and the readers
     /// have joined.
     #[test]
-    fn cursor_skips_mid_apply_ordinal() {
+    fn no_snapshot_ordinal_is_ever_mid_apply() {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(open(dir.path()));
         let seed_rows = 64u64;
@@ -846,10 +965,18 @@ mod tests {
         );
         assert!(frontier > seed_rows, "writer made no progress");
 
-        // Skips are REPORTED, not asserted: `tests/concurrent_stores.rs` owns
-        // the "the race is observable" assertion, and duplicating it here would
-        // only add a host-sensitive failure mode. The deterministic skip path is
-        // covered by `tombstoned_rows_skipped`.
+        // Skips are now ASSERTED at zero. They used to be merely reported,
+        // because the meta->tuple window was real and a mid-apply ordinal was a
+        // legal transient. Publishing liveness last closed it: measured at
+        // ~1.6M scans / ~1.9M rows with 0 skips before this assertion was
+        // added, so the zero is earned, not hoped for. A snapshot scan would
+        // ERROR on a mid-apply ordinal now anyway — this pins that the error
+        // never fires.
+        assert_eq!(
+            skips.load(Ordering::Relaxed),
+            0,
+            "a snapshot admitted an ordinal the tuple store could not produce"
+        );
         eprintln!(
             "[cursor] {} scans, {} rows, {} skipped transients",
             scans.load(Ordering::Relaxed),
