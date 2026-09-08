@@ -252,9 +252,15 @@ struct IndexApplier {
     /// First CreateCollection LSN that failed to materialize this session.
     /// Freezes `catalog_watermark` below it, so neither truncation nor the
     /// persisted catalog stamp can ever claim a create that didn't happen —
-    /// restart replays it. (Inserts don't need this: a failed insert stalls
-    /// its own collection's store watermarks, which are already in the min.
-    /// A failed create has no store watermark to stall — this is its stand-in.)
+    /// restart replays it.
+    ///
+    /// Belt to the halt's braces, and deliberately kept: any apply failure now
+    /// poisons the log (`wal::Poison`), which refuses every later write and
+    /// every checkpoint, so no watermark can advance past the hole in the
+    /// first place. This stays because it is the local, checkable version of
+    /// that argument — a create has no store watermark of its own to stall,
+    /// unlike an insert, so without it the invariant would rest entirely on a
+    /// guarantee made two modules away.
     failed_create: Option<u64>,
 }
 
@@ -268,6 +274,12 @@ impl Apply for IndexApplier {
     /// replay. Watermarks advance LAST, only after every write succeeded: a
     /// watermark must never claim an apply that didn't happen, or checkpoint
     /// could persist it and recovery would skip the record forever.
+    ///
+    /// That rule is necessary but not sufficient on its own, because watermarks
+    /// are a single high-water number per store: if this record fails and a
+    /// LATER one succeeds, the later `max()` sweeps right over the gap. What
+    /// closes it is the caller — an `Err` from here poisons the WAL, so there
+    /// is never a later record to do the sweeping. See `wal::Poison`.
     ///
     /// The liveness version is bumped once per liveness-changing record
     /// (`Insert`/`Delete`, not DDL — a new collection has no rows), and
@@ -496,6 +508,11 @@ impl Flusher {
                 // next tick and correctness never depends on it (the WAL is the
                 // source of truth). The final checkpoint, if any, is driven by
                 // `Db::close`.
+                //
+                // A halted log refuses every checkpoint until reopen, so this
+                // then ticks along doing nothing. That is the intended
+                // behaviour and the reason the error is dropped rather than
+                // logged per tick — the write path already told the caller.
                 while let Err(RecvTimeoutError::Timeout) = stop_rx.recv_timeout(interval) {
                     let _ = wal.checkpoint();
                 }
@@ -772,6 +789,10 @@ impl Db {
             });
         }
         coll.config.schema.validate_row(&row)?;
+        // Refuse before allocating: a halted log is going to reject this
+        // append anyway, and burning an ordinal for a write that never reaches
+        // the file costs the collection a slot of its capacity for nothing.
+        self.check_poison()?;
         let ordinal = coll.alloc_ordinal()?;
         match self.wal_handle()?.append(Record::Insert {
             collection,
@@ -781,13 +802,24 @@ impl Db {
         }) {
             Ok(_lsn) => Ok(Ordinal(ordinal as u32)),
             Err(e) => {
-                // The append never became durable, so there is nothing to undo
-                // and nothing to hide. The allocator already burned `ordinal`,
-                // leaving a zero-filled slot in the flat index below the
-                // high-water mark — but a burned ordinal is in no WAL record,
-                // so it is in `live` on no path, and every read (search, scan,
-                // cursor) filters through the liveness snapshot. The hole is
-                // unreachable by construction rather than by a tombstone.
+                // Two different failures arrive here and the caller must not
+                // conflate them:
+                //
+                //   * PRE-FSYNC (frame or fsync failed): the append never
+                //     became durable, so there is nothing to undo and nothing
+                //     to hide. The allocator already burned `ordinal`, leaving
+                //     a zero-filled slot in the flat index below the high-water
+                //     mark — but a burned ordinal is in no WAL record, so it is
+                //     in `live` on no path, and every read (search, scan,
+                //     cursor) filters through the liveness snapshot. The hole
+                //     is unreachable by construction rather than by a
+                //     tombstone.
+                //
+                //   * POISONED (`Error::Poisoned`): the log halted. If THIS
+                //     record is the one that failed to apply then it is
+                //     durable and WILL come back on the next open, ordinal and
+                //     all — do not tell the caller their write vanished. Which
+                //     of the two it was is in the error, not in this branch.
                 //
                 // This used to flip the flat index's tombstone bit from the
                 // CALLER's thread, the one place outside the WAL thread that
@@ -798,11 +830,12 @@ impl Db {
                 // `live` is rebuilt from metadata.snap plus WAL replay, and the
                 // burned ordinal was never in either.
                 //
-                // NOTE FOR COMPACTION: `ordinal` is permanently burned — the
-                // allocator never reuses it, so every failed append costs the
-                // collection one slot of its capacity. Compaction renumbers
-                // ordinals and reclaims these gaps for free; nothing else does.
-                Err(Error::from(e))
+                // NOTE FOR COMPACTION: on the pre-fsync path `ordinal` is
+                // permanently burned — the allocator never reuses it, so every
+                // failed append costs the collection one slot of its capacity.
+                // Compaction renumbers ordinals and reclaims these gaps for
+                // free; nothing else does.
+                Err(self.wal_err(e))
             }
         }
     }
@@ -811,10 +844,13 @@ impl Db {
     pub fn delete(&self, collection: u32, ordinal: u64) -> Result<()> {
         // Validate the collection exists before logging.
         let _ = self.collection(collection)?;
-        self.wal_handle()?.append(Record::Delete {
-            collection,
-            ordinal,
-        })?;
+        self.check_poison()?;
+        self.wal_handle()?
+            .append(Record::Delete {
+                collection,
+                ordinal,
+            })
+            .map_err(|e| self.wal_err(e))?;
         Ok(())
     }
 
@@ -897,7 +933,10 @@ impl Db {
             capacity,
             schema,
         };
-        self.wal_handle()?.append(Record::CreateCollection { config })?;
+        self.check_poison()?;
+        self.wal_handle()?
+            .append(Record::CreateCollection { config })
+            .map_err(|e| self.wal_err(e))?;
         Ok(id)
     }
 
@@ -1046,7 +1085,12 @@ impl Db {
     /// commit thread. Mostly for tests and graceful shutdown; the flusher does
     /// this on a timer otherwise.
     pub fn checkpoint(&self) -> Result<()> {
-        self.wal_handle()?.checkpoint()?;
+        // A halted log refuses this: checkpointing would stamp a durable
+        // watermark over the record the index never absorbed and then truncate
+        // that record away. See `Error::Poisoned`.
+        self.wal_handle()?
+            .checkpoint()
+            .map_err(|e| self.wal_err(e))?;
         Ok(())
     }
 
@@ -1057,8 +1101,24 @@ impl Db {
             flusher.stop();
         }
         let wal = self.wal.take().expect("wal present until close");
-        wal.handle().checkpoint()?; // final checkpoint on the commit thread
+        // Final checkpoint on the commit thread — but shut the thread down
+        // whichever way it goes. Returning early here used to drop `Wal`
+        // without joining, leaking the commit thread; a halted log makes that
+        // path routine rather than exotic, since it refuses the checkpoint by
+        // design. The WAL is durable either way, so a skipped checkpoint only
+        // means the next open replays a longer tail.
+        let checkpointed = wal.handle().checkpoint();
+        let poison = wal.poison();
         wal.shutdown();
+        if let Err(e) = checkpointed {
+            return Err(match poison {
+                Some(p) => Error::Poisoned {
+                    lsn: p.lsn.0,
+                    cause: p.cause,
+                },
+                None => Error::from(e),
+            });
+        }
         Ok(())
     }
 
@@ -1067,6 +1127,42 @@ impl Db {
             .get(&id)
             .cloned()
             .ok_or(Error::UnknownCollection { id })
+    }
+
+    /// Whether the database has halted on an apply failure. `true` means every
+    /// write and every checkpoint is being refused and the fix is to reopen;
+    /// reads still work. See `Error::Poisoned`.
+    pub fn is_poisoned(&self) -> bool {
+        self.wal.as_ref().is_some_and(|w| w.poison().is_some())
+    }
+
+    /// Refuse early if the log has halted, with the typed error rather than the
+    /// WAL's io-shaped one.
+    fn check_poison(&self) -> Result<()> {
+        match self.wal.as_ref().and_then(|w| w.poison()) {
+            Some(p) => Err(Error::Poisoned {
+                lsn: p.lsn.0,
+                cause: p.cause,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Map a WAL-layer failure into the engine's error type, promoting it to
+    /// `Poisoned` when the log has halted.
+    ///
+    /// A pre-fsync failure on one thread that races an apply failure on another
+    /// is reported as `Poisoned` rather than as itself. That is a fair trade:
+    /// both mean "this write did not take effect", and the halt is the more
+    /// important half of the news.
+    fn wal_err(&self, e: io::Error) -> Error {
+        match self.wal.as_ref().and_then(|w| w.poison()) {
+            Some(p) => Error::Poisoned {
+                lsn: p.lsn.0,
+                cause: p.cause,
+            },
+            None => Error::from(e),
+        }
     }
 
     fn wal_handle(&self) -> Result<WalHandle> {
@@ -1236,6 +1332,116 @@ mod tests {
     fn manual_opts() -> DbOptions {
         DbOptions {
             checkpoint_interval: Duration::from_secs(3600),
+        }
+    }
+
+    /// Poison a live `Db` the way production would: hand the WAL a record that
+    /// is durable but that the applier cannot absorb. `collection` is not
+    /// registered, so `IndexApplier::writers` errors AFTER the fsync — the same
+    /// shape as an ENOSPC while materializing a collection, but deterministic.
+    ///
+    /// Goes straight to the WAL handle on purpose: `Db::insert` validates the
+    /// collection first, which is exactly the guard that makes this
+    /// unreachable through the public API.
+    fn poison_db(db: &Db, collection: u32, ordinal: u64, vector: &[f32]) {
+        db.wal
+            .as_ref()
+            .expect("wal present")
+            .handle()
+            .append(Record::Insert {
+                collection,
+                ordinal,
+                vector: vector.to_vec(),
+                metadata: vec![],
+            })
+            .expect_err("apply must fail for an unregistered collection");
+    }
+
+    #[test]
+    fn poisoned_db_refuses_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap();
+
+        poison_db(&db, 9, 0, &[1.0, 0.0]);
+        assert!(db.is_poisoned());
+
+        // Both write doors report the same typed error, naming the record the
+        // index is missing. Acking anything else would be a lie: the record is
+        // committed and WILL come back on the next open.
+        match db.insert(0, &[2.0, 0.0], vec![]) {
+            Err(Error::Poisoned { lsn, .. }) => assert_eq!(lsn, 2),
+            other => panic!("expected Poisoned, got {other:?}"),
+        }
+        match db.delete(0, 0) {
+            Err(Error::Poisoned { lsn, .. }) => assert_eq!(lsn, 2),
+            other => panic!("expected Poisoned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poisoned_db_still_serves_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap();
+
+        poison_db(&db, 9, 0, &[1.0, 0.0]);
+
+        // The index is STALE, not inconsistent: it holds a consistent prefix of
+        // the log. Readers keep their guarantees, so a poisoned db degrades to
+        // read-only rather than going dark.
+        let hits = db.search(0, &[1.0, 0.0], 4).unwrap();
+        assert_eq!(hits.len(), 1);
+        let mut cursor = db.scan(0).unwrap();
+        assert!(cursor.seek_first().unwrap(), "the scan cursor still sees the row");
+        assert_eq!(cursor.ordinal().unwrap(), Ordinal(0));
+    }
+
+    #[test]
+    fn reopen_after_poison_replays_the_unapplied_record() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+            db.insert(0, &[1.0, 0.0], vec![]).unwrap();
+            // Collection 1 is not registered in THIS session, so the record is
+            // durable but unappliable.
+            poison_db(&db, 1, 0, &[0.0, 1.0]);
+
+            // The halt's whole job: refuse to checkpoint, so the frame stays in
+            // the log for the recovery below. Without this the durable
+            // watermark would advance over the hole and truncation would erase
+            // the record permanently.
+            assert!(matches!(db.checkpoint(), Err(Error::Poisoned { .. })));
+            db.close().expect_err("close reports the poison");
+        }
+
+        // Reopen DECLARING collection 1: `open` registers and materializes it
+        // (step 0/1) before the WAL replays (step 3), so the record that
+        // poisoned the last session now applies cleanly.
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64), cfg(1, 2, 64)], manual_opts()).unwrap();
+        assert!(!db.is_poisoned(), "recovery clears the condition");
+
+        let hits = db.search(1, &[0.0, 1.0], 4).unwrap();
+        assert_eq!(hits.len(), 1, "the unapplied record survived and replayed");
+
+        // And the db is fully writable again.
+        db.insert(1, &[0.0, 2.0], vec![]).unwrap();
+        db.checkpoint().unwrap();
+    }
+
+    #[test]
+    fn close_after_poison_reports_it_and_still_joins() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        poison_db(&db, 9, 0, &[1.0, 0.0]);
+
+        // close() takes a final checkpoint, which a poisoned db refuses. The
+        // caller must hear about it — but the commit thread still has to be
+        // joined, or an early return leaks it.
+        match db.close() {
+            Err(Error::Poisoned { .. }) => {}
+            other => panic!("expected Poisoned, got {other:?}"),
         }
     }
 
