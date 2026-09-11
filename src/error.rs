@@ -48,6 +48,19 @@ pub enum Error {
     #[error("row {ordinal} of collection {collection} is in the liveness snapshot but absent from the tuple store")]
     SnapshotRowMissing { collection: u32, ordinal: u32 },
 
+    /// The database is halted: a record was fsynced, then failed to apply to
+    /// the indexes. It is committed and will replay on the next `Db::open`, but
+    /// the index does not reflect it and a watermark cannot express a gap — so
+    /// every further write is refused, and so is every checkpoint and
+    /// truncation (either would shed the frame recovery needs).
+    ///
+    /// Reads keep working against the last consistent prefix of the log. The
+    /// remedy is to reopen the database, which replays the tail; apply is
+    /// idempotent, so replay is always safe. `lsn` names the unapplied record
+    /// and `cause` is the original apply failure.
+    #[error("database halted at lsn {lsn}: {cause} (reopen to replay the unapplied record)")]
+    Poisoned { lsn: u64, cause: String },
+
     /// A collection NAME did not resolve to a registered collection. Distinct
     /// from `UnknownCollection`, which reports an id: here there is no id to
     /// report — failing to produce one is the error. Raised by

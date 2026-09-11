@@ -19,6 +19,10 @@
 //! assign LSN -> write frame -> FSYNC -> apply -> ACK
 //! ```
 //!
+//!   Because fsync comes first, an apply failure lands on an already-committed
+//!   record — durable, but absent from the index, with no way to say so in a
+//!   watermark. The log halts there rather than carrying on: see `Poison`.
+//!
 //!   fsync strictly before apply keeps the WAL >= the index at all times, which
 //!   is what makes recovery "replay the tail onto the index" correct. ack
 //!   strictly after fsync is what makes durability honest: we only promise a
@@ -33,8 +37,8 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, OnceLock};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -293,9 +297,57 @@ impl WalHandle {
 // The WAL thread
 // ---------------------------------------------------------------------------
 
+/// Why the log stopped accepting writes.
+///
+/// Set exactly once, by the first `Apply::apply` that fails AFTER its record
+/// was fsynced. That record is committed — it will replay on the next `open` —
+/// but the index does not reflect it, and there is no way to express "applied
+/// through 7 except 5": a watermark is a single high-water number. So the only
+/// safe move is to stop:
+///
+///   * no further writes — they would apply on top of the hole, and their
+///     watermark would claim the record that never landed;
+///   * no checkpoint and no truncation — either one sheds the very frame that
+///     recovery needs, turning a recoverable failure into silent data loss.
+///
+/// Reads keep working: the index is stale, not inconsistent. Reopening the
+/// database replays the tail and clears the condition (apply is idempotent).
+/// This is the same posture as Postgres' redo `PANIC` — the log is the truth,
+/// the index is a derived cache, and you re-derive rather than repair in place.
+#[derive(Clone, Debug)]
+pub struct Poison {
+    /// The durable record the index never absorbed.
+    pub lsn: Lsn,
+    /// The apply error, rendered where it happened.
+    pub cause: String,
+}
+
+impl Poison {
+    fn to_io(&self) -> io::Error {
+        io::Error::other(format!(
+            "wal poisoned at lsn {}: {} (the record is durable but unapplied; \
+             reopen the database to replay it)",
+            self.lsn.0, self.cause
+        ))
+    }
+}
+
+/// The error to hand a waiter that was refused because the log is poisoned.
+fn poison_io(cell: &OnceLock<Poison>) -> io::Error {
+    match cell.get() {
+        Some(p) => p.to_io(),
+        // Unreachable: every caller checks `get().is_some()` first. Degrade to
+        // a truthful message rather than panicking on the commit thread.
+        None => io::Error::other("wal poisoned"),
+    }
+}
+
 pub struct Wal {
     handle: WalHandle,
     join: JoinHandle<()>,
+    /// Set once by the commit thread when a post-fsync apply fails; read by the
+    /// engine to turn a refused write into a typed error. See `Poison`.
+    poison: Arc<OnceLock<Poison>>,
     /// Test-only fault-injection point: when set, the next commit batch fails as
     /// if its fsync errored, exercising callers' durability-failure paths. The
     /// flag is shared with the commit thread; it is never consulted in non-test
@@ -343,17 +395,36 @@ impl Wal {
 
         let fail_next = Arc::new(AtomicBool::new(false));
         let loop_fail = fail_next.clone();
+        let poison: Arc<OnceLock<Poison>> = Arc::new(OnceLock::new());
+        let loop_poison = poison.clone();
         let loop_path = path.clone();
         let join = std::thread::Builder::new()
             .name("wal-commit".into())
-            .spawn(move || commit_loop(file, loop_path, rx, applier, next_lsn, loop_fail))
+            .spawn(move || {
+                commit_loop(
+                    file,
+                    loop_path,
+                    rx,
+                    applier,
+                    next_lsn,
+                    loop_fail,
+                    loop_poison,
+                )
+            })
             .expect("spawn wal thread");
 
         Ok(Wal {
             handle: WalHandle { tx },
             join,
+            poison,
             fail_next,
         })
+    }
+
+    /// Why the log stopped accepting writes, if it has. `None` is the healthy
+    /// state. Once `Some`, it stays `Some` for the life of this `Wal`.
+    pub fn poison(&self) -> Option<Poison> {
+        self.poison.get().cloned()
     }
 
     pub fn handle(&self) -> WalHandle {
@@ -394,6 +465,17 @@ enum Control {
     },
 }
 
+impl Control {
+    /// Both variants ack the same way; a poisoned log refuses either without
+    /// caring which it was.
+    fn into_ack(self) -> Sender<io::Result<()>> {
+        match self {
+            Control::Truncate { ack, .. } => ack,
+            Control::Checkpoint { ack } => ack,
+        }
+    }
+}
+
 fn commit_loop<A: Apply>(
     mut file: File,
     path: PathBuf,
@@ -401,6 +483,7 @@ fn commit_loop<A: Apply>(
     mut applier: A,
     mut next_lsn: u64,
     fail_next: Arc<AtomicBool>,
+    poison: Arc<OnceLock<Poison>>,
 ) {
     let mut batch: Vec<Pending> = Vec::with_capacity(MAX_BATCH);
     let mut frame_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
@@ -444,8 +527,31 @@ fn commit_loop<A: Apply>(
         }
 
         // Commit the batch (group fsync) first, so any control op that follows
-        // only ever runs against an already-durable, fully-applied log.
-        if !batch.is_empty() {
+        // runs against a log that is durable and — unless the batch itself
+        // poisoned us — fully applied.
+        // Test fault point: pretend this batch's fsync failed. Decided before
+        // any LSN/IO work so it models "the durable write never happened", and
+        // only consumed by a batch that would actually have committed.
+        // Compiled out of non-test builds entirely.
+        #[cfg(test)]
+        let injected_failure = !batch.is_empty() && fail_next.swap(false, Ordering::SeqCst);
+        #[cfg(not(test))]
+        let injected_failure = {
+            let _ = &fail_next; // unused in non-test builds
+            false
+        };
+
+        if poison.get().is_some() {
+            // Closed for business. Refuse without writing a frame or burning an
+            // LSN: anything appended past the hole is a record the index can
+            // never absorb in order.
+            fail_batch(&mut batch, &poison_io(&poison));
+        } else if injected_failure {
+            fail_batch(
+                &mut batch,
+                &io::Error::other("injected WAL failure (test fault point)"),
+            );
+        } else if !batch.is_empty() {
             commit_batch(
                 &mut file,
                 &mut applier,
@@ -453,11 +559,19 @@ fn commit_loop<A: Apply>(
                 &mut batch,
                 &mut frame_buf,
                 &mut payload,
-                &fail_next,
+                &poison,
             );
         }
 
         match pending_control {
+            // Checked AFTER the batch, because the batch may have poisoned us
+            // just now. Both control ops shed log the index still needs: a
+            // checkpoint would stamp a durable watermark over the hole and
+            // truncate the frame away, and truncate does the second half on its
+            // own. Refuse both while poisoned.
+            Some(control) if poison.get().is_some() => {
+                let _ = control.into_ack().send(Err(poison_io(&poison)));
+            }
             Some(Control::Truncate { up_to, ack }) => {
                 // Recovery's LSN-skip already makes truncation a no-op for
                 // correctness, so a failure here is not durability-critical —
@@ -492,18 +606,8 @@ fn commit_batch<A: Apply>(
     batch: &mut Vec<Pending>,
     frame_buf: &mut Vec<u8>,
     payload: &mut Vec<u8>,
-    fail_next: &AtomicBool,
+    poison: &OnceLock<Poison>,
 ) {
-    // Test fault point: pretend this batch's fsync failed. Placed before any
-    // LSN/IO work so it models "the durable write never happened". Compiled out
-    // of non-test builds entirely.
-    #[cfg(test)]
-    if fail_next.swap(false, Ordering::SeqCst) {
-        fail_batch(batch, &io::Error::other("injected WAL failure (test fault point)"));
-        return;
-    }
-    let _ = fail_next; // unused in non-test builds
-
     frame_buf.clear();
     let mut assigned: Vec<Lsn> = Vec::with_capacity(batch.len());
     let batch_start_lsn = *next_lsn;
@@ -546,11 +650,29 @@ fn commit_batch<A: Apply>(
 
     // --- COMMIT POINT crossed. Now apply (post-fsync) then ack. ---
     for ((record, ack), lsn) in batch.drain(..).zip(assigned) {
-        // Apply is idempotent; an error here is a bug in apply, not a durability
-        // failure — the record IS committed and will replay on restart. Surface
-        // it to the waiter but keep going; the data is safe.
-        let reply = applier.apply(lsn, &record).map(|()| lsn);
-        let _ = ack.send(reply); // waiter gone == nobody to tell; fine
+        // Every record from here on is committed. An apply failure is therefore
+        // NOT a durability failure — the record survives and replays — but the
+        // index is now missing it, and nothing downstream can represent that
+        // gap. So the first failure poisons the log and the rest of this batch
+        // is refused unapplied: applying past the hole would let their
+        // watermark claim the record that never landed, and the next checkpoint
+        // would truncate it away for good.
+        if poison.get().is_some() {
+            let _ = ack.send(Err(poison_io(poison)));
+            continue;
+        }
+        match applier.apply(lsn, &record) {
+            Ok(()) => {
+                let _ = ack.send(Ok(lsn)); // waiter gone == nobody to tell; fine
+            }
+            Err(e) => {
+                let _ = poison.set(Poison {
+                    lsn,
+                    cause: e.to_string(),
+                });
+                let _ = ack.send(Err(poison_io(poison)));
+            }
+        }
     }
 }
 
@@ -794,6 +916,7 @@ fn read_exact_or_eof(r: &mut impl Read, buf: &mut [u8]) -> io::Result<ReadOutcom
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
 
     fn insert(collection: u32, ordinal: u64, vector: &[f32]) -> Record {
@@ -810,22 +933,47 @@ mod tests {
     #[derive(Clone)]
     struct CollectingApplier {
         log: Arc<Mutex<Vec<(u64, Record)>>>,
+        /// When set, `apply` fails for this one LSN. The fault fixture for the
+        /// apply-error halt: by the time apply runs the record is already
+        /// fsynced, so this models the single failure the WAL cannot ack
+        /// honestly — durable, but not reflected in the index.
+        fail_at: Option<u64>,
+        /// How many times `checkpoint` was called. A poisoned log must never
+        /// call it: checkpoint advances the durable watermark and truncates.
+        checkpoints: Arc<AtomicUsize>,
     }
 
     impl CollectingApplier {
         fn new() -> Self {
             CollectingApplier {
                 log: Arc::new(Mutex::new(Vec::new())),
+                fail_at: None,
+                checkpoints: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        /// An applier that fails to apply exactly `lsn`, post-fsync.
+        fn failing_at(lsn: u64) -> Self {
+            CollectingApplier {
+                fail_at: Some(lsn),
+                ..CollectingApplier::new()
             }
         }
 
         fn snapshot(&self) -> Vec<(u64, Record)> {
             self.log.lock().expect("lock not poisoned").clone()
         }
+
+        fn checkpoints(&self) -> usize {
+            self.checkpoints.load(Ordering::SeqCst)
+        }
     }
 
     impl Apply for CollectingApplier {
         fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<()> {
+            if self.fail_at == Some(lsn.0) {
+                return Err(io::Error::other(format!("injected apply failure at {}", lsn.0)));
+            }
             self.log
                 .lock()
                 .expect("lock not poisoned")
@@ -833,9 +981,119 @@ mod tests {
             Ok(())
         }
         fn checkpoint(&mut self) -> io::Result<Option<u64>> {
-            // These WAL tests never checkpoint; nothing to make durable.
+            // These WAL tests never checkpoint; nothing to make durable. The
+            // count is what the poison tests assert on.
+            self.checkpoints.fetch_add(1, Ordering::SeqCst);
             Ok(None)
         }
+    }
+
+    /// Poison the log at `path` by letting LSN `fail_at` fail apply, and hand
+    /// back the running WAL plus a handle. Every poison test starts here.
+    fn poisoned_wal(path: &Path, fail_at: u64) -> (Wal, WalHandle, CollectingApplier) {
+        let applier = CollectingApplier::failing_at(fail_at);
+        let wal = Wal::start(path, applier.clone(), 0).unwrap();
+        let handle = wal.handle();
+        // LSNs are 1-based, so priming `fail_at - 1` records leaves the next
+        // append landing on exactly `fail_at`.
+        for ordinal in 0..fail_at.saturating_sub(1) {
+            handle.append(insert(0, ordinal, &[1.0])).unwrap();
+        }
+        handle
+            .append(insert(0, fail_at, &[2.0]))
+            .expect_err("the failing apply must be reported to its waiter");
+        (wal, handle, applier)
+    }
+
+    #[test]
+    fn apply_failure_poisons_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+
+        let (wal, handle, _applier) = poisoned_wal(&path, 2);
+
+        // The record IS durable — the fsync happened before apply ran. What
+        // failed is the derived index, so the log must remember which record
+        // the index is missing rather than carrying on as if nothing happened.
+        let poison = wal.poison().expect("a failed apply poisons the log");
+        assert_eq!(poison.lsn, Lsn(2));
+
+        drop(handle);
+        wal.shutdown();
+    }
+
+    #[test]
+    fn writes_after_poison_are_refused_without_touching_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+
+        let (wal, handle, _applier) = poisoned_wal(&path, 2);
+        let len_at_poison = std::fs::metadata(&path).unwrap().len();
+
+        handle
+            .append(insert(0, 3, &[3.0]))
+            .expect_err("a poisoned log refuses further writes");
+
+        // Refused means refused: no frame, no LSN burned. Anything written past
+        // the hole would be a record the index can never absorb in order.
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            len_at_poison,
+            "a refused append must not reach the file"
+        );
+
+        drop(handle);
+        wal.shutdown();
+    }
+
+    #[test]
+    fn checkpoint_is_refused_while_poisoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+
+        let (wal, handle, applier) = poisoned_wal(&path, 2);
+        let len_at_poison = std::fs::metadata(&path).unwrap().len();
+
+        handle
+            .checkpoint()
+            .expect_err("a poisoned log refuses to checkpoint");
+
+        // This is the whole point of the halt. Checkpoint persists the durable
+        // watermark and then truncates every frame at or below it — with an
+        // unapplied record in the tail that turns a recoverable failure into
+        // permanent, silent data loss.
+        assert_eq!(
+            applier.checkpoints(),
+            0,
+            "the index must not be made durable past a record it never absorbed"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            len_at_poison,
+            "the unapplied record must survive in the log for recovery"
+        );
+
+        drop(handle);
+        wal.shutdown();
+    }
+
+    #[test]
+    fn truncate_is_refused_while_poisoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+
+        let (wal, handle, _applier) = poisoned_wal(&path, 2);
+        let len_at_poison = std::fs::metadata(&path).unwrap().len();
+
+        // Same reasoning as checkpoint, via the other door: an explicit
+        // truncate would shed the frame recovery needs.
+        handle
+            .truncate(u64::MAX)
+            .expect_err("a poisoned log refuses to truncate");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len_at_poison);
+
+        drop(handle);
+        wal.shutdown();
     }
 
     #[test]
