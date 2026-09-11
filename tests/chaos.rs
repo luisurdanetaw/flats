@@ -201,7 +201,7 @@ fn verify_metadata(db: &Db, model: &Model, rng: &mut Rng) {
     // lookup_eq on a random INT value and a random TEXT value.
     let a = rng.below(8) as i64;
     let got: BTreeSet<u64> = meta
-        .lookup_eq(0, &Value::Int(a))
+        .lookup_eq(0, &Value::Int(a), &db.live_snapshot(0).unwrap())
         .expect("lookup_eq int")
         .iter()
         .map(u64::from)
@@ -216,7 +216,7 @@ fn verify_metadata(db: &Db, model: &Model, rng: &mut Rng) {
 
     let c = TEXTS[rng.below(TEXTS.len() as u64) as usize];
     let got: BTreeSet<u64> = meta
-        .lookup_eq(2, &Value::Text(c.into()))
+        .lookup_eq(2, &Value::Text(c.into()), &db.live_snapshot(0).unwrap())
         .expect("lookup_eq text")
         .iter()
         .map(u64::from)
@@ -233,7 +233,7 @@ fn verify_metadata(db: &Db, model: &Model, rng: &mut Rng) {
     let bound = rng.below(9) as i64 - 1; // sometimes outside the value range
     let op = [RangeOp::Lt, RangeOp::Le, RangeOp::Gt, RangeOp::Ge][rng.below(4) as usize];
     let got: BTreeSet<u64> = meta
-        .lookup_range(0, op, &Value::Int(bound))
+        .lookup_range(0, op, &Value::Int(bound), &db.live_snapshot(0).unwrap())
         .expect("lookup_range")
         .iter()
         .map(u64::from)
@@ -266,14 +266,28 @@ fn verify_metadata(db: &Db, model: &Model, rng: &mut Rng) {
             "tuple values for ordinal {ord}"
         );
     }
-    // …and a random deleted ordinal reports the deleted-marker.
+    // …and a random RETIRED ordinal is out of `live` but still readable.
+    //
+    // This assertion changed when liveness got a single owner. It used to
+    // require `RowGet::Deleted`: the tuple store destroyed a row's values on
+    // delete and reported the tombstone, making it a second authority on
+    // visibility. It no longer is. A retired row keeps its values so a reader
+    // holding an older liveness snapshot can still read the row it was
+    // promised, and `live` alone decides what is visible. Compaction, not
+    // `delete`, reclaims the space.
     if !model.deleted.is_empty() {
         let pick = rng.below(model.deleted.len() as u64) as usize;
         let &ord = model.deleted.iter().nth(pick).unwrap();
-        assert_eq!(
-            tuples.get(Ordinal(ord as u32), &[0]).expect("get deleted"),
-            RowGet::Deleted,
-            "deleted marker for ordinal {ord}"
+        assert!(
+            !meta.live().contains(ord as u32),
+            "retired ordinal {ord} is still live"
+        );
+        assert!(
+            matches!(
+                tuples.get(Ordinal(ord as u32), &[0]).expect("get retired"),
+                RowGet::Live(_)
+            ),
+            "retired ordinal {ord} lost its values"
         );
     }
 }

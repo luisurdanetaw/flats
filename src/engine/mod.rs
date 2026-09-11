@@ -115,6 +115,13 @@ struct Collection {
     /// Next ordinal to hand out. Seeded from the index high-water after
     /// recovery; advanced once per insert.
     next_ordinal: AtomicU64,
+    /// Version-tagged liveness snapshots for this collection. The applier
+    /// bumps its version once per liveness-changing record; readers resolve an
+    /// `Arc<LiveSet>` and carry it for the life of a query.
+    ///
+    /// Shared with this collection's `CollectionWriters` on the WAL thread,
+    /// which is the only side that bumps.
+    live: Arc<meta::LiveHandle>,
 }
 
 impl Collection {
@@ -181,13 +188,19 @@ fn open_collection(dir: &Path, cfg: &CollectionConfig) -> Result<(CollectionWrit
     let (tuple_w, tuple_r, tuple_lsn) = TupleStore::open_or_create(&cdir, cfg.schema.clone())?;
 
     let watermark = flat_w.checkpoint_lsn().min(meta_lsn.0).min(tuple_lsn.0);
+    // ONE handle, shared by both sides. The applier could reach the read-side
+    // Collection through the catalog instead, but that is an RwLock read plus a
+    // HashMap lookup per record, on the write path, forever.
+    let live = Arc::new(meta_r.live_handle());
     Ok((
         CollectionWriters {
             flat: flat_w,
             meta: meta_w,
             tuple: tuple_w,
+            live: Arc::clone(&live),
         },
         Collection {
+            live,
             reader: flat_r,
             meta: meta_r,
             tuple: tuple_r,
@@ -209,6 +222,10 @@ struct CollectionWriters {
     flat: Writer,
     meta: meta::Writer,
     tuple: tuples::Writer,
+    /// Liveness version counter, shared with the read-side `Collection`. Bumped
+    /// once per liveness-changing record — the WAL thread is the only bumper,
+    /// which is the same single-writer argument the three writers above rest on.
+    live: Arc<meta::LiveHandle>,
 }
 
 /// Owns every collection's writers. Lives entirely on the WAL commit thread,
@@ -251,6 +268,18 @@ impl Apply for IndexApplier {
     /// replay. Watermarks advance LAST, only after every write succeeded: a
     /// watermark must never claim an apply that didn't happen, or checkpoint
     /// could persist it and recovery would skip the record forever.
+    ///
+    /// The liveness version is bumped once per liveness-changing record
+    /// (`Insert`/`Delete`, not DDL — a new collection has no rows), and
+    /// unconditionally: an idempotent replay of a delete bumps too. Over-
+    /// invalidation costs one re-materialization; the branch that avoided it
+    /// would cost a correctness argument.
+    ///
+    /// Fan-out ORDER is load-bearing, not incidental: a row becomes visible
+    /// when `meta.insert_row` sets its live bit, so every store a reader can
+    /// consult must already hold it by then. Inserts publish liveness last,
+    /// deletes publish it first. Do not reorder — `concurrent_stores.rs`
+    /// asserts the resulting property directly.
     fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<()> {
         match record {
             Record::Insert {
@@ -261,9 +290,16 @@ impl Apply for IndexApplier {
             } => {
                 let w = self.writers(*collection)?;
                 let ord32 = ordinal32(*ordinal)?;
+                // DATA FIRST, LIVENESS LAST. `meta.insert_row` is what makes
+                // the ordinal enumerable, so it must not run until every store
+                // that a reader will consult for that row already holds it —
+                // otherwise a snapshot can admit a row the tuple store has
+                // never seen, and a LiveSet is immutable, so that reader is
+                // wrong for as long as it holds the snapshot.
                 w.flat.write_at(*ordinal, vector).map_err(to_io)?;
-                w.meta.insert_row(ord32, metadata).map_err(to_io)?;
                 w.tuple.write_row(ord32, metadata).map_err(to_io)?;
+                w.meta.insert_row(ord32, metadata).map_err(to_io)?;
+                w.live.bump();
                 w.flat.advance_applied_lsn(lsn.0);
                 w.meta.advance_applied_lsn(lsn);
                 w.tuple.advance_applied_lsn(lsn);
@@ -274,9 +310,13 @@ impl Apply for IndexApplier {
             } => {
                 let w = self.writers(*collection)?;
                 let ord32 = ordinal32(*ordinal)?;
-                w.flat.delete(*ordinal).map_err(to_io)?;
+                // Retiring a row clears ONE bit. The vector stays in the flat
+                // index and the values stay in the tuple store, so a reader
+                // holding an older snapshot can still read the row it was
+                // promised; compaction reclaims both later. Liveness has one
+                // owner, so a delete has exactly one place to happen.
                 w.meta.remove_row(ord32).map_err(to_io)?;
-                w.tuple.delete_row(ord32).map_err(to_io)?;
+                w.live.bump();
                 w.flat.advance_applied_lsn(lsn.0);
                 w.meta.advance_applied_lsn(lsn);
                 w.tuple.advance_applied_lsn(lsn);
@@ -741,32 +781,27 @@ impl Db {
         }) {
             Ok(_lsn) => Ok(Ordinal(ordinal as u32)),
             Err(e) => {
-                // The append never became durable, so there is nothing to log —
-                // but the allocator already burned `ordinal`, leaving a
-                // zero-filled slot that a later insert will pull into search
-                // range and surface with score 0 (a phantom). Tombstone it in
-                // memory: a pure bit-flip, NOT a WAL Delete (the ordinal was
-                // never durable, so there is nothing to replay). Best-effort —
-                // if the lock is poisoned we still surface the original error.
+                // The append never became durable, so there is nothing to undo
+                // and nothing to hide. The allocator already burned `ordinal`,
+                // leaving a zero-filled slot in the flat index below the
+                // high-water mark — but a burned ordinal is in no WAL record,
+                // so it is in `live` on no path, and every read (search, scan,
+                // cursor) filters through the liveness snapshot. The hole is
+                // unreachable by construction rather than by a tombstone.
                 //
-                // TODO(durability): this in-memory tombstone is lost on a crash
-                // before the next checkpoint flushes the bitset. It fully covers
-                // the common case (a WAL append failure is effectively terminal —
-                // no later append succeeds, so the high-water mark never advances
-                // past `ordinal` and the gap is unreachable). The residual hole:
-                // a *transient* append failure, followed by a *successful* insert
-                // (which advances the high-water mark past `ordinal`), followed by
-                // a crash before any checkpoint — recovery would then rebuild the
-                // high-water mark over the gap with no tombstone, resurfacing the
-                // phantom. Closing it requires making the tombstone durable
-                // (e.g. logging a WAL `Delete { ordinal }` here, or persisting a
-                // "burned ordinals" set), which we deliberately deferred. Revisit
-                // if WAL failures ever become recoverable/retryable mid-session.
+                // This used to flip the flat index's tombstone bit from the
+                // CALLER's thread, the one place outside the WAL thread that
+                // mutated index state. It also left a durability hole: the bit
+                // was in-memory only, so a transient failure followed by a
+                // successful insert and a crash before checkpoint would
+                // resurface the phantom. Both went away with the snapshot —
+                // `live` is rebuilt from metadata.snap plus WAL replay, and the
+                // burned ordinal was never in either.
                 //
-                // The Writer lives on the WAL thread, so we flip the bit through
-                // the Reader — sound because the tombstone bitset is atomic (see
-                // `Reader::tombstone_uncommitted`).
-                let _ = coll.reader.tombstone_uncommitted(ordinal);
+                // NOTE FOR COMPACTION: `ordinal` is permanently burned — the
+                // allocator never reuses it, so every failed append costs the
+                // collection one slot of its capacity. Compaction renumbers
+                // ordinals and reclaims these gaps for free; nothing else does.
                 Err(Error::from(e))
             }
         }
@@ -788,7 +823,13 @@ impl Db {
     /// lock-free against the reader; concurrent searches do not serialize.
     pub fn search(&self, collection: u32, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
         let coll = self.collection(collection)?;
-        coll.reader.search(query, k)
+        // The SNAPSHOT is the authority, not the flat index's own view of what
+        // exists. `flat.write_at` runs first in the fan-out, so without this a
+        // bare SEARCH could rank a vector that a scan issued at the same instant
+        // would not show — one collection, two answers.
+        let live = coll.live.resolve();
+        coll.reader
+            .search_filtered(query, k, Some(live.bits()), None)
     }
 
     /// Brute-force top-`k` search within `collection`, restricted to `allowed`.
@@ -805,7 +846,9 @@ impl Db {
         allowed: &RoaringBitmap,
     ) -> Result<Vec<SearchResult>> {
         let coll = self.collection(collection)?;
-        coll.reader.search_filtered(query, k, Some(allowed))
+        let live = coll.live.resolve();
+        coll.reader
+            .search_filtered(query, k, Some(live.bits()), Some(allowed))
     }
 
     /// Create a new collection through the WAL (Phase 6): DDL is a mutation,
@@ -858,6 +901,18 @@ impl Db {
         Ok(id)
     }
 
+    /// The current liveness snapshot for `collection`, materializing it if no
+    /// reader has needed this version yet. `None` for an unknown collection.
+    ///
+    /// Resolve ONCE and hold the returned `Arc` for the life of a query: a
+    /// `LiveSet` is immutable, so the rows it admits never change underneath
+    /// the caller. Calling this per row would defeat the point.
+    pub fn live_snapshot(&self, collection: u32) -> Option<Arc<meta::LiveSet>> {
+        catalog_snapshot(&self.catalog)
+            .get(&collection)
+            .map(|c| c.live.resolve())
+    }
+
     /// A cloneable read handle for `collection`, for issuing searches from other
     /// threads in parallel. Returns `None` for an unknown collection.
     pub fn reader(&self, collection: u32) -> Option<Reader> {
@@ -896,7 +951,16 @@ impl Db {
     /// [`Cursor::over`].
     pub fn scan(&self, collection: u32) -> Result<Cursor<'static>> {
         let coll = self.collection(collection)?;
-        let live = coll.meta.live();
+        // The SNAPSHOT, not a fresh read of `live`. Two readers that resolve at
+        // the same version get the same set, which is what lets a scan and a
+        // filtered search agree about what is live; `meta.live()` is a read of
+        // mutable state and two calls a microsecond apart can differ.
+        //
+        // The bitmap is cloned out because `Cursor<'static>` needs an owning
+        // iterator and `LiveSet::iter` borrows. That clone is the same cost as
+        // the `live()` call it replaces — and next to a brute-force scan over
+        // the vectors themselves, it is noise.
+        let live = coll.live.resolve().bitmap().clone();
         self.scan_over(collection, live.into_iter().map(Ordinal))
     }
 
@@ -904,9 +968,17 @@ impl Db {
     /// scalar column in `ColumnId` order.
     ///
     /// The general form of [`scan`](Self::scan), and the seam the cursor was
-    /// built around: the ordinal source is a plain iterator, so a full scan
-    /// (`live()`), a ranked KNN result, and a future `WHERE`-filtered bitmap all
-    /// produce the SAME cursor type with no new machinery.
+    /// built around: the ordinal source is a plain iterator, so a full scan, a
+    /// ranked KNN result, and a `WHERE`-filtered bitmap all produce the SAME
+    /// cursor type with no new machinery.
+    ///
+    /// **`ordinals` must come from this collection's liveness snapshot** — a
+    /// full snapshot, or anything derived from one by intersection or ranking.
+    /// An ordinal the tuple store cannot produce is reported as
+    /// [`Error::SnapshotRowMissing`] rather than skipped, because from a
+    /// snapshot it can only mean the stores disagree. To iterate ordinals from
+    /// somewhere else, build a [`Cursor::over`](crate::Cursor::over) directly;
+    /// that one skips.
     ///
     /// **Order is preserved.** The cursor visits ordinals in the order given and
     /// imposes none of its own — which is what lets a KNN result stay in SCORE
@@ -925,7 +997,15 @@ impl Db {
         // ColumnId space), which is what makes `Cursor::column`'s position
         // coincide with the ColumnId for this projection.
         let columns = coll.config.schema.columns.iter().map(|c| c.id).collect();
-        Ok(Cursor::over(ordinals, coll.tuple.clone(), columns))
+        // STRICT: every ordinal source the engine hands a cursor is derived
+        // from a liveness snapshot, so a row the tuple store cannot produce is
+        // a consistency failure rather than something to skip past.
+        Ok(Cursor::over_snapshot(
+            collection,
+            ordinals,
+            coll.tuple.clone(),
+            columns,
+        ))
     }
 
     /// Resolve a collection NAME to the id every other method here is keyed by.
@@ -1084,6 +1164,7 @@ mod tests {
         ColumnDef, ColumnSpec, ColumnType, DeclarationOrdinal, RangeOp, Value,
     };
     use crate::metadata::tuples::RowGet;
+    use std::collections::BTreeSet;
     use std::num::NonZeroUsize;
 
     /// Vector-only collection: empty schema, inserts pass an empty row.
@@ -1136,6 +1217,19 @@ mod tests {
     fn meta_row(a: i64, c: &str) -> Row {
         vec![(0, Value::Int(a)), (1, Value::Text(c.into()))]
     }
+
+    /// Rows written by `writes_materialize_nothing`. Each insert is its own
+    /// group-commit batch (one writer, one record) and therefore its own fsync,
+    /// so this trades coverage against wall clock. Override to push it harder:
+    /// `FLATS_WRITE_ONLY_ROWS=100000 cargo test writes_materialize_nothing`.
+    fn write_only_rows() -> usize {
+        std::env::var("FLATS_WRITE_ONLY_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_WRITE_ONLY_ROWS)
+    }
+
+    const DEFAULT_WRITE_ONLY_ROWS: usize = 2_000;
 
     // Large interval => the background flusher never fires; tests drive
     // checkpoints explicitly for determinism.
@@ -1244,6 +1338,97 @@ mod tests {
         db.close().unwrap();
     }
 
+    /// The burned slot is hidden by the SNAPSHOT, not by a tombstone — and the
+    /// flat index is left physically untouched to prove it.
+    ///
+    /// `Db::insert`'s error path used to flip the flat index's tombstone bit
+    /// from the CALLER's thread: the one place outside the WAL thread that
+    /// mutated index state. It is unnecessary, because a burned ordinal is in
+    /// no WAL record and therefore in `live` on no path, and every read filters
+    /// through the liveness snapshot.
+    #[test]
+    fn burned_ordinal_is_hidden_without_touching_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap(); // ord 0
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap(); // ord 1
+
+        db.wal.as_ref().unwrap().fail_next_append();
+        assert!(db.insert(0, &[9.0, 9.0], vec![]).is_err(), "must surface");
+
+        // A later success pulls the burned slot into search range.
+        assert_eq!(db.insert(0, &[1.0, 0.0], vec![]).unwrap(), Ordinal(3));
+
+        // THE POINT: the flat index still holds ordinal 2, zero-filled and
+        // UNTOMBSTONED. Nothing mutated it — `vector_at` would return None if
+        // anything had.
+        let flat = db.reader(0).expect("reader");
+        assert_eq!(
+            flat.vector_at(Ordinal(2)),
+            Some(&[0.0, 0.0][..]),
+            "the burned slot must be left exactly as the allocator left it"
+        );
+
+        // ...and it is invisible anyway, because the snapshot never admitted it.
+        assert!(!db.live_snapshot(0).unwrap().contains(2));
+        let ids: BTreeSet<u32> = db
+            .search(0, &[1.0, 1.0], 64)
+            .unwrap()
+            .iter()
+            .map(|h| h.id.0)
+            .collect();
+        assert_eq!(ids, [0u32, 1, 3].into_iter().collect());
+
+        // The scan path agrees — one authority, one answer.
+        let mut cursor = db.scan(0).unwrap();
+        let mut scanned = Vec::new();
+        let mut has = cursor.seek_first().unwrap();
+        while has {
+            scanned.push(cursor.ordinal().unwrap().0);
+            has = cursor.next().unwrap();
+        }
+        assert_eq!(scanned, vec![0, 1, 3]);
+
+        db.close().unwrap();
+    }
+
+    /// The durability hole the old TODO deferred, now closed.
+    ///
+    /// The in-memory tombstone was lost on reopen, so a TRANSIENT append
+    /// failure, then a successful insert (pushing the high-water mark past the
+    /// gap), then a crash before any checkpoint would rebuild the mark over an
+    /// untombstoned zero slot and resurface the phantom. `live` is rebuilt from
+    /// metadata.snap plus WAL replay instead, and the burned ordinal is in
+    /// neither — so there is nothing to lose.
+    #[test]
+    fn burned_ordinal_stays_hidden_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap();
+        db.wal.as_ref().unwrap().fail_next_append();
+        assert!(db.insert(0, &[9.0, 9.0], vec![]).is_err());
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap(); // ord 2, mark -> 3
+
+        // NO checkpoint: reopen replays the WAL from the last durable snapshot,
+        // which is exactly the window the old mechanism could not survive.
+        db.close().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+
+        assert!(!db.live_snapshot(0).unwrap().contains(1));
+        let ids: BTreeSet<u32> = db
+            .search(0, &[1.0, 1.0], 64)
+            .unwrap()
+            .iter()
+            .map(|h| h.id.0)
+            .collect();
+        assert_eq!(
+            ids,
+            [0u32, 2].into_iter().collect(),
+            "the burned ordinal came back after recovery"
+        );
+        db.close().unwrap();
+    }
+
     // -----------------------------------------------------------------------
     // Phase 4c: metadata through the WAL apply path
     // -----------------------------------------------------------------------
@@ -1264,7 +1449,7 @@ mod tests {
         let tuples = db.tuple_reader(0).unwrap();
 
         // WHERE a < 3 → {0, 1}.
-        let filter = meta.lookup_range(0, RangeOp::Lt, &Value::Int(3)).unwrap();
+        let filter = meta.lookup_range(0, RangeOp::Lt, &Value::Int(3), &db.live_snapshot(0).unwrap()).unwrap();
         assert_eq!(filter.iter().collect::<Vec<u32>>(), vec![0, 1]);
 
         // Intersect with search candidates by hand.
@@ -1284,9 +1469,11 @@ mod tests {
 
         // Delete and re-check exclusion everywhere.
         db.delete(0, 0).unwrap();
-        let filter = meta.lookup_eq(1, &Value::Text("alice".into())).unwrap();
+        let filter = meta.lookup_eq(1, &Value::Text("alice".into()), &db.live_snapshot(0).unwrap()).unwrap();
         assert_eq!(filter.iter().collect::<Vec<u32>>(), vec![2]);
-        assert_eq!(tuples.get(Ordinal(0), &[0]).unwrap(), RowGet::Deleted);
+        // Retiring a row clears its live bit and touches nothing else — the
+        // values are still there for anyone holding an older snapshot.
+        assert!(matches!(tuples.get(Ordinal(0), &[0]).unwrap(), RowGet::Live(_)));
         assert_eq!(meta.live_count(), 2);
 
         db.close().unwrap();
@@ -1319,10 +1506,12 @@ mod tests {
         for ord in [0u32, 1, 2, 4] {
             assert!(matches!(tuples.get(Ordinal(ord), &[0]).unwrap(), RowGet::Live(_)));
         }
-        assert_eq!(tuples.get(Ordinal(3), &[0]).unwrap(), RowGet::Deleted);
+        // Retired, so absent from `live` — but its values survive.
+        assert!(matches!(tuples.get(Ordinal(3), &[0]).unwrap(), RowGet::Live(_)));
+        assert!(!meta.live().contains(3));
 
         // Spot-check lookups and values.
-        let evens = meta.lookup_eq(1, &Value::Text("even".into())).unwrap();
+        let evens = meta.lookup_eq(1, &Value::Text("even".into()), &db.live_snapshot(0).unwrap()).unwrap();
         assert_eq!(evens.iter().collect::<Vec<u32>>(), vec![0, 2, 4]);
         assert_eq!(
             tuples.get(Ordinal(4), &[0, 1]).unwrap(),
@@ -1389,11 +1578,11 @@ mod tests {
             let tuples = db.tuple_reader(0).unwrap();
             assert_eq!(meta.live_count(), 1, "victim {victim}");
             assert_eq!(
-                meta.lookup_eq(0, &Value::Int(2)).unwrap().iter().collect::<Vec<u32>>(),
+                meta.lookup_eq(0, &Value::Int(2), &db.live_snapshot(0).unwrap()).unwrap().iter().collect::<Vec<u32>>(),
                 vec![1],
                 "victim {victim}"
             );
-            assert_eq!(tuples.get(Ordinal(0), &[1]).unwrap(), RowGet::Deleted);
+            assert!(matches!(tuples.get(Ordinal(0), &[1]).unwrap(), RowGet::Live(_)));
             assert_eq!(
                 tuples.get(Ordinal(1), &[1]).unwrap(),
                 RowGet::Live(vec![Value::Text("y".into())]),
@@ -1430,7 +1619,7 @@ mod tests {
         assert_eq!(db.search(1, &[1.0, 0.0, 0.0], 10).unwrap().len(), 1);
         let meta = db.metadata_reader(0).unwrap();
         assert_eq!(
-            meta.lookup_eq(0, &Value::Int(7)).unwrap().iter().collect::<Vec<u32>>(),
+            meta.lookup_eq(0, &Value::Int(7), &db.live_snapshot(0).unwrap()).unwrap().iter().collect::<Vec<u32>>(),
             vec![0]
         );
         // The re-emerged schema still validates inserts.
@@ -1539,17 +1728,18 @@ mod tests {
         assert_eq!(db.search(0, &[1.0, 0.0], 10).unwrap().len(), 1);
         let meta0 = db.metadata_reader(0).unwrap();
         assert_eq!(meta0.live_count(), 1);
-        assert_eq!(
+        assert!(matches!(
             db.tuple_reader(0).unwrap().get(Ordinal(0), &[0]).unwrap(),
-            RowGet::Deleted
-        );
+            RowGet::Live(_)
+        ));
+        assert!(!meta0.live().contains(0), "retired, so out of `live`");
 
         // Collection 1: untouched by collection 0's delete; both rows live.
         assert_eq!(db.search(1, &[1.0, 0.0, 0.0, 0.0], 10).unwrap().len(), 2);
         let meta1 = db.metadata_reader(1).unwrap();
         assert_eq!(meta1.live_count(), 2);
         assert_eq!(
-            meta1.lookup_eq(0, &Value::Int(20)).unwrap().iter().collect::<Vec<u32>>(),
+            meta1.lookup_eq(0, &Value::Int(20), &db.live_snapshot(0).unwrap()).unwrap().iter().collect::<Vec<u32>>(),
             vec![1]
         );
         assert_eq!(
@@ -1611,7 +1801,7 @@ mod tests {
         assert_eq!(
             db.metadata_reader(id)
                 .unwrap()
-                .lookup_eq(0, &Value::Int(8))
+                .lookup_eq(0, &Value::Int(8), &db.live_snapshot(0).unwrap())
                 .unwrap()
                 .iter()
                 .collect::<Vec<u32>>(),
@@ -1943,6 +2133,208 @@ mod tests {
         // `create_collection`: if "C0" resolved to "c0" here, two names that
         // `create_collection` considers distinct would collide at execution.
         assert!(db.collection_id("C0").is_err());
+
+        db.close().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Liveness versioning
+    // -----------------------------------------------------------------------
+
+    /// The collection's shared liveness handle. Tests live in this module, so
+    /// they reach it directly rather than widening the public API.
+    fn live_handle(db: &Db, id: u32) -> Arc<meta::LiveHandle> {
+        Arc::clone(
+            &catalog_snapshot(&db.catalog)
+                .get(&id)
+                .expect("collection exists")
+                .live,
+        )
+    }
+
+    /// One bump per liveness-changing record, no more and no less. The counter
+    /// is what invalidates every cached snapshot, so a missed bump makes writes
+    /// permanently invisible and a doubled bump throws away a good snapshot.
+    #[test]
+    fn insert_and_delete_bump_the_version_once_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        let live = live_handle(&db, 0);
+
+        let before = live.version();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap();
+        assert_eq!(live.version(), before + 1, "insert bumps exactly once");
+
+        db.insert(0, &[2.0, 0.0], vec![]).unwrap();
+        db.insert(0, &[3.0, 0.0], vec![]).unwrap();
+        assert_eq!(live.version(), before + 3);
+
+        db.delete(0, 1).unwrap();
+        assert_eq!(live.version(), before + 4, "delete bumps exactly once");
+
+        // Deleting an already-dead ordinal still bumps: the applier does not
+        // branch on whether liveness actually moved. Over-invalidation is a
+        // wasted re-materialization, never a correctness problem.
+        db.delete(0, 1).unwrap();
+        assert_eq!(live.version(), before + 5);
+
+        db.close().unwrap();
+    }
+
+    /// DDL is a mutation, but not a LIVENESS mutation — a fresh collection has
+    /// no rows. Bumping here would invalidate every other collection's readers
+    /// for nothing.
+    #[test]
+    fn create_collection_does_not_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        let live = live_handle(&db, 0);
+
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap();
+        let after_insert = live.version();
+
+        let id = db.create_collection("fresh", 64, vec_only(2)).unwrap();
+        assert_eq!(live.version(), after_insert, "DDL must not bump");
+        assert_eq!(
+            live_handle(&db, id).version(),
+            0,
+            "a new collection starts at version 0"
+        );
+
+        db.close().unwrap();
+    }
+
+    /// A snapshot resolved over a real collection agrees with the authority it
+    /// was copied from, and reading it costs exactly one materialization no
+    /// matter how many times it is resolved.
+    #[test]
+    fn resolve_matches_the_live_bitmap() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        let live = live_handle(&db, 0);
+        let meta = db.metadata_reader(0).unwrap();
+
+        for i in 0..8 {
+            db.insert(0, &[i as f32, 0.0], vec![]).unwrap();
+        }
+        db.delete(0, 3).unwrap();
+
+        let set = live.resolve();
+        assert_eq!(set.bitmap(), &meta.live(), "snapshot must match the authority");
+        assert_eq!(set.len(), 7);
+        assert!(!set.contains(3));
+        assert_eq!(set.version(), 9, "8 inserts + 1 delete");
+
+        // Re-resolving at an unchanged version is a pointer clone.
+        assert!(Arc::ptr_eq(&set, &live.resolve()));
+        assert_eq!(live.materializations(), 1);
+
+        // A write invalidates it, and the OLD snapshot is unmoved — the row it
+        // could see when it was taken, it can still see.
+        db.delete(0, 4).unwrap();
+        let newer = live.resolve();
+        assert_eq!(newer.len(), 6);
+        assert_eq!(set.len(), 7, "an outstanding snapshot never mutates");
+        assert!(set.contains(4));
+        assert_eq!(live.materializations(), 2);
+
+        db.close().unwrap();
+    }
+
+    /// A lookup answers as of the SNAPSHOT it is handed, not as of now.
+    ///
+    /// This is what makes a query correspond to one instant. Before the
+    /// snapshot became a parameter, every lookup masked against the metadata
+    /// index's current liveness, so two predicates in one `WHERE` answered as
+    /// of two different moments and their union could describe a row set that
+    /// never existed.
+    #[test]
+    fn a_lookup_answers_as_of_its_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], meta_row(1, "alice")).unwrap(); // ord 0
+        db.insert(0, &[2.0, 0.0], meta_row(2, "alice")).unwrap(); // ord 1
+        db.insert(0, &[3.0, 0.0], meta_row(3, "bob")).unwrap(); // ord 2
+
+        let meta = db.metadata_reader(0).unwrap();
+        let before = db.live_snapshot(0).unwrap();
+
+        db.delete(0, 1).unwrap();
+        let after = db.live_snapshot(0).unwrap();
+        assert!(!Arc::ptr_eq(&before, &after), "the delete moved the version");
+
+        // The OLD snapshot still sees ordinal 1 — a query that opened before
+        // the delete must keep seeing the row it was promised, predicate or no
+        // predicate.
+        let alice = Value::Text("alice".into());
+        assert_eq!(
+            meta.lookup_eq(1, &alice, &before)
+                .unwrap()
+                .iter()
+                .collect::<Vec<u32>>(),
+            vec![0, 1],
+            "a lookup against the old snapshot lost a row it should still see"
+        );
+        // The new one does not.
+        assert_eq!(
+            meta.lookup_eq(1, &alice, &after)
+                .unwrap()
+                .iter()
+                .collect::<Vec<u32>>(),
+            vec![0]
+        );
+
+        // Same for ranges.
+        assert_eq!(
+            meta.lookup_range(0, RangeOp::Lt, &Value::Int(3), &before)
+                .unwrap()
+                .iter()
+                .collect::<Vec<u32>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            meta.lookup_range(0, RangeOp::Lt, &Value::Int(3), &after)
+                .unwrap()
+                .iter()
+                .collect::<Vec<u32>>(),
+            vec![0]
+        );
+
+        db.close().unwrap();
+    }
+
+    /// THE write-path gate: writing must never build a snapshot. Rebuilding a
+    /// LiveSet per statement would cost a ~125KB bitmap copy per million rows,
+    /// on the write path — the whole reason the version counter exists.
+    ///
+    /// This cannot fail today: nothing in the crate materializes yet. It is a
+    /// tripwire planted before the code that could trip it, and it becomes
+    /// load-bearing the moment lazy resolution lands.
+    #[test]
+    fn writes_materialize_nothing() {
+        let rows = write_only_rows();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, rows + 8)], manual_opts()).unwrap();
+        let live = live_handle(&db, 0);
+
+        for i in 0..rows {
+            db.insert(0, &[i as f32, 0.0], vec![]).unwrap();
+        }
+        for o in 0..(rows as u64 / 4) {
+            db.delete(0, o).unwrap();
+        }
+
+        assert_eq!(
+            live.version(),
+            (rows + rows / 4) as u64,
+            "one bump per write"
+        );
+        assert_eq!(
+            live.materializations(),
+            0,
+            "a write-only workload must not build a single snapshot"
+        );
+        assert!(live.cached().is_none(), "nothing should be cached");
 
         db.close().unwrap();
     }

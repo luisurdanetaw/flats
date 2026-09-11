@@ -38,13 +38,18 @@
 //! hold `&MmapMut` — itself an aliasing violation. Caching the base sidesteps
 //! that entirely; the raw pointer is the explicit interior-mutability handle.
 //!
-//! # On-disk layout (version 2) — unchanged by the split
+//! # On-disk layout (version 3)
 //! ```text
 //! page 0:  header slot A   (64 bytes used)
 //! page 1:  header slot B   (64 bytes used)
-//! page 2+: tombstone bitset (ceil(capacity/8) bytes)
-//! page N:  vectors          (f32 * dim * capacity), page-aligned start
+//! page 2:  vectors          (f32 * dim * capacity)
 //! ```
+//! Version 3 DROPPED the tombstone bitset that versions 1-2 kept on pages 2+.
+//! This index no longer decides what is visible — the metadata index's `live`
+//! bitmap is the sole authority, and every read filters through a liveness
+//! snapshot derived from it. Removing the bitset moves the vector region, so a
+//! v2 file is not merely stale but misaligned; `open` refuses it rather than
+//! misreading it.
 //! Each header slot (little-endian): magic u32, version u32, dim u32, flags u32,
 //! count u32, _pad u32, last_lsn u64, capacity u64, seq u64, crc32 u32 (over the
 //! first 48 bytes). Two slots on separate pages are alternated each checkpoint
@@ -57,7 +62,7 @@ use std::fs::OpenOptions;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
 use memmap2::MmapMut;
 use roaring::RoaringBitmap;
@@ -66,7 +71,7 @@ use crate::error::{Error, Result};
 use crate::simd::dot;
 
 const MAGIC: u32 = u32::from_le_bytes(*b"FLAT");
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const F32_BYTES: usize = std::mem::size_of::<f32>(); // 4
 const PAGE: usize = 4096;
 
@@ -75,7 +80,7 @@ const SLOT_BYTES: usize = 64;
 const SLOT_CRC_COVERAGE: usize = 48; // crc covers bytes [0, 48) of a slot
 const SLOT0_OFFSET: usize = 0;
 const SLOT1_OFFSET: usize = PAGE;
-const BITSET_OFFSET: usize = 2 * PAGE;
+const VECTORS_OFFSET: usize = 2 * PAGE;
 
 // Field offsets within a slot.
 const F_MAGIC: usize = 0;
@@ -150,9 +155,7 @@ struct FlatIndexInner {
 //      made visible solely via the Release store on `count`; Readers Acquire-
 //      load `count` and read only ordinals below it, so no reference ever
 //      aliases a region being written.
-//   3. The tombstone bitset (the only in-place mutation) is touched exclusively
-//      through `AtomicU8`.
-//   4. The header region is writer-exclusive and only read single-threaded at
+//   3. The header region is writer-exclusive and only read single-threaded at
 //      open.
 unsafe impl Send for FlatIndexInner {}
 unsafe impl Sync for FlatIndexInner {}
@@ -188,37 +191,11 @@ impl FlatIndexInner {
         }
     }
 
-    /// The tombstone byte holding `ordinal`'s bit, viewed as an atomic.
-    fn tombstone_byte(&self, ordinal: usize) -> &AtomicU8 {
-        // SAFETY: `BITSET_OFFSET + ordinal/8` is within the bitset region
-        // (ordinal < capacity). This byte is accessed ONLY through this
-        // `&AtomicU8` (load here, fetch_or in `Writer::delete`), never as a plain
-        // `&mut u8`, so concurrent reader/writer access is well-defined atomic
-        // access. The pointer carries the mapping's provenance.
-        unsafe { &*(self.base.add(BITSET_OFFSET + ordinal / 8) as *const AtomicU8) }
-    }
-
-    fn is_deleted(&self, ordinal: usize) -> bool {
-        let byte = self.tombstone_byte(ordinal).load(AtomicOrdering::Relaxed);
-        (byte >> (ordinal % 8)) & 1 == 1
-    }
-
-    /// Atomically set `ordinal`'s tombstone bit. Idempotent. Sound from any
-    /// thread: the bitset is an atomic structure (Relaxed suffices — the bit is
-    /// an independent flag; the vector it refers to was published via `count`).
-    fn set_deleted(&self, ordinal: usize) {
-        self.tombstone_byte(ordinal)
-            .fetch_or(1 << (ordinal % 8), AtomicOrdering::Relaxed);
-    }
 }
 
 /// Geometry helpers (independent of any handle).
-fn bitset_bytes(capacity: usize) -> usize {
-    capacity.div_ceil(8)
-}
-fn vectors_offset(capacity: usize) -> usize {
-    let end = BITSET_OFFSET + bitset_bytes(capacity);
-    end.div_ceil(PAGE) * PAGE
+fn vectors_offset(_capacity: usize) -> usize {
+    VECTORS_OFFSET
 }
 fn bytes_for(dim: usize, capacity: usize) -> Result<usize> {
     let vec_bytes = dim
@@ -428,19 +405,6 @@ impl Writer {
         Ok(Ordinal(ordinal as u32))
     }
 
-    /// Tombstone `ordinal`. Idempotent; never errors on a re-set.
-    pub fn delete(&mut self, ordinal: u64) -> Result<()> {
-        if ordinal >= self.inner.capacity as u64 {
-            return Err(Error::CapacityExceeded {
-                capacity: self.inner.capacity,
-            });
-        }
-        // In-place flip below `count`, where Readers may be reading — hence the
-        // atomic RMW inside `set_deleted`.
-        self.inner.set_deleted(ordinal as usize);
-        Ok(())
-    }
-
     /// Record that the engine applied up to `lsn`. Its max becomes the durable
     /// watermark at the next checkpoint.
     pub fn advance_applied_lsn(&mut self, lsn: u64) {
@@ -474,8 +438,8 @@ impl Writer {
 
     /// Step (a): flush the bitset + vector pages.
     pub fn sync_data(&self) -> Result<()> {
-        let len = self.inner.len - BITSET_OFFSET;
-        self.inner._mmap.flush_range(BITSET_OFFSET, len)?;
+        let len = self.inner.len - VECTORS_OFFSET;
+        self.inner._mmap.flush_range(VECTORS_OFFSET, len)?;
         Ok(())
     }
 
@@ -547,28 +511,13 @@ impl Reader {
         self.len() == 0
     }
 
-    /// Tombstone an ordinal that was never durably committed — e.g. one whose
-    /// `insert` reserved the slot but whose WAL append failed, leaving a
-    /// zero-filled hole that would otherwise surface in search with score 0.
+    /// The vector stored at `ordinal`, or `None` if it is past the published
+    /// count.
     ///
-    /// Sound to call from any thread (it is on `Reader` precisely because the
-    /// engine holds Readers, not the Writer): the tombstone bitset is an atomic
-    /// structure, unlike the vector region whose single-writer publication rides
-    /// on `count`. This is NOT a general delete — use the Writer / WAL for those.
-    pub fn tombstone_uncommitted(&self, ordinal: u64) -> Result<()> {
-        if ordinal >= self.inner.capacity as u64 {
-            return Err(Error::CapacityExceeded {
-                capacity: self.inner.capacity,
-            });
-        }
-        self.inner.set_deleted(ordinal as usize);
-        Ok(())
-    }
-
-    /// The vector stored at `ordinal`, or `None` if it is not visible.
-    ///
-    /// Visibility is **exactly** [`search`](Self::search)'s: an ordinal
-    /// resolves iff it is below the published count AND not tombstoned. Nothing
+    /// This index does NOT decide what is visible — the metadata index's `live`
+    /// bitmap does, and callers filter through a liveness snapshot. A vector
+    /// whose row has been deleted is still returned here; it simply is not in
+    /// anyone's snapshot. Nothing
     /// `search` would hide is reachable here, and nothing `search` can return
     /// is unreachable — `assert_visibility_parity` in the tests mechanizes that
     /// equivalence. In particular a never-written slot BELOW the high-water
@@ -597,18 +546,19 @@ impl Reader {
         if end > vectors.len() {
             return None;
         }
-        // Tombstones are checked AFTER the bound: `is_deleted` indexes the
-        // bitset by ordinal and is only in-bounds for ordinals within capacity.
-        if self.inner.is_deleted(id) {
-            return None;
-        }
         Some(&vectors[start..end])
     }
 
-    /// Brute-force top-`k` search. Tombstoned ordinals are skipped. Results are
-    /// most-similar (highest dot product) first.
+    /// Brute-force top-`k` search over EVERY committed vector, minus this
+    /// index's own tombstones. Results are most-similar first.
+    ///
+    /// This form consults no liveness snapshot, so it can rank a row that the
+    /// rest of the engine does not consider live yet. Callers that answer user
+    /// queries want [`search_filtered`](Self::search_filtered) with the
+    /// collection's snapshot; this stays for tests and for index-level work
+    /// that has no snapshot to speak of.
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
-        self.search_filtered(query, k, None)
+        self.search_filtered(query, k, None, None)
     }
 
     /// Brute-force top-`k` search restricted to `allowed`.
@@ -619,7 +569,15 @@ impl Reader {
     /// nearest neighbours happen not to match — and would look entirely
     /// plausible while doing it.
     ///
-    /// `None` means "no restriction" and is exactly [`Reader::search`].
+    /// `live` is the collection's liveness snapshot as a flat bitset (LSB-first
+    /// within each word, indexed by ordinal). It is a SECOND prefilter and the
+    /// authoritative one: an ordinal past the end of the slice, or with its bit
+    /// clear, is not live. Passing a raw slice rather than the snapshot type
+    /// keeps this module free of any dependency on the metadata layer, and
+    /// keeps the inner test to one shift and one AND.
+    ///
+    /// Both filters `None` means "no restriction" and is exactly
+    /// [`Reader::search`].
     ///
     /// Still a full pass over the vectors. A very selective filter would be
     /// better served by iterating the bitmap and fetching those rows directly,
@@ -629,6 +587,7 @@ impl Reader {
         &self,
         query: &[f32],
         k: usize,
+        live: Option<&[u64]>,
         allowed: Option<&RoaringBitmap>,
     ) -> Result<Vec<SearchResult>> {
         let dim = self.inner.dim.get();
@@ -653,7 +612,14 @@ impl Reader {
         let mut heap = BinaryHeap::with_capacity(k.min(committed));
 
         for (id, v) in vectors.chunks_exact(dim).enumerate() {
-            if self.inner.is_deleted(id) {
+            // The liveness snapshot, and the ONLY liveness test: one shift and
+            // one AND, in front of the dot product. A row the snapshot does not
+            // admit is not this query's to return, however close it happens to
+            // be. With `live` as None this index has no opinion at all and
+            // returns every committed vector.
+            if let Some(live) = live
+                && live.get(id / 64).is_none_or(|w| w >> (id % 64) & 1 == 0)
+            {
                 continue;
             }
             // The prefilter, applied BEFORE the distance is even computed —
@@ -808,20 +774,68 @@ mod tests {
         assert_eq!(results[0].score, 2.0);
     }
 
+    /// A v2 file is REFUSED, not misread and not silently re-created.
+    ///
+    /// v2 kept a tombstone bitset on pages 2+, so its vector region starts
+    /// somewhere else entirely: opening one as v3 would read vectors out of the
+    /// old bitset. And silently treating it as a fresh empty index — the way
+    /// the metadata stores treat a corrupt snapshot, because the WAL can heal
+    /// those — would be DATA LOSS here, since the vectors are the only copy.
     #[test]
-    fn delete_is_idempotent_and_hidden_from_search() {
+    fn open_refuses_an_old_format_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir, "v2.idx");
+        {
+            let (mut w, _r) = FlatIndex::create(&path, dim(2), 8).unwrap();
+            w.write_at(0, &[1.0, 0.0]).unwrap();
+            w.sync().unwrap();
+        }
+
+        // Rewrite both header slots' version field as 2 and fix their crcs, so
+        // the ONLY thing wrong with this file is that it is the old format.
+        let mut bytes = std::fs::read(&path).unwrap();
+        for slot in 0..2 {
+            let base = slot_offset(slot);
+            bytes[base + F_VERSION..base + F_VERSION + 4].copy_from_slice(&2u32.to_le_bytes());
+            let crc = crc32(&bytes[base..base + SLOT_CRC_COVERAGE]);
+            bytes[base + F_CRC..base + F_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        match FlatIndex::open(&path) {
+            Err(Error::UnsupportedVersion { got: 2 }) => {}
+            Err(e) => panic!("wrong error for an old-format file: {e:?}"),
+            Ok(_) => panic!("a v2 index must be refused, not opened"),
+        }
+
+        // Refusal must not have touched the file — a failed open that resets
+        // the index would destroy the only copy of the vectors.
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "open mutated the file");
+    }
+
+    /// A retired row is still HERE — this index keeps the vector and has no
+    /// opinion about visibility. Only the snapshot hides it.
+    #[test]
+    fn a_retired_row_stays_in_the_index() {
         let dir = tempfile::tempdir().unwrap();
         let path = temp_path(&dir, "del.bin");
         let (mut w, r) = FlatIndex::create(&path, dim(2), 8).unwrap();
         w.write_at(0, &[1.0, 0.0]).unwrap();
         w.write_at(1, &[2.0, 0.0]).unwrap();
 
-        w.delete(1).unwrap();
-        w.delete(1).unwrap(); // idempotent, no error
+        // Unfiltered: both, because this index does not know about deletes.
+        assert_eq!(r.search(&[1.0, 0.0], 8).unwrap().len(), 2);
+        assert_eq!(r.vector_at(Ordinal(1)), Some([2.0, 0.0].as_slice()));
 
-        let results = r.search(&[1.0, 0.0], 8).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, Ordinal(0));
+        // Retire ordinal 1 the only way it can now be retired — by leaving it
+        // out of the snapshot.
+        let live = bits(&[0]);
+        let hits = r.search_filtered(&[1.0, 0.0], 8, Some(&live), None).unwrap();
+        assert_eq!(ids(&hits), vec![0]);
+
+        // ...and its vector is still readable, which is what lets a reader on an
+        // older snapshot still see the row it was promised.
+        assert_eq!(r.vector_at(Ordinal(1)), Some([2.0, 0.0].as_slice()));
     }
 
     #[test]
@@ -985,8 +999,112 @@ mod tests {
         assert_visibility_parity(&r, 2);
     }
 
+    /// Bare search must obey the liveness snapshot, not just its own
+    /// tombstones. The flat index still HOLDS every one of these vectors and
+    /// has tombstoned none of them; the snapshot alone decides.
+    ///
+    /// This is the split-authority fix in its smallest form. Before it,
+    /// `search` had no snapshot to consult and would happily rank a row the
+    /// rest of the engine did not consider live — a vector is searchable the
+    /// instant `write_at` lands, which is strictly before the metadata index
+    /// hears about it.
     #[test]
-    fn vector_at_skips_tombstoned() {
+    fn search_obeys_the_liveness_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.idx");
+        let (mut w, r) = FlatIndex::create(&path, NonZeroUsize::new(2).unwrap(), 8).unwrap();
+        for (o, v) in [[1.0, 0.0], [0.9, 0.1], [0.8, 0.2], [0.7, 0.3]]
+            .into_iter()
+            .enumerate()
+        {
+            w.write_at(o as u64, &v).unwrap();
+        }
+
+        // No snapshot: every vector is fair game.
+        let all = r.search(&[1.0, 0.0], 4).unwrap();
+        assert_eq!(ids(&all), vec![0, 1, 2, 3]);
+
+        // A snapshot that omits the two best matches. They are NOT tombstoned —
+        // `search` must exclude them purely on the snapshot's say-so.
+        let live = bits(&[2, 3]);
+        let filtered = r.search_filtered(&[1.0, 0.0], 4, Some(&live), None).unwrap();
+        assert_eq!(ids(&filtered), vec![2, 3]);
+        assert!(
+            r.vector_at(Ordinal(0)).is_some(),
+            "ordinal 0 is still in the index and untombstoned — only the \
+             snapshot excluded it"
+        );
+
+        // An empty snapshot admits nothing, however close the vectors are.
+        let none: [u64; 0] = [];
+        assert!(r.search_filtered(&[1.0, 0.0], 4, Some(&none), None).unwrap().is_empty());
+    }
+
+    /// The two prefilters compose: `k` counts rows that pass BOTH, and neither
+    /// can smuggle a row past the other.
+    #[test]
+    fn snapshot_and_predicate_prefilters_compose() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.idx");
+        let (mut w, r) = FlatIndex::create(&path, NonZeroUsize::new(2).unwrap(), 8).unwrap();
+        for (o, v) in [[1.0, 0.0], [0.9, 0.1], [0.8, 0.2], [0.7, 0.3]]
+            .into_iter()
+            .enumerate()
+        {
+            w.write_at(o as u64, &v).unwrap();
+        }
+
+        let live = bits(&[0, 1, 2]);
+        let allowed: RoaringBitmap = [1u32, 2, 3].into_iter().collect();
+
+        // Intersection is {1, 2}: 0 fails the predicate, 3 fails liveness.
+        let hits = r
+            .search_filtered(&[1.0, 0.0], 4, Some(&live), Some(&allowed))
+            .unwrap();
+        assert_eq!(ids(&hits), vec![1, 2]);
+
+        // With a snapshot covering everything, only the predicate bites — and
+        // the result matches the predicate-only search exactly.
+        let all_live = bits(&[0, 1, 2, 3]);
+        let a = r.search_filtered(&[1.0, 0.0], 4, Some(&all_live), Some(&allowed)).unwrap();
+        let b = r.search_filtered(&[1.0, 0.0], 4, None, Some(&allowed)).unwrap();
+        assert_eq!(ids(&a), ids(&b));
+        assert_eq!(ids(&a), vec![1, 2, 3]);
+    }
+
+    /// Ordinal-indexed, LSB-first within each word — the layout
+    /// `search_filtered` decodes. A mismatch here silently filters the wrong
+    /// rows, so it is pinned rather than assumed.
+    #[test]
+    fn live_bits_layout_is_ordinal_indexed_lsb_first() {
+        assert_eq!(bits(&[0]), vec![1u64]);
+        assert_eq!(bits(&[1]), vec![2u64]);
+        assert_eq!(bits(&[63]), vec![1u64 << 63]);
+        assert_eq!(bits(&[64]), vec![0u64, 1]);
+        assert_eq!(bits(&[0, 64, 65]), vec![1u64, 0b11]);
+    }
+
+    /// Build a liveness bitset the way `LiveSet` does.
+    fn bits(ordinals: &[u32]) -> Vec<u64> {
+        let words = ordinals.iter().max().map_or(0, |m| *m as usize / 64 + 1);
+        let mut out = vec![0u64; words];
+        for o in ordinals {
+            out[*o as usize / 64] |= 1 << (o % 64);
+        }
+        out
+    }
+
+    fn ids(hits: &[SearchResult]) -> Vec<u32> {
+        let mut v: Vec<u32> = hits.iter().map(|h| h.id.0).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// `vector_at` resolves everything below the published count — including a
+    /// slot no live row points at. Hiding is the snapshot's job, and
+    /// `assert_visibility_parity` pins that unfiltered `search` agrees.
+    #[test]
+    fn vector_at_resolves_everything_below_the_count() {
         let dir = tempfile::tempdir().unwrap();
         let path = temp_path(&dir, "vectomb.bin");
         let (mut w, r) = FlatIndex::create(&path, dim(2), 8).unwrap();
@@ -994,21 +1112,9 @@ mod tests {
         w.write_at(1, &[2.0, 0.0]).unwrap();
         w.write_at(2, &[3.0, 0.0]).unwrap();
 
-        w.delete(1).unwrap();
-
-        assert_eq!(
-            r.vector_at(Ordinal(1)),
-            None,
-            "tombstoned ordinal is not reachable"
-        );
         assert_eq!(r.vector_at(Ordinal(0)), Some([1.0, 0.0].as_slice()));
+        assert_eq!(r.vector_at(Ordinal(1)), Some([2.0, 0.0].as_slice()));
         assert_eq!(r.vector_at(Ordinal(2)), Some([3.0, 0.0].as_slice()));
-        assert_visibility_parity(&r, 2);
-
-        // The Reader-side tombstone path (uncommitted-insert cleanup) hides the
-        // ordinal just the same — search and vector_at share one bitset.
-        r.tombstone_uncommitted(2).unwrap();
-        assert_eq!(r.vector_at(Ordinal(2)), None);
         assert_visibility_parity(&r, 2);
     }
 

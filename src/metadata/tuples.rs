@@ -36,9 +36,12 @@
 //! ColumnId — ids are dense 0..n by Schema construction), so `get` is an
 //! index, not a search.
 //!
-//! Unlike 4a's lazy live-bitmap, deletion here is per-slot (`Tombstone`)
-//! because the caller of `get` needs the distinction "was deleted" — the
-//! spec's deleted-marker test.
+//! This store does NOT decide what is visible, and does not destroy anything on
+//! delete. The metadata index's `live` bitmap is liveness's sole owner, and a
+//! reader holding an older liveness snapshot must still be able to read the
+//! values of a row that has since been retired — otherwise a row could vanish
+//! out from under an open cursor. Retired values are reclaimed by compaction,
+//! not by `delete_row`.
 //!
 //! # `tuples.snap` layout
 //!
@@ -67,7 +70,7 @@ use crate::error::{Error, Result};
 use crate::metadata::common::{ColumnId, Lsn, Ordinal, Row, Schema, Value};
 
 const MAGIC: &[u8; 4] = b"TUP0";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const SNAP_FILE: &str = "tuples.snap";
 const TMP_FILE: &str = "tuples.snap.tmp";
 
@@ -80,12 +83,10 @@ use crate::metadata::crc32;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 enum Slot {
     /// Never written (a hole from sparse ordinals, or beyond the highest
-    /// write). Distinct from Tombstone on purpose.
+    /// write).
     Vacant,
     /// Values positionally by ColumnId.
     Live(Vec<Value>),
-    /// Written, then deleted. `get` reports this as `RowGet::Deleted`.
-    Tombstone,
 }
 
 /// What `Reader::get` hands back. An enum instead of Option so the executor
@@ -97,8 +98,14 @@ enum Slot {
 pub enum RowGet {
     /// The requested columns' values, in the order requested.
     Live(Vec<Value>),
-    /// The spec's "deleted-marker".
-    Deleted,
+    /// No row was ever written at this ordinal.
+    ///
+    /// NOT a deleted row. There used to be a `Deleted` variant here, back when
+    /// this store destroyed values on delete and reported a tombstone — a
+    /// second authority on visibility. Retiring a row now clears one bit in the
+    /// metadata index and leaves this store untouched, so a retired row still
+    /// reads back `Live`. Whether it is VISIBLE is a question only a liveness
+    /// snapshot can answer.
     Missing,
 }
 
@@ -235,16 +242,6 @@ impl Writer {
         Ok(())
     }
 
-    /// Tombstone `ordinal`. Idempotent.
-    ///
-    /// Beyond-the-end or Vacant ordinals grow and get marked anyway — a
-    /// replayed Delete may arrive when the snapshot already folded the
-    /// Insert away; the marker must still stick.
-    pub fn delete_row(&mut self, ordinal: Ordinal) -> Result<()> {
-        *self.lock().slot_mut(ordinal) = Slot::Tombstone;
-        Ok(())
-    }
-
     /// Same contract as `metadata::index::Writer::advance_applied_lsn`:
     /// monotonic, keeps max(current, lsn).
     pub fn advance_applied_lsn(&mut self, lsn: Lsn) {
@@ -309,7 +306,6 @@ impl Reader {
         }
         match inner.slots.get(ordinal.0 as usize) {
             None | Some(Slot::Vacant) => Ok(RowGet::Missing),
-            Some(Slot::Tombstone) => Ok(RowGet::Deleted),
             Some(Slot::Live(values)) => Ok(RowGet::Live(
                 columns.iter().map(|&c| values[c as usize].clone()).collect(),
             )),
@@ -468,23 +464,24 @@ mod tests {
         assert_eq!(r.get(Ordinal(2000), &[0]).unwrap(), RowGet::Missing);
     }
 
+    /// Retiring a row does not reach this store at all: the values stay put so
+    /// a reader holding an older liveness snapshot can still read the row it
+    /// was promised. There is no longer any way to make `get` forget a value —
+    /// only compaction reclaims one.
     #[test]
-    fn tombstoned_ordinal_returns_deleted_marker() {
+    fn retiring_a_row_does_not_destroy_its_values() {
         let dir = tempfile::tempdir().unwrap();
         let (mut w, r) = TupleStore::create(dir.path(), test_schema()).unwrap();
 
         w.write_row(Ordinal(5), &row(5, 5.0, "five")).unwrap();
-        w.delete_row(Ordinal(5)).unwrap();
-        assert_eq!(r.get(Ordinal(5), &[0]).unwrap(), RowGet::Deleted);
+        assert_eq!(
+            r.get(Ordinal(5), &[0, 2]).unwrap(),
+            RowGet::Live(vec![Value::Int(5), Value::Text("five".into())])
+        );
 
-        // Idempotent.
-        w.delete_row(Ordinal(5)).unwrap();
-        assert_eq!(r.get(Ordinal(5), &[0]).unwrap(), RowGet::Deleted);
-
-        // Delete on a vacant ordinal: the marker must still stick (a
-        // replayed Delete whose Insert was folded into the snapshot).
-        w.delete_row(Ordinal(9)).unwrap();
-        assert_eq!(r.get(Ordinal(9), &[0]).unwrap(), RowGet::Deleted);
+        // A never-written ordinal is still Missing — Vacant and retired are
+        // different things, and only one of them is a bug signal.
+        assert_eq!(r.get(Ordinal(9), &[0]).unwrap(), RowGet::Missing);
     }
 
     #[test]
@@ -513,7 +510,6 @@ mod tests {
             w.write_row(Ordinal(0), &row(1, 1.0, "x")).unwrap();
             w.write_row(Ordinal(1), &row(2, 2.0, "y")).unwrap();
             w.write_row(Ordinal(3), &row(4, 4.0, "w")).unwrap(); // 2 stays Vacant
-            w.delete_row(Ordinal(1)).unwrap();
             w.checkpoint(Lsn(9)).unwrap();
         }
 
@@ -523,7 +519,7 @@ mod tests {
             r.get(Ordinal(0), &[0, 2]).unwrap(),
             RowGet::Live(vec![Value::Int(1), Value::Text("x".into())])
         );
-        assert_eq!(r.get(Ordinal(1), &[0]).unwrap(), RowGet::Deleted);
+        assert!(matches!(r.get(Ordinal(1), &[0]).unwrap(), RowGet::Live(_)));
         assert_eq!(r.get(Ordinal(2), &[0]).unwrap(), RowGet::Missing);
         assert!(matches!(r.get(Ordinal(3), &[1]).unwrap(), RowGet::Live(_)));
     }

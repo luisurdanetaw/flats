@@ -2,42 +2,34 @@
 //! metadata index and the tuple store.
 //!
 //! ============================================================================
-//! WORLD VERDICT: **WORLD A — `Missing` on a live ordinal is a LEGAL TRANSIENT.**
+//! WORLD VERDICT: **WORLD B — `Missing` on a live ordinal is IMPOSSIBLE.**
 //!
-//! The race is not theoretical and it is not rare. `live_then_get_under_
-//! concurrent_writes` observes it **~20-28k times in ~6 seconds** across two
-//! seeds on an 8-thread dev box. `missing_is_transient_not_corruption` then
-//! proves every sighting resolves: worst observed transient **83 retry
-//! attempts / ~920µs**, typically far less.
+//! It was not always. This file's original run observed the meta->tuple window
+//! **~20-28k times in ~6 seconds** across two seeds, and that measurement is
+//! why the fan-out order in `IndexApplier::apply` is what it is. Liveness is
+//! now published LAST on the way in: `flat.write_at` and `tuple.write_row`
+//! both complete before `meta.insert_row` sets the live bit, so an ordinal
+//! cannot be enumerable before the stores hold it. `live_then_get_under_
+//! concurrent_writes` asserts the window is gone; it reports 0 sightings where
+//! it used to report tens of thousands.
 //!
 //! POLICY THE CURSOR MUST IMPLEMENT:
 //!
-//!   * `RowGet::Missing` for an ordinal enumerated from `live()` is **NOT an
-//!     error and NOT corruption**. The cursor must **SKIP the row** and keep
-//!     going. It must never propagate an error, panic, or abort the scan.
-//!   * Skipping is *semantically* correct, not just pragmatic: apply runs
-//!     BEFORE the ack (`wal.rs`, `commit_batch` — "COMMIT POINT crossed. Now
-//!     apply (post-fsync) then ack"), so an ordinal that is in `live()` while
-//!     the tuple store still says `Missing` belongs to an insert **whose ack
-//!     has not yet been sent to its caller**. No query is obliged to observe a
-//!     write that hasn't returned to the writer yet.
-//!   * A bounded retry is also sound — `missing_is_transient_not_corruption`
-//!     proves every sighting resolves — but it buys nothing except latency: it
-//!     would pull in a write that was still in flight when the scan started.
-//!     **Prefer skip.**
-//!   * `RowGet::Deleted` for an enumerated ordinal is likewise legal (deleted
-//!     after the snapshot) — skip that too.
-//!   * What the cursor may still treat as loud: a row whose VALUES are wrong.
-//!     That invariant holds in every world and is asserted throughout here.
+//!   * `RowGet::Missing` for an ordinal enumerated from a liveness snapshot is
+//!     a BUG — in the applier's ordering, not in the reader. It is no longer a
+//!     transient to skip past. Treat it loudly.
+//!   * There is no longer a `Deleted` verdict to handle. Retiring a row clears
+//!     one bit in the metadata index and destroys nothing, so a row retired
+//!     after a snapshot was taken still reads back with its values — which is
+//!     what stops it vanishing out from under an open cursor.
+//!   * A row whose VALUES are wrong is loud in every world, and is asserted
+//!     throughout here.
 //!
-//! Note for whoever writes the enumeration loop: the two reader roles hit this
-//! at wildly different rates, and the difference is a trap. The frontier PROBER
-//! sees thousands per run; the SCANNER — the cursor's exact future loop — saw
-//! **1 sighting in ~3.1M gets** on one run and 0 on the next. An ascending walk
-//! usually reaches the frontier long after the window shut, so the plain loop
-//! *rarely* notices. **Rarely is not never**: the scan role demonstrably trips
-//! it. A cursor that treats `Missing` as an error would be a once-in-millions
-//! production panic — the worst possible failure shape. Handle it.
+//! WHAT IS STILL OPEN: the DELETE side. `flat.delete` tombstones before
+//! `tuple.delete_row` clears the row, so a snapshot taken before a delete can
+//! see the two stores disagree (~50 sightings per 3s run, measured). That skew
+//! is inherent to a destructive delete and closes only when retiring a row
+//! stops destroying its values.
 //! ============================================================================
 //!
 //! # Why this file exists
@@ -93,10 +85,26 @@ const WRITE_FOR: Duration = Duration::from_secs(3);
 /// Cap on captured `Missing` observations — enough to characterize the race
 /// without an unbounded log.
 const MAX_OBSERVATIONS: usize = 8;
-/// How long a `Missing` ordinal may stay missing before we call it a lost row.
-/// Measured resolve time is microseconds; this is ~6 orders of magnitude of
-/// headroom so a loaded CI box can never fail this for the wrong reason.
-const RETRY_BUDGET: Duration = Duration::from_secs(5);
+/// Which world this build implements.
+///
+/// **A** — liveness has three independent owners (the flat index's tombstone
+/// bitset, the metadata index's `live` bitmap, the tuple store's
+/// `Slot::Tombstone`), updated at three different moments during apply. A
+/// reader can therefore observe an ordinal in `live()` before the tuple store
+/// holds it.
+///
+/// **B** — liveness is unified behind one versioned snapshot published after
+/// every store already holds the row, so the window is closed structurally.
+///
+/// The snapshot-isolation work flips this constant to [`World::B`]. It is the
+/// single line that changes: the decider reads the verdict from here.
+#[allow(dead_code)] // `B` is unconstructed until liveness unification lands.
+enum World {
+    A,
+    B,
+}
+
+const EXPECTED_WORLD: World = World::B;
 
 /// xorshift64* — same generator `chaos.rs` uses, so a failure reproduces from
 /// the seed alone.
@@ -269,22 +277,13 @@ fn assert_settled(meta: &meta::Reader, tuples: &tuples::Reader, live: &[u64], ne
     let got_live: BTreeSet<u64> = meta.live().iter().map(u64::from).collect();
     assert_eq!(got_live, want_live, "live bitmap diverged from the writer");
 
+    // Every ordinal ever written reads back with the right values, retired or
+    // not: the tuple store is not a visibility authority and destroys nothing.
+    // Whether a row is VISIBLE was already decided by the `live` check above.
     for o in 0..next {
         match tuples.get(Ordinal(o as u32), &COLS).expect("get") {
-            RowGet::Live(values) => {
-                verify_values(o, &values);
-                assert!(
-                    want_live.contains(&o),
-                    "ordinal {o} is live but absent from live()"
-                );
-            }
-            RowGet::Deleted => {
-                assert!(
-                    !want_live.contains(&o),
-                    "ordinal {o} is in live() but tombstoned"
-                );
-            }
-            RowGet::Missing => panic!("ordinal {o} still Missing after the run quiesced"),
+            RowGet::Live(values) => verify_values(o, &values),
+            other => panic!("ordinal {o} was written but reads back {other:?}"),
         }
     }
 }
@@ -293,8 +292,17 @@ fn assert_settled(meta: &meta::Reader, tuples: &tuples::Reader, live: &[u64], ne
 // Observation tally
 // ---------------------------------------------------------------------------
 
-/// What the reader threads saw. Counters only — the decider does NOT assert on
-/// `missing_*`; it reports them, and the reported result picks the policy.
+/// What the reader threads saw. The `missing_*` counters are the instrument the
+/// decider asserts against; which of them, and in which direction, is dictated
+/// by [`EXPECTED_WORLD`].
+/// `Missing`-on-live sightings from one run, kept split by reader role.
+struct Sightings {
+    /// Sightings from the full-scan role — the cursor's exact future loop.
+    scan: u64,
+    /// Sightings from the frontier-probe role.
+    probe: u64,
+}
+
 #[derive(Default)]
 struct Tally {
     /// `live()` snapshots taken.
@@ -303,9 +311,6 @@ struct Tally {
     gets: AtomicU64,
     /// …of those, how many returned a live row (values verified).
     live_hits: AtomicU64,
-    /// …how many returned the deleted-marker. LEGAL: the row can be deleted
-    /// between the snapshot and the get.
-    deleted_on_live: AtomicU64,
     /// …how many returned `Missing` from the full-scan role.
     missing_scan: AtomicU64,
     /// …how many returned `Missing` from the frontier-probe role.
@@ -322,17 +327,20 @@ impl Tally {
         }
     }
 
-    /// Print the tally and return the total `Missing`-on-live count.
-    fn report(&self, label: &str) -> u64 {
+    /// Print the tally and return the `Missing`-on-live counts, split by role.
+    ///
+    /// Split on purpose: the two roles trip the window at wildly different rates
+    /// (see the header), so collapsing them into one number would hand the
+    /// decider a statistic it cannot safely assert on.
+    fn report(&self, label: &str) -> Sightings {
         let missing_scan = self.missing_scan.load(Ordering::Relaxed);
         let missing_probe = self.missing_probe.load(Ordering::Relaxed);
         eprintln!(
             "\n[{label}]\n  snapshots        {}\n  gets on live     {}\n  live rows        {}\n  \
-             deleted-on-live  {}\n  MISSING (scan)   {}\n  MISSING (probe)  {}",
+             MISSING (scan)   {}\n  MISSING (probe)  {}",
             self.snapshots.load(Ordering::Relaxed),
             self.gets.load(Ordering::Relaxed),
             self.live_hits.load(Ordering::Relaxed),
-            self.deleted_on_live.load(Ordering::Relaxed),
             missing_scan,
             missing_probe,
         );
@@ -344,7 +352,10 @@ impl Tally {
         {
             eprintln!("  {line}");
         }
-        missing_scan + missing_probe
+        Sightings {
+            scan: missing_scan,
+            probe: missing_probe,
+        }
     }
 }
 
@@ -369,9 +380,11 @@ impl Tally {
 /// scanner answers "does the cursor's own access pattern reach it?" — and it
 /// does, rarely (see the header).
 ///
-/// Returns the total `Missing`-on-live count. The caller reports; nothing here
-/// asserts a world.
-fn run_decider(seed: u64) -> u64 {
+/// Returns the `Missing`-on-live counts split by role. This function asserts
+/// the invariants that hold in BOTH worlds — that the run did real work, and
+/// that every value it did see was correct — and leaves the world verdict to
+/// the caller, which asserts it against [`EXPECTED_WORLD`].
+fn run_decider(seed: u64) -> Sightings {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path(), &cfgs(), opts()).unwrap();
 
@@ -419,11 +432,6 @@ fn run_decider(seed: u64) -> u64 {
                             verify_values(o64, &values);
                             tally.live_hits.fetch_add(1, Ordering::Relaxed);
                         }
-                        // Legal in every world: the writer may have deleted
-                        // this ordinal after the snapshot was taken.
-                        RowGet::Deleted => {
-                            tally.deleted_on_live.fetch_add(1, Ordering::Relaxed);
-                        }
                         // THE observation this whole file exists to count.
                         RowGet::Missing => {
                             let (counter, role) = if scanner {
@@ -469,143 +477,211 @@ fn run_decider(seed: u64) -> u64 {
         acked.load(Ordering::Relaxed),
         live.len()
     );
-    let missing = tally.report(&format!("seed {seed:#x}"));
+    let sightings = tally.report(&format!("seed {seed:#x}"));
     db.close().unwrap();
-    missing
+    sightings
 }
 
-/// THE DECIDER. Runs the race hard and reports whether `Missing` on a live
-/// ordinal is observable. Asserts only the invariants that hold in BOTH worlds
-/// — the tally, not this test's pass/fail, picked the cursor's policy.
+/// THE DECIDER. Runs the race hard and **asserts** whether `Missing` on a live
+/// ordinal is observable, against whatever [`EXPECTED_WORLD`] says this build
+/// owes. Today: **WORLD A**, ~20-28k sightings per run. See the file header.
 ///
-/// Result: **WORLD A**, ~20-28k sightings per run. See the file header.
+/// The assertion is deliberately asymmetric between the two worlds, because the
+/// evidence is:
+///
+///   * **World A checks the PROBER only.** The scanner trips the window about
+///     once in three million gets (header), so a run in which it saw nothing
+///     proves nothing — asserting on the combined total would be asserting on a
+///     coin flip. The prober sees thousands per run; that is the instrument.
+///   * **World B checks BOTH roles for zero.** Once liveness is unified behind
+///     a single versioned snapshot published after every store already holds
+///     the row, the window is closed *structurally* rather than statistically.
+///     One sighting from either role is then a real regression, and a rare
+///     signal is exactly the one worth keeping.
+///
+/// The `run_decider` guards (`snapshots > 1_000`, `live_hits > 1_000`,
+/// `next > SEED_ROWS`) are what make the World B direction meaningful rather
+/// than vacuous: they prove the readers and writer actually ran before silence
+/// is allowed to count as evidence.
 #[test]
 fn live_then_get_under_concurrent_writes() {
+    // A genuinely serial host cannot be relied on to interleave two threads
+    // across two independent mutexes. Report and bail rather than fail for a
+    // reason that has nothing to do with the code under test — the same posture
+    // `RETRY_BUDGET` takes toward a loaded box. (Note this cannot reuse
+    // `reader_threads()`, which is floored at 4 regardless of the hardware.)
+    let parallelism = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if parallelism < 2 {
+        eprintln!(
+            "SKIP: available_parallelism() == {parallelism}; the cross-store \
+             window is not demonstrable on a serial host"
+        );
+        return;
+    }
+
     let a = run_decider(0x9E37_79B9_7F4A_7C15);
     let b = run_decider(0xD1B5_4A32_D192_ED03);
-    let total = a + b;
+    let scan = a.scan + b.scan;
+    let probe = a.probe + b.probe;
+    let total = scan + probe;
 
     eprintln!(
         "\n================ VERDICT ================\n\
-         Missing-on-live observations: {total}\n\
-         {}\n\
+         Missing-on-live observations: {total} (scan {scan}, probe {probe})\n\
+         expected: {}\n\
          =========================================\n",
-        if total == 0 {
-            "WORLD B on this host: the meta->tuple window was not observed."
-        } else {
-            "WORLD A: the window IS observable; Missing is a legal transient."
+        match EXPECTED_WORLD {
+            World::A => "WORLD A — the window IS observable; Missing is a legal transient.",
+            World::B => "WORLD B — liveness is unified; the window is closed.",
         }
     );
+
+    match EXPECTED_WORLD {
+        World::A => assert!(
+            probe > 0,
+            "EXPECTED_WORLD is A, so liveness still has three independent owners \
+             and the meta->tuple window must be observable — but the prober saw \
+             0 Missing-on-live across both seeds (scanner saw {scan}). Either the \
+             window closed without EXPECTED_WORLD being updated, or the readers \
+             never reached the write frontier."
+        ),
+        World::B => assert_eq!(
+            total, 0,
+            "EXPECTED_WORLD is B, so no reader may observe an ordinal in live() \
+             before the tuple store holds it — but there were {scan} scanner and \
+             {probe} prober sightings. See the captured observations above for \
+             the offending ordinals."
+        ),
+    }
 }
 
+// NOTE: bare SEARCH's liveness is NOT tested here, deliberately.
+//
+// A concurrent version of it was written and thrown away: with the applier
+// publishing liveness last, the interval in which a vector is searchable but
+// not yet live is a few microseconds, and a single `search` call takes longer
+// than that. The test scored **578,524 searches / 2,314,096 hits / 0
+// violations** against the KNOWN-BROKEN implementation — it could not tell the
+// two apart, and an always-green test is worse than no test.
+//
+// The property is asserted deterministically instead, in `index.rs`, by handing
+// `search_filtered` a snapshot that excludes a row the flat index still holds.
+
 // ---------------------------------------------------------------------------
-// 2. WORLD A LOCK-IN — the contract the cursor relies on
+// 3. SNAPSHOT SAFETY — no snapshot admits a row the stores don't hold
 // ---------------------------------------------------------------------------
 
-/// World A's regression guard: a `Missing` observed on a live ordinal is a row
-/// **mid-apply**, never a lost one. Every sighting must become gettable within
-/// `RETRY_BUDGET`.
+/// The snapshot-based analogue of the PROBER, and the property the whole
+/// liveness-unification exists to buy:
 ///
-/// This is the assertion that licenses the cursor to skip `Missing` instead of
-/// erroring. If a future change to the apply fan-out ever leaves a row
-/// permanently missing from the tuple store while it is live in the metadata
-/// index, this test fails — loudly, with the ordinal.
+/// **Every ordinal in a resolved `LiveSet` is fully written in every store.**
 ///
-/// Every reader is a PROBER here: the scan role provably never trips the window
-/// (see the header), so it would only dilute the sample.
+/// A `LiveSet` is immutable, so unlike a raw `live()` + `get()` sighting this
+/// cannot resolve by retrying — a row admitted early is wrong for as long as
+/// the snapshot lives. That makes the ordering rule strict: liveness must be
+/// published only after flat AND tuple already hold the row.
+///
+/// Probes the snapshot's MAXIMUM ordinal, for the same reason the prober does:
+/// it is the one the applier just published, so it aims straight at the window.
+///
+/// Both stores are checked. An earlier revision could only assert the tuple
+/// store, because `flat.delete` tombstoned before `tuple.delete_row` cleared the
+/// row and a snapshot could catch them disagreeing (~50 sightings per 3s run).
+/// Retiring a row now touches neither store, so the skew has nowhere to come
+/// from.
 #[test]
-fn missing_is_transient_not_corruption() {
+fn snapshot_never_contains_an_unwritten_row() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path(), &cfgs(), opts()).unwrap();
-    let meta = db.metadata_reader(0).expect("metadata reader");
     let tuples = db.tuple_reader(0).expect("tuple reader");
+    let flat = db.reader(0).expect("flat reader");
     seed_rows(&db);
 
     let stop = Arc::new(AtomicBool::new(false));
-    let observed = Arc::new(AtomicU64::new(0));
+    let violations = Arc::new(AtomicU64::new(0));
+    let resolves = Arc::new(AtomicU64::new(0));
+    let checks = Arc::new(AtomicU64::new(0));
+    let notes = Arc::new(Mutex::new(Vec::<String>::new()));
     let acked = Arc::new(AtomicU64::new(SEED_ROWS));
-    // How hard the retries had to work — reported so the cursor's author knows
-    // the real magnitude of the window rather than guessing at it.
-    let max_attempts = Arc::new(AtomicU64::new(0));
-    let max_nanos = Arc::new(AtomicU64::new(0));
 
+    let next = std::thread::scope(|scope| {
     let mut handles = Vec::new();
     for _ in 0..reader_threads() {
-        let meta = meta.clone();
+        let db = &db;
         let tuples = tuples.clone();
+        let flat = flat.clone();
         let stop = stop.clone();
-        let observed = observed.clone();
-        let max_attempts = max_attempts.clone();
-        let max_nanos = max_nanos.clone();
-        handles.push(std::thread::spawn(move || {
+        let violations = violations.clone();
+        let resolves = resolves.clone();
+        let checks = checks.clone();
+        let notes = notes.clone();
+        handles.push(scope.spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                let live = meta.live();
-                let Some(frontier) = live.max() else { continue };
-                if !matches!(
-                    tuples.get(Ordinal(frontier), &COLS).expect("get"),
-                    RowGet::Missing
-                ) {
+                let set = db.live_snapshot(0).expect("collection 0");
+                resolves.fetch_add(1, Ordering::Relaxed);
+                let Some(max) = set.iter().max() else {
                     continue;
-                }
-                observed.fetch_add(1, Ordering::Relaxed);
-
-                // Caught one mid-apply. Retry until it resolves — to a live row
-                // (the insert's `write_row` landed) or to the deleted-marker
-                // (the writer deleted it afterwards; applies are sequential on
-                // the WAL thread, so that too proves `write_row` ran).
-                let start = Instant::now();
-                let mut attempts = 0u64;
-                let resolved = loop {
-                    attempts += 1;
-                    match tuples.get(Ordinal(frontier), &COLS).expect("get") {
-                        RowGet::Live(values) => {
-                            verify_values(frontier as u64, &values);
-                            break true;
-                        }
-                        RowGet::Deleted => break true,
-                        RowGet::Missing => {}
-                    }
-                    if start.elapsed() > RETRY_BUDGET {
-                        break false;
-                    }
-                    std::thread::yield_now();
                 };
-                let elapsed = start.elapsed();
-                assert!(
-                    resolved,
-                    "ordinal {frontier} was in live() but stayed Missing for {elapsed:?} across \
-                     {attempts} attempts — that is a LOST ROW, not a mid-apply transient. The \
-                     cursor's skip-on-Missing policy is no longer safe; see this file's header."
-                );
-                max_attempts.fetch_max(attempts, Ordering::Relaxed);
-                max_nanos.fetch_max(elapsed.as_nanos() as u64, Ordering::Relaxed);
+                checks.fetch_add(1, Ordering::Relaxed);
+
+                match tuples.get(Ordinal(max), &COLS).expect("get") {
+                    RowGet::Live(values) => {
+                        verify_values(max as u64, &values);
+                        // The flat index must hold it too. This was dropped
+                        // while `flat.delete` still ran before `tuple.delete_row`
+                        // — a snapshot could then catch the two stores
+                        // disagreeing. Neither call exists now: retiring a row
+                        // touches only `live`, so all three stores agree about
+                        // every ordinal a snapshot admits.
+                        if flat.vector_at(Ordinal(max)).is_none() {
+                            violations.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    RowGet::Missing => {
+                        violations.fetch_add(1, Ordering::Relaxed);
+                        let mut n = notes.lock().unwrap_or_else(|e| e.into_inner());
+                        if n.len() < MAX_OBSERVATIONS {
+                            n.push(format!(
+                                "ordinal {max} is in a v{} snapshot (len={}) but the tuple \
+                                 store says Missing",
+                                set.version(),
+                                set.len()
+                            ));
+                        }
+                    }
+                }
             }
         }));
     }
 
-    let (live, next) = drive_writer(&db, 0x5DEE_CE66_D1B5_4A32, &acked);
+    let (_live, next) = drive_writer(&db, 0x51A2_7E31_0C4D_9B77, &acked);
     stop.store(true, Ordering::Relaxed);
     for h in handles {
         h.join().expect("reader thread panicked");
     }
+    next
+    });
 
-    assert_settled(&meta, &tuples, &live, next);
-
-    let seen = observed.load(Ordering::Relaxed);
-    eprintln!(
-        "\n[transience] {seen} Missing sightings, all resolved. \
-         worst case: {} retry attempts / {:?}",
-        max_attempts.load(Ordering::Relaxed),
-        Duration::from_nanos(max_nanos.load(Ordering::Relaxed)),
-    );
-
-    // Guard against a vacuous pass. The decider sees thousands of sightings per
-    // second, so a run that sees none did not exercise the contract at all.
-    // (If this ever proves flaky on a very small CI runner, raise `WRITE_FOR`
-    // rather than dropping the assertion — a silent no-op test is worse.)
+    // The same meaningfulness guards the decider uses: silence is only evidence
+    // if the readers and the writer actually ran.
     assert!(
-        seen > 0,
-        "no Missing was observed, so the retry contract went untested — the race is known \
-         reachable on this codebase (see live_then_get_under_concurrent_writes)"
+        resolves.load(Ordering::Relaxed) > 1_000,
+        "readers barely ran; the result would not be meaningful"
     );
+    assert!(checks.load(Ordering::Relaxed) > 1_000, "readers saw no rows");
+    assert!(next > SEED_ROWS, "writer made no progress");
+
+    let violations = violations.load(Ordering::Relaxed);
+    for note in notes.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        eprintln!("  {note}");
+    }
+    assert_eq!(
+        violations, 0,
+        "{violations} snapshot(s) admitted a row the stores did not hold — \
+         liveness was published before the data"
+    );
+
+    db.close().unwrap();
 }
