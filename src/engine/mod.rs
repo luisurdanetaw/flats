@@ -1894,6 +1894,34 @@ mod tests {
         );
     }
 
+    /// "The record is kilobytes": a bulk DELETE of a contiguous range must log
+    /// a few hundred bytes, not one entry per row. Roaring only reaches that
+    /// size in RUN containers, which it builds on `optimize()` — left alone, the
+    /// same 100k ordinals sit in two 8 KiB bitmap containers.
+    #[test]
+    fn delete_of_100k_contiguous_rows_logs_kilobytes() {
+        const ROWS: u64 = 100_000;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, ROWS as usize)], manual_opts()).unwrap();
+
+        // Seed in ONE record: 100k single-row inserts would be 100k fsyncs.
+        let seed: Vec<Install> = (0..ROWS).map(|o| install(o, 1.0)).collect();
+        db.mutate(0, RoaringBitmap::new(), seed).unwrap();
+        assert_eq!(db.live_snapshot(0).unwrap().len(), ROWS);
+
+        let wal = dir.path().join("wal.log");
+        let before = std::fs::metadata(&wal).unwrap().len();
+        let everything: RoaringBitmap = (0..ROWS as u32).collect();
+        db.mutate(0, everything, vec![]).unwrap();
+        let grew = std::fs::metadata(&wal).unwrap().len() - before;
+
+        assert!(db.live_snapshot(0).unwrap().is_empty());
+        assert!(
+            grew < 1024,
+            "deleting {ROWS} contiguous rows logged {grew} bytes; runs must be compressed"
+        );
+    }
+
     #[test]
     fn insert_search_delete_e2e() {
         let dir = tempfile::tempdir().unwrap();
