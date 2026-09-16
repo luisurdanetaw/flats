@@ -219,19 +219,20 @@ impl Parser {
 
     // -- one function per grammar rule -------------------------------------
 
-    /// `statement := (select | insert | create | search) ';'`
+    /// `statement := (select | insert | create | search | delete) ';'`
     pub fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         let stmt = match self.peek() {
             Token::Select => Statement::Select(self.parse_select()?),
             Token::Insert => Statement::Insert(self.parse_insert()?),
             Token::Create => Statement::CreateCollection(self.parse_create()?),
             Token::Search => Statement::Search(self.parse_search()?),
-            // EXTEND: dispatch Delete/Update on their leading keyword.
+            Token::Delete => Statement::Delete(self.parse_delete()?),
+            // EXTEND: dispatch Update on its leading keyword.
             Token::Eof => return Err(self.error(ParseErrorKind::UnexpectedEof)),
             _ => {
                 let found = format!("{:?}", self.peek());
                 return Err(self.error(ParseErrorKind::UnexpectedToken {
-                    expected: "SELECT, INSERT, CREATE, or SEARCH".to_string(),
+                    expected: "SELECT, INSERT, CREATE, SEARCH, or DELETE".to_string(),
                     found,
                 }));
             }
@@ -252,6 +253,22 @@ impl Parser {
             from,
             filter,
         })
+    }
+
+    /// `delete := DELETE FROM ident WHERE expr`
+    ///
+    /// The clause is required, so this expects `WHERE` itself rather than going
+    /// through the optional [`parse_where`](Self::parse_where): a DELETE that
+    /// forgot its predicate is an error here, never a whole-collection delete.
+    /// The expression grammar is the shared one, so a predicate means the same
+    /// thing in a DELETE as in the SELECT a user would run to preview it.
+    fn parse_delete(&mut self) -> Result<DeleteStmt, ParseError> {
+        self.expect(Token::Delete)?;
+        self.expect(Token::From)?;
+        let from = self.expect_ident()?;
+        self.expect(Token::Where)?;
+        let filter = self.parse_expr()?;
+        Ok(DeleteStmt { from, filter })
     }
 
     /// `where := WHERE expr` — the whole clause, absent when the keyword is not

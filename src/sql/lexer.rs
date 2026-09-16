@@ -241,6 +241,7 @@ fn keyword(word: &str) -> Option<Token> {
         "where" => Some(Token::Where),
         "and" => Some(Token::And),
         "or" => Some(Token::Or),
+        "delete" => Some(Token::Delete),
         // EXTEND: future reserved keywords here.
         _ => None,
     }
