@@ -179,7 +179,24 @@ pub enum BoundStatement {
     CreateCollection(BoundCreate),
     /// A resolved `SEARCH`.
     Search(BoundSearch),
-    // EXTEND: Delete(BoundDelete), Update(BoundUpdate).
+    /// A resolved `DELETE`.
+    Delete(BoundDelete),
+    // EXTEND: Update(BoundUpdate).
+}
+
+/// A resolved `DELETE FROM from WHERE filter`.
+///
+/// The predicate is bound by the same routine a `SELECT`'s is, against the same
+/// schema, so a DELETE can only name the rows the matching SELECT would return
+/// — a user can preview exactly what a DELETE will remove.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundDelete {
+    /// The collection deleted from (confirmed to exist).
+    pub from: String,
+    /// Its resolved schema.
+    pub schema: Schema,
+    /// Which rows go. Required — the parser refuses a DELETE without one.
+    pub filter: BoundPredicate,
 }
 
 /// A resolved `SELECT projection FROM from`.
@@ -1085,6 +1102,51 @@ mod tests {
             pred("published_at < 4 OR published_at = 9"),
             BoundPredicate::Or(..)
         ));
+    }
+
+    // -- DELETE ------------------------------------------------------------
+
+    #[test]
+    fn delete_binds_its_predicate_against_the_collection() {
+        match analyze_ok("DELETE FROM docs WHERE author = 'alice';", &docs_catalog()) {
+            BoundStatement::Delete(d) => assert_eq!(
+                d,
+                BoundDelete {
+                    from: "docs".into(),
+                    schema: docs_schema(),
+                    filter: compare("author", 1, CompareOp::Eq, Literal::Str("alice".into())),
+                }
+            ),
+            other => panic!("expected a DELETE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_from_a_missing_collection_is_not_found() {
+        assert_eq!(
+            analyze_err("DELETE FROM nope WHERE author = 'alice';", &docs_catalog()),
+            BindError::CollectionNotFound("nope".into())
+        );
+    }
+
+    /// A DELETE predicate must be refused for exactly the reasons a SELECT
+    /// predicate is — otherwise the SELECT a user runs to preview a DELETE
+    /// could disagree with what the DELETE does.
+    #[test]
+    fn delete_predicates_fail_exactly_like_select_predicates() {
+        for clause in [
+            "nope < 2",               // unknown column
+            "vector = 'x'",           // the embedding has no postings
+            "author < 'm'",           // ordered compare on TEXT
+            "published_at = 'soon'",  // type mismatch
+        ] {
+            let sql = format!("DELETE FROM docs WHERE {clause};");
+            assert_eq!(
+                analyze_err(&sql, &docs_catalog()),
+                pred_err(clause),
+                "DELETE and SELECT disagree on `{clause}`"
+            );
+        }
     }
 
     #[test]

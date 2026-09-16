@@ -343,7 +343,9 @@ fn labels_of(bound: &BoundStatement) -> Vec<String> {
                 Projected::Pseudo(pseudo) => pseudo.name().to_string(),
             })
             .collect(),
-        BoundStatement::Insert(_) | BoundStatement::CreateCollection(_) => Vec::new(),
+        BoundStatement::Insert(_)
+        | BoundStatement::CreateCollection(_)
+        | BoundStatement::Delete(_) => Vec::new(),
     }
 }
 

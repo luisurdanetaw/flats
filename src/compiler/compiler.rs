@@ -91,6 +91,7 @@ pub fn compile(plan: LogicalPlan, schema: Option<&Schema>) -> Result<Program, Co
     // back up through a `FnMut`.
     let created = match &plan {
         LogicalPlan::CreateCollection(create) => Some(to_metadata_schema(&create.schema)?),
+        LogicalPlan::Delete(_) => return Err(CompileError::Unsupported { statement: "DELETE" }),
         _ => None,
     };
 
@@ -127,6 +128,13 @@ pub enum CompileError {
     /// collection's catalog schema — there is nothing to translate its
     /// declaration ordinals through.
     MissingSchema,
+    /// The statement plans, but this build cannot emit code for it yet. The
+    /// compiler's counterpart to `BindError::Unbound`: a clean error in the
+    /// window between a plan node landing and its emission landing.
+    Unsupported {
+        /// Which statement kind.
+        statement: &'static str,
+    },
 }
 
 impl From<SchemaError> for CompileError {
@@ -142,6 +150,9 @@ impl fmt::Display for CompileError {
             CompileError::MissingSchema => {
                 write!(f, "no catalog schema for the target collection")
             }
+            CompileError::Unsupported { statement } => {
+                write!(f, "{statement} plans but cannot be compiled yet")
+            }
         }
     }
 }
@@ -150,7 +161,7 @@ impl std::error::Error for CompileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             CompileError::Schema(e) => Some(e),
-            CompileError::MissingSchema => None,
+            CompileError::MissingSchema | CompileError::Unsupported { .. } => None,
         }
     }
 }
@@ -588,6 +599,10 @@ impl<'a> Compiler<'a> {
                     capacity: create.capacity,
                 });
             }
+
+            // `compile` refuses a DELETE before emission begins, so reaching
+            // here means the two dispatches disagree about the plan.
+            LogicalPlan::Delete(_) => unreachable!("compile refuses DELETE before emission"),
         }
     }
 

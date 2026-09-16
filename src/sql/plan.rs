@@ -41,6 +41,8 @@ pub enum LogicalPlan {
     /// Rank a collection's rows by similarity to a query vector (leaf of a
     /// ranked read tree).
     Knn(Knn),
+    /// Retire every row a predicate admits, as one statement.
+    Delete(Delete),
 }
 
 // NOTE: there is deliberately no `Filter` node. A `WHERE` predicate in V-SQL is
@@ -125,6 +127,23 @@ pub struct Insert {
     /// One [`TypedValue`] per schema column, in schema order (the binder
     /// already reordered and type-checked it; the planner does not touch it).
     pub row: Vec<TypedValue>,
+}
+
+/// Retire every row `predicate` admits — one statement, one durable record.
+///
+/// A LEAF with no row loop above or below it. The predicate is answered as one
+/// bitmap by the metadata index, and that bitmap IS the statement: it is logged
+/// whole as a single `Record::Mutate`. A per-row delete loop would be N records
+/// and N commit points, which is exactly the non-atomic shape the one-record
+/// design exists to prevent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Delete {
+    /// The collection deleted from (already confirmed to exist by the binder).
+    pub collection: String,
+    /// Its resolved schema — the predicate's ordinals are relative to it.
+    pub schema: Schema,
+    /// Which rows go. Not optional: V-SQL has no whole-collection DELETE.
+    pub predicate: BoundPredicate,
 }
 
 /// Provision a new collection with a resolved schema.
