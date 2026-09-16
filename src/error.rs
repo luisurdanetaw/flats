@@ -61,6 +61,21 @@ pub enum Error {
     #[error("database halted at lsn {lsn}: {cause} (reopen to replay the unapplied record)")]
     Poisoned { lsn: u64, cause: String },
 
+    /// One statement's installed payload exceeds the per-record cap.
+    ///
+    /// A `Record::Mutate` is deliberately ONE frame with ONE checksum behind
+    /// ONE fsync — that is what makes a multi-row DELETE or UPDATE all-or-
+    /// nothing. The cost of that guarantee is that the whole statement must fit
+    /// in memory: on the commit thread now, and on every replay for the life of
+    /// the log. The cap turns "this UPDATE rewrites a million vectors" into a
+    /// named refusal at the door rather than an allocation failure inside the
+    /// commit loop, and it bounds how long the metadata lock is held, since
+    /// that is proportional to statement size.
+    ///
+    /// Split the statement with a narrower predicate.
+    #[error("statement installs {bytes} bytes, over the {cap}-byte per-record cap")]
+    StatementTooLarge { bytes: usize, cap: usize },
+
     /// A collection NAME did not resolve to a registered collection. Distinct
     /// from `UnknownCollection`, which reports an id: here there is no id to
     /// report — failing to produce one is the error. Raised by

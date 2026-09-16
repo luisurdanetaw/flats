@@ -465,6 +465,63 @@ impl Writer {
         Ok(())
     }
 
+    /// Apply ONE `Record::Mutate` — every retirement and every installation —
+    /// under a SINGLE lock hold.
+    ///
+    /// # Why one hold, and not a loop of `insert_row`/`remove_row`
+    ///
+    /// Those take the lock per row and release it. That is atomic enough for a
+    /// one-row record, but a statement spanning N rows would release the lock
+    /// N times, and `LiveHandle::resolve` takes that same lock to copy `live`
+    /// when its cache is stale. A reader landing between two rows would
+    /// materialize a HALF-APPLIED statement, label it with the current version
+    /// (the applier bumps only once, at the end), and cache it — and a query
+    /// holds its snapshot for its whole life. Half an UPDATE is exactly the
+    /// state the one-record-per-statement design exists to make unobservable.
+    ///
+    /// So the rule is: everything a single record changes happens inside one
+    /// critical section. The caller then bumps the version, publishing it.
+    ///
+    /// # Cost
+    ///
+    /// The hold is proportional to the statement, so a bulk mutation blocks
+    /// snapshot materialization and metadata lookups for its duration. Vector
+    /// and tuple-store writes deliberately happen OUTSIDE this call (see the
+    /// engine's apply order), so only postings and bitmap work is inside, and
+    /// the WAL's installed-payload cap bounds the worst case.
+    ///
+    /// # Semantics
+    ///
+    /// Installs are applied before retirements, so a statement that retires and
+    /// reinstalls the same ordinal ends with it RETIRED — matching the WAL
+    /// record's reading of "retire this set, install these rows". Validation
+    /// covers every row before anything mutates: there is no rollback here, so
+    /// a bad row must fail the statement whole. Retiring an ordinal that is not
+    /// live is a silent no-op, as in `remove_row`, which is what makes replay
+    /// idempotent.
+    pub fn apply_mutation(
+        &mut self,
+        retire: &RoaringBitmap,
+        install: &[(Ordinal, &Row)],
+    ) -> Result<()> {
+        let mut inner = self.lock();
+
+        // Validate EVERYTHING first — no partial statement, ever.
+        for (_, row) in install {
+            inner.schema.validate_row(row)?;
+        }
+
+        for (ordinal, row) in install {
+            for (col, value) in *row {
+                inner.columns[*col as usize].insert(*col, *ordinal, value)?;
+            }
+            inner.live.insert(ordinal.0);
+        }
+        // Retire last: see the ordering note above.
+        inner.live -= retire;
+        Ok(())
+    }
+
     /// Tombstone `ordinal`. Idempotent (clearing a cleared bit is a no-op).
     ///
     /// Postings stay (lazy delete, see module doc). Removing an ordinal that
@@ -1020,6 +1077,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<(MetadataInner, Lsn)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
     use crate::metadata::common::{ColumnSpec, ColumnType};
     use std::num::NonZeroUsize;
 
@@ -1383,6 +1441,137 @@ mod tests {
         }
         .live_handle();
         (handle, inner)
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_mutation — one statement, one publish
+    // -----------------------------------------------------------------------
+
+    /// A `Record::Mutate` retires and installs in ONE lock hold.
+    ///
+    /// The tear this rules out is specific and reachable. `resolve`'s fast path
+    /// returns the cached snapshot while the version is unchanged, so a reader
+    /// mid-statement usually sees the clean pre-state. But if the cache is
+    /// STALE when it resolves — a previous bump that no reader has materialized
+    /// yet — it takes the metadata lock and copies `live` as it finds it. With
+    /// per-row locking that copy lands between two rows of the statement, and
+    /// the half-applied result gets LABELLED with the current version and
+    /// cached. A query holding it sees half an UPDATE for its entire life.
+    ///
+    /// The invariant asserted is the one a caller actually cares about: an
+    /// UPDATE moves rows from set A to set B, so the live COUNT never changes.
+    /// Any observed count other than `N` is a statement caught mid-flight.
+    #[test]
+    fn apply_mutation_publishes_retire_and_install_together() {
+        const N: u32 = 64;
+        const ROUNDS: usize = 300;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut w, r) = MetadataIndex::create(dir.path(), test_schema()).unwrap();
+        let live = Arc::new(r.live_handle());
+
+        // Seed set A live.
+        let set_a: Vec<(Ordinal, Row)> = (0..N).map(|o| (Ordinal(o), row(o as i64, 0.0, "a"))).collect();
+        let set_b: Vec<(Ordinal, Row)> =
+            (N..2 * N).map(|o| (Ordinal(o), row(o as i64, 0.0, "b"))).collect();
+        for (ord, r) in &set_a {
+            w.insert_row(*ord, r).unwrap();
+        }
+        live.bump();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let live = Arc::clone(&live);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut worst = None;
+                while !stop.load(Ordering::Relaxed) {
+                    let snap = live.resolve();
+                    if snap.len() != u64::from(N) {
+                        worst = Some(snap.len());
+                        break;
+                    }
+                }
+                worst
+            })
+        };
+
+        let bitmap_of = |rows: &[(Ordinal, Row)]| -> RoaringBitmap {
+            rows.iter().map(|(o, _)| o.0).collect()
+        };
+        for i in 0..ROUNDS {
+            let (retire, install) = if i % 2 == 0 {
+                (bitmap_of(&set_a), &set_b)
+            } else {
+                (bitmap_of(&set_b), &set_a)
+            };
+            let installs: Vec<(Ordinal, &Row)> = install.iter().map(|(o, r)| (*o, r)).collect();
+            w.apply_mutation(&retire, &installs).unwrap();
+            // Publish AFTER the statement is whole, exactly as the applier does.
+            live.bump();
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let torn = reader.join().unwrap();
+        assert_eq!(
+            torn, None,
+            "a reader observed {torn:?} live rows — a statement was visible half-applied"
+        );
+    }
+
+    /// Validation covers the WHOLE statement before anything mutates. A bad row
+    /// in the middle must leave the index untouched, not half-installed — there
+    /// is no rollback here, and a partially applied statement would be
+    /// published by the very next bump.
+    #[test]
+    fn apply_mutation_validates_every_row_before_mutating() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut w, r) = MetadataIndex::create(dir.path(), test_schema()).unwrap();
+
+        w.insert_row(Ordinal(0), &row(1, 1.0, "keep")).unwrap();
+        let before = r.live();
+
+        let good = row(2, 2.0, "new");
+        // Column 1 is FLOAT; an Int there is a type error.
+        let bad: Row = vec![
+            (0, Value::Int(3)),
+            (1, Value::Int(3)),
+            (2, Value::Text("bad".into())),
+        ];
+        let installs: Vec<(Ordinal, &Row)> = vec![(Ordinal(1), &good), (Ordinal(2), &bad)];
+
+        let retire: RoaringBitmap = [0u32].into_iter().collect();
+        w.apply_mutation(&retire, &installs)
+            .expect_err("a bad row anywhere fails the whole statement");
+
+        assert_eq!(
+            r.live(),
+            before,
+            "a refused statement must not retire, install, or otherwise touch liveness"
+        );
+    }
+
+    /// Replay redelivers a statement verbatim until a checkpoint folds it away,
+    /// so applying it twice must be indistinguishable from once.
+    #[test]
+    fn apply_mutation_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut w, r) = MetadataIndex::create(dir.path(), test_schema()).unwrap();
+
+        for o in 0..4u32 {
+            w.insert_row(Ordinal(o), &row(o as i64, 0.0, "old")).unwrap();
+        }
+
+        let new_row = row(99, 9.0, "new");
+        let installs: Vec<(Ordinal, &Row)> = vec![(Ordinal(10), &new_row)];
+        let retire: RoaringBitmap = [1u32, 2].into_iter().collect();
+
+        w.apply_mutation(&retire, &installs).unwrap();
+        let once = r.live();
+        w.apply_mutation(&retire, &installs).unwrap();
+
+        assert_eq!(r.live(), once, "replaying a statement changes nothing");
+        assert_eq!(once, bm(&[0, 3, 10]));
     }
 
     #[test]

@@ -63,7 +63,15 @@ use crate::metadata::common::{Row, Schema};
 use crate::metadata::index::MetadataIndex;
 use crate::metadata::tuples::TupleStore;
 use crate::metadata::{crc32, index as meta, tuples, write_snapshot_atomic};
-use crate::wal::wal::{Apply, Lsn, Record, Wal, WalHandle};
+use crate::wal::wal::{Apply, Bitmap, Install, Lsn, Record, Wal, WalHandle};
+
+/// Ceiling on the installed payload of one `Record::Mutate`, in bytes.
+///
+/// One statement is one record, so the whole thing has to fit in memory on the
+/// commit thread and on every future replay. 256 MiB is far above any
+/// reasonable predicate-scoped UPDATE and far below anything that threatens a
+/// small deployment's memory. See `Error::StatementTooLarge`.
+pub const MAX_INSTALL_BYTES: usize = 256 * 1024 * 1024;
 
 /// Re-exported from `metadata::common` (it moved there in Phase 6 so
 /// `Record::CreateCollection` can carry it — the WAL may only depend on plain
@@ -125,6 +133,29 @@ struct Collection {
 }
 
 impl Collection {
+    /// Raise the allocator's high-water mark to `at_least`, so ordinals a
+    /// statement placed itself are never handed out again.
+    ///
+    /// `Db::mutate` installs rows at ordinals chosen on the logging side rather
+    /// than drawn from `alloc_ordinal`, so without this the next `insert` would
+    /// allocate straight over a freshly installed row. Monotonic and racy-safe:
+    /// a concurrent `alloc_ordinal` either loses the CAS and retries above the
+    /// new mark, or wins and is already above it.
+    fn reserve_through(&self, at_least: u64) {
+        let mut cur = self.next_ordinal.load(Ordering::Acquire);
+        while cur < at_least {
+            match self.next_ordinal.compare_exchange_weak(
+                cur,
+                at_least,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
     /// Reserve the next ordinal, or fail if the collection is at capacity.
     /// CAS loop so a full collection never overshoots the high-water mark.
     fn alloc_ordinal(&self) -> Result<u64> {
@@ -335,6 +366,36 @@ impl Apply for IndexApplier {
             }
             Record::CreateCollection { config } => {
                 self.apply_create(lsn, config)?;
+            }
+            Record::Mutate {
+                collection,
+                retire,
+                install,
+            } => {
+                let w = self.writers(*collection)?;
+                // DATA FIRST, LIVENESS LAST — the same rule as `Insert`, but
+                // now spanning a whole statement. Every installed row must be
+                // readable in both stores before anything publishes it, or a
+                // snapshot could admit a row the tuple store has never seen.
+                for row in install {
+                    let ord32 = ordinal32(row.ordinal)?;
+                    w.flat.write_at(row.ordinal, &row.vector).map_err(to_io)?;
+                    w.tuple.write_row(ord32, &row.metadata).map_err(to_io)?;
+                }
+                // ONE publish for the whole statement. `apply_mutation` holds
+                // the metadata lock across every retire and install precisely
+                // so no reader can materialize a snapshot mid-statement — see
+                // its doc. A loop of insert_row/remove_row here would be
+                // correct on disk and wrong in memory.
+                let rows: Vec<(Ordinal, &Row)> = install
+                    .iter()
+                    .map(|r| ordinal32(r.ordinal).map(|o| (o, &r.metadata)))
+                    .collect::<io::Result<_>>()?;
+                w.meta.apply_mutation(&retire.0, &rows).map_err(to_io)?;
+                w.live.bump();
+                w.flat.advance_applied_lsn(lsn.0);
+                w.meta.advance_applied_lsn(lsn);
+                w.tuple.advance_applied_lsn(lsn);
             }
         }
         // The catalog watermark advances only on success — a `?` above skips
@@ -849,6 +910,82 @@ impl Db {
             .append(Record::Delete {
                 collection,
                 ordinal,
+            })
+            .map_err(|e| self.wal_err(e))?;
+        Ok(())
+    }
+
+    /// Apply ONE statement — retire a set of ordinals, install a set of rows —
+    /// as a single durable record. Blocks until durable.
+    ///
+    /// This is the primitive `DELETE` and `UPDATE` compile to. A `DELETE`
+    /// installs nothing; an `UPDATE` is copy-on-write, retiring the old
+    /// ordinals and installing their replacements at fresh ones. Both are
+    /// all-or-nothing because both are one frame, one CRC, one fsync.
+    ///
+    /// Retiring an ordinal that is not live is a silent no-op (as for
+    /// `delete`), which is what keeps replay idempotent. A statement that
+    /// retires nothing and installs nothing succeeds without logging: a
+    /// predicate matching zero rows is a successful no-op, not an error.
+    ///
+    /// Everything that can be checked is checked BEFORE logging — dim, rows,
+    /// capacity, and the payload cap — because a record that cannot apply must
+    /// never reach the durable WAL, or it would fail apply forever on every
+    /// replay and (since Phase 7) halt the database each time.
+    pub fn mutate(
+        &self,
+        collection: u32,
+        retire: RoaringBitmap,
+        install: Vec<Install>,
+    ) -> Result<()> {
+        let coll = self.collection(collection)?;
+        if retire.is_empty() && install.is_empty() {
+            return Ok(());
+        }
+        self.check_poison()?;
+
+        let dim = coll.config.schema.vector().dim.get();
+        for row in &install {
+            if row.vector.len() != dim {
+                return Err(Error::DimensionMismatch {
+                    expected: dim,
+                    got: row.vector.len(),
+                });
+            }
+            coll.config.schema.validate_row(&row.metadata)?;
+            if row.ordinal >= coll.config.capacity as u64 {
+                return Err(Error::CapacityExceeded {
+                    capacity: coll.config.capacity,
+                });
+            }
+        }
+
+        // Measured on the installs alone: the retire bitmap is compressed and
+        // bounded by the collection, while installs carry the vectors that
+        // actually make a statement big.
+        let bytes = bincode::serialized_size(&install)
+            .map_err(|e| Error::Io(io::Error::new(io::ErrorKind::InvalidData, e.to_string())))?
+            as usize;
+        if bytes > MAX_INSTALL_BYTES {
+            return Err(Error::StatementTooLarge {
+                bytes,
+                cap: MAX_INSTALL_BYTES,
+            });
+        }
+
+        // Claim the installed ordinals BEFORE logging: a concurrent `insert`
+        // must not be able to allocate one of them in the window between the
+        // append and the reservation. Like `insert`, a failed append leaves the
+        // reservation burned — the ordinals are simply never reused.
+        if let Some(highest) = install.iter().map(|r| r.ordinal).max() {
+            coll.reserve_through(highest + 1);
+        }
+
+        self.wal_handle()?
+            .append(Record::Mutate {
+                collection,
+                retire: Bitmap(retire),
+                install,
             })
             .map_err(|e| self.wal_err(e))?;
         Ok(())
@@ -1443,6 +1580,191 @@ mod tests {
             Err(Error::Poisoned { .. }) => {}
             other => panic!("expected Poisoned, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Record::Mutate — one statement, one record
+    // -----------------------------------------------------------------------
+
+    fn install(ordinal: u64, x: f32) -> Install {
+        Install {
+            ordinal,
+            vector: vec![x, 0.0],
+            metadata: vec![],
+        }
+    }
+
+    /// An installed ordinal is OCCUPIED. The allocator hands out the next
+    /// free one, so a statement that places a row without telling it would let
+    /// the very next `insert` allocate the same ordinal and overwrite the row
+    /// it just installed — silently, and only until the next reopen reseeds
+    /// the allocator from the flat index's high-water mark.
+    #[test]
+    fn installing_a_row_reserves_its_ordinal_against_the_allocator() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        assert_eq!(db.insert(0, &[1.0, 0.0], vec![]).unwrap(), Ordinal(0));
+
+        // Install past the allocator's high-water mark, leaving a gap.
+        db.mutate(0, RoaringBitmap::new(), vec![install(4, 7.0)])
+            .unwrap();
+
+        assert_eq!(
+            db.insert(0, &[3.0, 0.0], vec![]).unwrap(),
+            Ordinal(5),
+            "the allocator must resume above every installed ordinal"
+        );
+        // And the installed row is still intact, not overwritten.
+        let hits = db.search(0, &[7.0, 0.0], 8).unwrap();
+        assert!(hits.iter().any(|h| h.id == Ordinal(4)));
+    }
+
+    #[test]
+    fn mutate_end_to_end_then_reopen_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfgs = [cfg(0, 2, 64)];
+
+        {
+            let db = Db::open(dir.path(), &cfgs, manual_opts()).unwrap();
+            db.insert(0, &[1.0, 0.0], vec![]).unwrap();
+            db.insert(0, &[2.0, 0.0], vec![]).unwrap();
+
+            // The UPDATE shape: retire ordinal 0, install its copy-on-write
+            // replacement at a fresh ordinal. One record, one fsync.
+            let retire: RoaringBitmap = [0u32].into_iter().collect();
+            db.mutate(0, retire, vec![install(2, 9.0)]).unwrap();
+
+            let hits = db.search(0, &[9.0, 0.0], 8).unwrap();
+            assert_eq!(hits.len(), 2, "one retired, one installed => count holds");
+            assert!(
+                hits.iter().any(|h| h.id == Ordinal(2)),
+                "the installed row is searchable"
+            );
+            assert!(
+                !hits.iter().any(|h| h.id == Ordinal(0)),
+                "the retired row is gone"
+            );
+            db.close().unwrap();
+        }
+
+        // The whole statement must come back from the log as one unit.
+        let db = Db::open(dir.path(), &cfgs, manual_opts()).unwrap();
+        let hits = db.search(0, &[9.0, 0.0], 8).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|h| h.id == Ordinal(2)));
+        assert!(!hits.iter().any(|h| h.id == Ordinal(0)));
+    }
+
+    /// The fan-out rule from `Insert`, extended to a statement: any ordinal the
+    /// liveness snapshot admits must ALREADY be readable in the tuple store and
+    /// the flat index. A snapshot is immutable, so a reader that catches an
+    /// installed ordinal before its data landed stays wrong for its whole life.
+    #[test]
+    fn mutate_writes_data_before_publishing_liveness() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap();
+
+        let retire: RoaringBitmap = [0u32].into_iter().collect();
+        db.mutate(0, retire, vec![install(1, 5.0), install(2, 6.0)])
+            .unwrap();
+
+        let snap = db.live_snapshot(0).expect("collection is open");
+        let reader = db.reader(0).expect("collection is open");
+        for ordinal in snap.iter() {
+            assert!(
+                reader.vector_at(Ordinal(ordinal)).is_some(),
+                "ordinal {ordinal} is live but has no vector"
+            );
+        }
+        assert_eq!(snap.iter().collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    /// A statement matching nothing is a successful no-op, not an error and not
+    /// a log record. `DELETE FROM docs WHERE <matches nothing>` must succeed,
+    /// and burning an fsync on a record that changes nothing is pure cost.
+    #[test]
+    fn empty_mutate_is_a_no_op_and_logs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap();
+
+        let before = std::fs::metadata(dir.path().join("wal.log")).unwrap().len();
+        db.mutate(0, RoaringBitmap::new(), vec![])
+            .expect("an empty statement succeeds");
+        assert_eq!(
+            std::fs::metadata(dir.path().join("wal.log")).unwrap().len(),
+            before,
+            "an empty statement must not reach the log"
+        );
+    }
+
+    /// One record means one buffer, on the commit thread now and on every
+    /// replay forever. The cap turns "this UPDATE rewrites a million vectors"
+    /// into a named error at the door instead of an allocation failure inside
+    /// the commit loop — and it is what bounds the metadata lock hold, since
+    /// that is proportional to statement size.
+    #[test]
+    fn oversized_install_is_refused_before_logging() {
+        let dir = tempfile::tempdir().unwrap();
+        // 4096 floats = 16 KiB of vector per row; enough rows to clear 256 MiB.
+        let dim = 4096;
+        let per_row = dim * std::mem::size_of::<f32>();
+        let rows = MAX_INSTALL_BYTES / per_row + 2;
+        let db = Db::open(dir.path(), &[cfg(0, dim, rows + 8)], manual_opts()).unwrap();
+
+        let installs: Vec<Install> = (0..rows as u64)
+            .map(|ordinal| Install {
+                ordinal,
+                vector: vec![0.5; dim],
+                metadata: vec![],
+            })
+            .collect();
+
+        let before = std::fs::metadata(dir.path().join("wal.log")).unwrap().len();
+        match db.mutate(0, RoaringBitmap::new(), installs) {
+            Err(Error::StatementTooLarge { bytes, cap }) => {
+                assert!(bytes > cap);
+                assert_eq!(cap, MAX_INSTALL_BYTES);
+            }
+            other => panic!("expected StatementTooLarge, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::metadata(dir.path().join("wal.log")).unwrap().len(),
+            before,
+            "a refused statement must never reach the durable log"
+        );
+    }
+
+    #[test]
+    fn install_just_under_the_cap_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let dim = 4096;
+        // bincode spends ~24 bytes of framing per Install on top of the vector
+        // (ordinal, plus a length prefix for each of the two vecs). Budget for
+        // it, or "just under" silently becomes "just over".
+        let per_row = dim * std::mem::size_of::<f32>() + 32;
+        let rows = MAX_INSTALL_BYTES / per_row - 1;
+        let db = Db::open(dir.path(), &[cfg(0, dim, rows + 8)], manual_opts()).unwrap();
+
+        let installs: Vec<Install> = (0..rows as u64)
+            .map(|ordinal| Install {
+                ordinal,
+                vector: vec![0.5; dim],
+                metadata: vec![],
+            })
+            .collect();
+        // Pin that this really is a boundary case rather than a small
+        // statement that trivially fits.
+        let bytes = bincode::serialized_size(&installs).unwrap() as usize;
+        assert!(
+            bytes <= MAX_INSTALL_BYTES && bytes > MAX_INSTALL_BYTES - 1024 * 1024,
+            "expected a statement just under the cap, got {bytes}"
+        );
+
+        db.mutate(0, RoaringBitmap::new(), installs)
+            .expect("just under the cap is a legal statement");
+        assert_eq!(db.live_snapshot(0).unwrap().len(), rows as u64);
     }
 
     #[test]

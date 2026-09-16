@@ -79,8 +79,8 @@ impl Apply for WriterApplier {
             // The flat index no longer participates in a delete: retiring a
             // row clears a bit in the metadata index and nothing else.
             Record::Delete { .. } => {}
-            Record::CreateCollection { .. } => {
-                unreachable!("this test never logs CreateCollection records")
+            Record::CreateCollection { .. } | Record::Mutate { .. } => {
+                unreachable!("this test only logs Insert and Delete records")
             }
         }
         self.writer.advance_applied_lsn(lsn.0);
@@ -102,8 +102,8 @@ fn log_and_apply(h: &WalHandle, w: &mut Writer, rec: Record) {
             ordinal, vector, ..
         } => w.write_at(*ordinal, vector).expect("write_at"),
         Record::Delete { .. } => {}
-        Record::CreateCollection { .. } => {
-            unreachable!("this test never logs CreateCollection records")
+        Record::CreateCollection { .. } | Record::Mutate { .. } => {
+            unreachable!("this test only logs Insert and Delete records")
         }
     }
     w.advance_applied_lsn(lsn.0);
