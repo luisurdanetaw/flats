@@ -1571,4 +1571,114 @@ mod tests {
         );
         db.close().unwrap();
     }
+    // -- DELETE, end to end through the front door ---------------------------
+
+    /// Every author still visible, sorted — the oracle for what a DELETE left.
+    fn remaining(db: &Db) -> Vec<String> {
+        let mut all = authors(
+            db.execute("SELECT author FROM docs WHERE published_at > 0;")
+                .expect("the select runs"),
+        );
+        all.sort();
+        all
+    }
+
+    /// Run a DELETE and insist it behaves like every mutation: no rows out.
+    fn delete(db: &Db, sql: &str) {
+        let stream = db.execute(sql).expect("the delete runs");
+        assert!(collect(stream).is_empty(), "a DELETE yields no rows");
+    }
+
+    #[test]
+    fn delete_removes_exactly_the_rows_its_where_admits() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        delete(&db, "DELETE FROM docs WHERE published_at = 1;");
+
+        assert_eq!(remaining(&db), vec!["bob", "dave"]);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn delete_takes_compound_predicates() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        // AND binds tighter than OR: (published_at = 1 AND author = 'alice') OR author = 'dave'.
+        delete(
+            &db,
+            "DELETE FROM docs WHERE published_at = 1 AND author = 'alice' OR author = 'dave';",
+        );
+
+        assert_eq!(remaining(&db), vec!["bob", "carol"]);
+        db.close().unwrap();
+    }
+
+    /// V-SQL has no NOT; `!=` is its negation, built as a complement WITHIN
+    /// the query's snapshot. A DELETE through it must hit only rows that were
+    /// live — it must neither resurrect a row deleted earlier nor reach past
+    /// the live set into ordinals no row has been given yet.
+    #[test]
+    fn a_negated_delete_stays_inside_the_live_set() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        delete(&db, "DELETE FROM docs WHERE author = 'alice';");
+        delete(&db, "DELETE FROM docs WHERE author != 'bob';");
+        assert_eq!(remaining(&db), vec!["bob"]);
+        assert!(
+            where_authors(&db, "author = 'alice'").is_empty(),
+            "no resurrection"
+        );
+
+        // A row inserted afterwards lands at a fresh ordinal and is visible:
+        // the complement did not pre-retire ordinal space beyond the live set.
+        insert(&db, "eve", "late", 3);
+        assert_eq!(remaining(&db), vec!["bob", "eve"]);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn a_delete_matching_nothing_succeeds_and_logs_nothing() {
+        let (dir, db) = docs_db();
+        seed_filterable(&db);
+
+        let wal = dir.path().join("wal.log");
+        let before = std::fs::metadata(&wal).expect("wal exists").len();
+        delete(&db, "DELETE FROM docs WHERE author = 'nobody';");
+
+        assert_eq!(std::fs::metadata(&wal).expect("wal exists").len(), before);
+        assert_eq!(remaining(&db), vec!["alice", "bob", "carol", "dave"]);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn a_delete_survives_reopen() {
+        let (dir, db) = docs_db();
+        seed_filterable(&db);
+        delete(&db, "DELETE FROM docs WHERE published_at = 1;");
+        drop(db); // no closing checkpoint: the WAL must carry the delete
+
+        let db = Db::open(dir.path(), &[], DbOptions::default()).expect("reopen");
+        assert_eq!(remaining(&db), vec!["bob", "dave"]);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn malformed_and_misaddressed_deletes_are_errors_not_panics() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        assert!(matches!(
+            db.execute("DELETE FROM docs;"),
+            Err(Error::Parse(_))
+        ));
+        assert!(matches!(
+            db.execute("DELETE FROM nope WHERE author = 'alice';"),
+            Err(Error::Bind(BindError::CollectionNotFound(_)))
+        ));
+        assert_eq!(remaining(&db).len(), 4, "a refused DELETE removes nothing");
+        db.close().unwrap();
+    }
 }
