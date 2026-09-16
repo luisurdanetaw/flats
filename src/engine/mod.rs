@@ -935,13 +935,18 @@ impl Db {
     pub fn mutate(
         &self,
         collection: u32,
-        retire: RoaringBitmap,
+        mut retire: RoaringBitmap,
         install: Vec<Install>,
     ) -> Result<()> {
         let coll = self.collection(collection)?;
         if retire.is_empty() && install.is_empty() {
             return Ok(());
         }
+        // Collapse contiguous runs into run containers before the bitmap is
+        // encoded. A bulk DELETE retires long runs, and this is the difference
+        // between ~16 KiB and a few dozen bytes per 100k rows in the frame. We
+        // own the bitmap here, so it costs no copy.
+        retire.optimize();
         self.check_poison()?;
 
         let dim = coll.config.schema.vector().dim.get();

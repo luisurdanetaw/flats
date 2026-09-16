@@ -71,12 +71,12 @@ pub struct Lsn(pub u64);
 /// long contiguous run of ordinals. A structural encoding would spell out every
 /// ordinal, and this bitmap has to fit in one frame, one CRC, one fsync.
 ///
-/// `RoaringBitmap::optimize` is NOT called here. `Serialize` takes `&self`, so doing it on
-/// the encode path would mean cloning the bitmap every time; the logging side
-/// calls it once when it builds the retire set, where the run structure is
-/// known. Un-optimized is already ~16 KiB per 100k contiguous ordinals (bitmap
-/// containers) against ~400 KiB structural, so this is a tuning lever, not a
-/// correctness one.
+/// `RoaringBitmap::optimize` is NOT called here. `Serialize` takes `&self`, so
+/// doing it on the encode path would mean cloning the bitmap every time.
+/// `Db::mutate` calls it instead, once, on the bitmap it already owns before
+/// building the record. Un-optimized is already ~16 KiB per 100k contiguous
+/// ordinals (bitmap containers) against ~400 KiB structural, so this is a size
+/// lever, not a correctness one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bitmap(pub RoaringBitmap);
 
@@ -1238,8 +1238,7 @@ mod tests {
     /// Second, `RoaringBitmap::optimize` collapses those runs into RUN containers and
     /// buys another ~20x. It is deliberately NOT called in `Serialize` (that
     /// takes `&self`, so it would mean cloning the bitmap on every encode) —
-    /// the logging side calls it when it builds the retire set, which is where
-    /// the run structure is known.
+    /// `Db::mutate` calls it on the bitmap it owns before logging.
     #[test]
     fn bitmap_round_trips_in_the_portable_roaring_encoding() {
         let dense: RoaringBitmap = (0..100_000u32).collect();
