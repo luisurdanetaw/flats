@@ -40,8 +40,8 @@
 use std::fmt;
 
 use crate::sql::ast::{
-    ColumnType, CompareOp, CreateStmt, Expr, InsertStmt, Literal, Projection, SearchStmt,
-    SelectStmt, Statement,
+    ColumnType, CompareOp, CreateStmt, DeleteStmt, Expr, InsertStmt, Literal, Projection,
+    SearchStmt, SelectStmt, Statement,
 };
 
 // ---------------------------------------------------------------------------
@@ -478,9 +478,7 @@ pub fn analyze(stmt: Statement, catalog: &impl Catalog) -> Result<BoundStatement
             bind_create(c, catalog).map(BoundStatement::CreateCollection)
         }
         Statement::Search(s) => bind_search(s, catalog).map(BoundStatement::Search),
-        Statement::Delete(_) => Err(BindError::Unbound {
-            statement: "DELETE",
-        }),
+        Statement::Delete(d) => bind_delete(d, catalog).map(BoundStatement::Delete),
         // EXTEND: Update dispatches here when it lands.
     }
 }
@@ -659,6 +657,25 @@ fn bind_select(stmt: SelectStmt, catalog: &impl Catalog) -> Result<BoundSelect, 
         schema,
         projection,
         include_vector,
+        filter,
+    })
+}
+
+/// `DELETE FROM from WHERE filter`.
+///
+/// Two checks, in the order `bind_select` makes them: the collection exists,
+/// then the predicate binds against its schema. The predicate goes through the
+/// SAME `bind_predicate` a SELECT's does — not a copy of it — so a DELETE
+/// refuses exactly what a SELECT refuses and a user can preview a DELETE by
+/// running the SELECT with the same WHERE.
+fn bind_delete(stmt: DeleteStmt, catalog: &impl Catalog) -> Result<BoundDelete, BindError> {
+    let schema = catalog
+        .get_collection(&stmt.from)
+        .ok_or_else(|| BindError::CollectionNotFound(stmt.from.clone()))?;
+    let filter = bind_predicate(stmt.filter, &schema)?;
+    Ok(BoundDelete {
+        from: stmt.from,
+        schema,
         filter,
     })
 }
