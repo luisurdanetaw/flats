@@ -238,9 +238,16 @@ impl Db {
         // Labels come from the BOUND projection, so they exist long before the
         // first row is fetched.
         let labels = labels_of(&bound);
+        // A DELETE would also finish inside `open_cursors` — its `Mutate` needs
+        // the database, so it runs before the machine detaches — but that is
+        // the read path's detach rule doing a write by coincidence. Mutations
+        // are drained on the write path, where "durable before `execute`
+        // returns" is the stated contract rather than a consequence.
         let mutates = matches!(
             bound,
-            BoundStatement::Insert(_) | BoundStatement::CreateCollection(_)
+            BoundStatement::Insert(_)
+                | BoundStatement::CreateCollection(_)
+                | BoundStatement::Delete(_)
         );
 
         // 3. PLAN — infallible: binding already validated everything, so this
