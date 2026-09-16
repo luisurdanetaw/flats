@@ -1152,10 +1152,10 @@ mod tests {
     #[test]
     fn delete_predicates_fail_exactly_like_select_predicates() {
         for clause in [
-            "nope < 2",               // unknown column
-            "vector = 'x'",           // the embedding has no postings
-            "author < 'm'",           // ordered compare on TEXT
-            "published_at = 'soon'",  // type mismatch
+            "nope < 2",              // unknown column
+            "vector = 'x'",          // the embedding has no postings
+            "author < 'm'",          // ordered compare on TEXT
+            "published_at = 'soon'", // type mismatch
         ] {
             let sql = format!("DELETE FROM docs WHERE {clause};");
             assert_eq!(

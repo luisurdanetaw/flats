@@ -1809,7 +1809,10 @@ mod tests {
         assert_eq!(matched.iter().collect::<Vec<_>>(), vec![0, 2]);
 
         let hits = db.search(0, &[1.0, 0.0], 8).unwrap();
-        assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![Ordinal(1)]);
+        assert_eq!(
+            hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![Ordinal(1)]
+        );
 
         let mut cursor = db.scan(0).unwrap();
         assert!(cursor.seek_first().unwrap());
@@ -1839,7 +1842,10 @@ mod tests {
             drop(db);
         }
         let db = Db::open(dir.path(), &cfgs, manual_opts()).unwrap();
-        assert_eq!(db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![1]
+        );
     }
 
     /// Two statements racing to delete the same rows, or one replayed after a
@@ -1852,8 +1858,12 @@ mod tests {
 
         let stale: RoaringBitmap = [0u32, 2].into_iter().collect();
         db.mutate(0, stale.clone(), vec![]).unwrap();
-        db.mutate(0, stale, vec![]).expect("retiring retired rows succeeds");
-        assert_eq!(db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(), vec![1]);
+        db.mutate(0, stale, vec![])
+            .expect("retiring retired rows succeeds");
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![1]
+        );
     }
 
     /// `DELETE … WHERE <matches nothing>` is a successful no-op that costs no
