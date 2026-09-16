@@ -44,7 +44,23 @@ pub enum Statement {
     CreateCollection(CreateStmt),
     /// `SEARCH TOP … NEAREST TO … FROM …`
     Search(SearchStmt),
-    // EXTEND: Delete(DeleteStmt), Update(UpdateStmt).
+    /// `DELETE FROM … WHERE …`
+    Delete(DeleteStmt),
+    // EXTEND: Update(UpdateStmt).
+}
+
+/// `DELETE FROM ident WHERE expr`.
+///
+/// The predicate is REQUIRED, not optional like `SELECT`'s: V-SQL has no
+/// statement that deletes a whole collection by leaving a clause out (CLAUDE.md
+/// §4). A missing `WHERE` is a parse error, so the dangerous form cannot be
+/// typed by accident.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteStmt {
+    /// The collection name after `FROM`.
+    pub from: String,
+    /// Which rows to delete.
+    pub filter: Expr,
 }
 
 /// `SELECT projection FROM ident [WHERE expr]`.

@@ -312,6 +312,8 @@ impl Target {
             // rejects it for now — see `BindError::Unbound` — but this is the
             // right answer, so the arm is real rather than a placeholder.)
             Statement::Search(s) => Target::Existing(s.collection.clone()),
+            // A DELETE's predicate is resolved against the collection it names.
+            Statement::Delete(d) => Target::Existing(d.from.clone()),
         }
     }
 }

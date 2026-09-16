@@ -29,8 +29,8 @@
 use std::fmt;
 
 use crate::sql::ast::{
-    CollectionOption, ColumnDef, ColumnType, CompareOp, CreateStmt, Expr, InsertStmt, Literal,
-    Projection, SearchStmt, SelectStmt, Statement,
+    CollectionOption, ColumnDef, ColumnType, CompareOp, CreateStmt, DeleteStmt, Expr, InsertStmt,
+    Literal, Projection, SearchStmt, SelectStmt, Statement,
 };
 use crate::sql::lexer::{LexError, Lexer, Span, SpannedToken, Token};
 
@@ -843,6 +843,61 @@ mod tests {
 
     fn cmp(left: Box<Expr>, op: CompareOp, right: Box<Expr>) -> Box<Expr> {
         Box::new(Expr::Compare { left, op, right })
+    }
+
+    // -- DELETE ------------------------------------------------------------
+    //
+    // `delete := DELETE FROM ident WHERE expr` — the WHERE is mandatory.
+
+    fn delete_of(sql: &str) -> DeleteStmt {
+        match ok(sql) {
+            Statement::Delete(d) => d,
+            other => panic!("expected a DELETE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_delete_with_a_predicate() {
+        assert_eq!(
+            ok("DELETE FROM docs WHERE z < 2;"),
+            Statement::Delete(DeleteStmt {
+                from: "docs".to_string(),
+                filter: *cmp(col("z"), CompareOp::Lt, int(2)),
+            })
+        );
+        // Keywords are case-insensitive; the collection keeps its source case.
+        assert_eq!(delete_of("delete from MyDocs where z < 2;").from, "MyDocs");
+    }
+
+    #[test]
+    fn delete_takes_the_full_where_grammar() {
+        // The same expression parser as SELECT, so AND binds tighter than OR.
+        assert_eq!(
+            delete_of("DELETE FROM docs WHERE a = 1 OR b = 2 AND c = 3;").filter,
+            Expr::Or(
+                cmp(col("a"), CompareOp::Eq, int(1)),
+                Box::new(Expr::And(
+                    cmp(col("b"), CompareOp::Eq, int(2)),
+                    cmp(col("c"), CompareOp::Eq, int(3)),
+                )),
+            )
+        );
+    }
+
+    #[test]
+    fn delete_without_where_is_an_error() {
+        // No accidental whole-collection delete: leaving the clause out does
+        // not parse. (`err` panics unless the parse fails.)
+        err("DELETE FROM docs;");
+        err("DELETE FROM docs WHERE;");
+    }
+
+    #[test]
+    fn malformed_deletes_are_errors() {
+        err("DELETE docs WHERE z < 2;");
+        err("DELETE FROM WHERE z < 2;");
+        err("DELETE FROM docs WHERE z < 2");
+        err("DELETE FROM docs WHERE z < 2 RETURNING id;");
     }
 
     #[test]

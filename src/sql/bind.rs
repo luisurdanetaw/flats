@@ -461,7 +461,10 @@ pub fn analyze(stmt: Statement, catalog: &impl Catalog) -> Result<BoundStatement
             bind_create(c, catalog).map(BoundStatement::CreateCollection)
         }
         Statement::Search(s) => bind_search(s, catalog).map(BoundStatement::Search),
-        // EXTEND: Delete/Update dispatch here as those statements land.
+        Statement::Delete(_) => Err(BindError::Unbound {
+            statement: "DELETE",
+        }),
+        // EXTEND: Update dispatches here when it lands.
     }
 }
 
