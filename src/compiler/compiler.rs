@@ -630,7 +630,7 @@ mod tests {
     use crate::sql::bind::{
         BoundPredicate, ColumnRef, ColumnSchema, Projected, Schema as BindSchema, TypedValue,
     };
-    use crate::sql::plan::{CreateCollection, Insert, LogicalPlan, Project, Scan};
+    use crate::sql::plan::{CreateCollection, Delete, Insert, LogicalPlan, Project, Scan};
     use std::num::NonZeroUsize;
 
     // ------------------------------------------------------------------------
@@ -789,6 +789,70 @@ mod tests {
                 ty: ColumnType::Int,
             },
         }
+    }
+
+    /// `DELETE FROM docs WHERE <pred>`, compiled.
+    fn delete_program(predicate: BoundPredicate) -> Program {
+        let plan = LogicalPlan::Delete(Delete {
+            collection: "docs".to_string(),
+            schema: docs_bind_schema(),
+            predicate,
+        });
+        compile(plan, Some(&docs_meta_schema())).expect("a DELETE compiles")
+    }
+
+    #[test]
+    fn delete_compiles_to_its_predicate_then_one_mutate() {
+        let program = delete_program(cmp_pred("published_at", 3, CompareOp::Lt, 2));
+        assert_eq!(
+            program.ops,
+            vec![
+                Op::Integer {
+                    value: 2,
+                    dst: Reg(0)
+                },
+                Op::BitmapRange {
+                    collection: "docs".to_string(),
+                    col: 2,
+                    op: RangeOp::Lt,
+                    value: Reg(0),
+                    dst: Reg(1),
+                },
+                // The whole answer, handed over at once.
+                Op::Mutate {
+                    collection: "docs".to_string(),
+                    retire: Reg(1),
+                },
+                Op::Halt,
+            ]
+        );
+        // No cursor: a DELETE never walks rows, so there is no loop to emit.
+        assert_eq!(program.n_cursors, 0);
+        program.validate().expect("a DELETE program validates");
+    }
+
+    #[test]
+    fn a_compound_delete_predicate_feeds_mutate_its_final_bitmap() {
+        let pred = BoundPredicate::Or(
+            Box::new(cmp_pred("published_at", 3, CompareOp::Lt, 2)),
+            Box::new(cmp_pred("published_at", 3, CompareOp::Gt, 9)),
+        );
+        let ops = delete_program(pred).ops;
+        let or_dst = ops
+            .iter()
+            .find_map(|op| match op {
+                Op::BitmapOr { dst, .. } => Some(*dst),
+                _ => None,
+            })
+            .expect("an OR predicate emits BitmapOr");
+        assert_eq!(
+            ops[ops.len() - 2],
+            Op::Mutate {
+                collection: "docs".to_string(),
+                retire: or_dst,
+            },
+            "Mutate retires the combined bitmap, not either operand"
+        );
     }
 
     #[test]

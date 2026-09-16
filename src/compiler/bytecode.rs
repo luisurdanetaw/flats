@@ -457,6 +457,21 @@ pub enum Op {
         /// Destination register.
         dst: Reg,
     },
+    /// Retire every row in a bitmap — ONE statement, logged as ONE durable
+    /// record.
+    ///
+    /// Set-at-a-time on purpose. The bitmap is the predicate's answer, already
+    /// computed by the `Bitmap*` ops above against this query's snapshot, and it
+    /// is handed to the engine whole: one `Record::Mutate`, one fsync, all or
+    /// nothing. A cursor loop issuing a delete per row would be N records and N
+    /// commit points — exactly the non-atomic shape that design exists to rule
+    /// out.
+    Mutate {
+        /// The collection to retire rows from.
+        collection: String,
+        /// Register holding the bitmap of ordinals to retire.
+        retire: Reg,
+    },
     /// Provision a collection. One fat op — nothing about DDL varies at runtime.
     CreateCollection {
         /// New collection name.
@@ -571,6 +586,9 @@ impl Program {
                 Op::BitmapNot { src, dst, .. } => {
                     self.check_reg(at, *src)?;
                     self.check_reg(at, *dst)?;
+                }
+                Op::Mutate { retire, .. } => {
+                    self.check_reg(at, *retire)?;
                 }
                 Op::CreateCollection { schema, .. } => {
                     self.check_const(at, *schema)?;

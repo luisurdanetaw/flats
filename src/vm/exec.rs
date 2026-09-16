@@ -204,6 +204,7 @@ fn needs_db(op: &Op) -> bool {
             | Op::OpenWrite { .. }
             | Op::KnnScan { .. }
             | Op::Insert { .. }
+            | Op::Mutate { .. }
             | Op::CreateCollection { .. }
             // Every bitmap op reads the collection's metadata index.
             | Op::BitmapEq { .. }
@@ -237,6 +238,7 @@ fn mnemonic(op: &Op) -> &'static str {
         Op::BitmapAnd { .. } => "BitmapAnd",
         Op::BitmapOr { .. } => "BitmapOr",
         Op::BitmapNot { .. } => "BitmapNot",
+        Op::Mutate { .. } => "Mutate",
         Op::Halt => "Halt",
     }
 }
@@ -729,6 +731,9 @@ impl Vm {
                 // -- not built yet ---------------------------------------------
                 // `todo!`, never a no-op. Each names the cycle that fills it.
                 Op::VectorFetch { .. } => todo!("5b: embedding fetch"),
+                // Unreachable from public input until the compiler emits it:
+                // `compile` still refuses DELETE.
+                Op::Mutate { .. } => todo!("Op::Mutate execution"),
 
                 // -- DML: pack a record, then write it through a write cursor --
                 Op::OpenWrite { cur, collection } => {
@@ -1713,6 +1718,107 @@ mod tests {
             n_regs: 5,
             n_cursors: 1,
         }
+    }
+
+    // ======================================================================
+    // DELETE — Op::Mutate retires a whole bitmap as one statement.
+    // ======================================================================
+
+    /// `DELETE FROM docs WHERE author = <author>`, as the compiler emits it:
+    /// the predicate's bitmap, then one `Mutate` over it.
+    fn delete_where_author_program(author: &str) -> Program {
+        let mut consts = ConstPool::new();
+        let needle = consts.add(Const::Str(author.into()));
+        Program {
+            ops: vec![
+                Op::String {
+                    id: needle,
+                    dst: Reg(0),
+                },
+                Op::BitmapEq {
+                    collection: "docs".into(),
+                    col: 0, // author
+                    value: Reg(0),
+                    dst: Reg(1),
+                },
+                Op::Mutate {
+                    collection: "docs".into(),
+                    retire: Reg(1),
+                },
+                Op::Halt,
+            ],
+            consts,
+            n_regs: 2,
+            n_cursors: 0,
+        }
+    }
+
+    fn run_to_halt(db: &Db, program: Program) -> Result<(), ExecError> {
+        let mut vm = Vm::new(program)?;
+        while vm.step(db)?.is_some() {}
+        Ok(())
+    }
+
+    #[test]
+    fn mutate_retires_every_row_in_the_bitmap() {
+        let (_dir, db) = docs_db();
+        for (author, n) in [("alice", 1), ("bob", 2), ("alice", 3)] {
+            run_to_halt(&db, insert_program(author, n)).expect("inserts");
+        }
+
+        run_to_halt(&db, delete_where_author_program("alice")).expect("deletes");
+
+        assert_eq!(live_rows(&db), 1, "both alices are gone, bob is not");
+        let mut cursor = db.scan(0).expect("collection 0 exists");
+        assert!(cursor.seek_first().expect("reads"));
+        assert_eq!(cursor.row().expect("parked")[0], Value::Text("bob".into()));
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn mutate_refuses_a_register_that_is_not_a_bitmap() {
+        let (_dir, db) = docs_db();
+        let program = Program {
+            ops: vec![
+                Op::Integer {
+                    value: 1,
+                    dst: Reg(0),
+                },
+                Op::Mutate {
+                    collection: "docs".into(),
+                    retire: Reg(0),
+                },
+                Op::Halt,
+            ],
+            consts: ConstPool::new(),
+            n_regs: 1,
+            n_cursors: 0,
+        };
+        match run_to_halt(&db, program) {
+            Err(ExecError::NotABitmap { reg }) => assert_eq!(reg, 0),
+            other => panic!("expected NotABitmap, got {other:?}"),
+        }
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn mutate_register_is_range_checked_before_anything_runs() {
+        let program = Program {
+            ops: vec![
+                Op::Mutate {
+                    collection: "docs".into(),
+                    retire: Reg(5),
+                },
+                Op::Halt,
+            ],
+            consts: ConstPool::new(),
+            n_regs: 1,
+            n_cursors: 0,
+        };
+        assert!(
+            matches!(Vm::new(program), Err(ExecError::Invalid(_))),
+            "an out-of-range retire register must fail validation, not execution"
+        );
     }
 
     #[test]
