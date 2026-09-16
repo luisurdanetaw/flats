@@ -731,9 +731,6 @@ impl Vm {
                 // -- not built yet ---------------------------------------------
                 // `todo!`, never a no-op. Each names the cycle that fills it.
                 Op::VectorFetch { .. } => todo!("5b: embedding fetch"),
-                // Unreachable from public input until the compiler emits it:
-                // `compile` still refuses DELETE.
-                Op::Mutate { .. } => todo!("Op::Mutate execution"),
 
                 // -- DML: pack a record, then write it through a write cursor --
                 Op::OpenWrite { cur, collection } => {
@@ -797,6 +794,23 @@ impl Vm {
                     // Blocks until durable AND applied, so the row is readable
                     // through a cursor the moment this returns.
                     db.insert(collection, &vector, row)
+                        .map_err(ExecError::Engine)?;
+                }
+
+                // -- DELETE: one statement, one record --------------------------
+                Op::Mutate { collection, retire } => {
+                    let retire = *retire;
+                    let db = db.ok_or(ExecError::Detached { op: "Mutate" })?;
+                    // The bitmap the predicate ops computed against THIS
+                    // query's snapshot. It is handed over whole: the engine
+                    // logs it as one record, so the statement is all or
+                    // nothing. The register keeps its own reference, hence the
+                    // copy rather than a move.
+                    let bitmap = self.bitmap(retire)?;
+                    let id = db.collection_id(collection).map_err(ExecError::Engine)?;
+                    // Blocks until durable AND applied: on return, no new
+                    // snapshot admits any of these rows.
+                    db.mutate(id, bitmap.as_ref().clone(), Vec::new())
                         .map_err(ExecError::Engine)?;
                 }
 

@@ -74,6 +74,12 @@
 //                                     stores. One fat op — nothing about DDL
 //                                     varies at runtime, so there is nothing to
 //                                     interpret.
+//   Mutate       collection, retireReg
+//                                     retire every ordinal in the bitmap as ONE
+//                                     statement: one Record::Mutate, one fsync.
+//                                     What DELETE compiles to — no cursor, no
+//                                     loop, because a per-row delete would be N
+//                                     commit points instead of one.
 //
 // WHERE — predicates are SET ALGEBRA, not per-row comparisons
 //   BitmapEq     collection, colId, valueReg, dst
@@ -102,15 +108,15 @@
 // Control
 //   Halt                              stop execution
 //
-// 24 opcodes = a working engine, vector search, RETURNING and WHERE included.
+// 25 opcodes = a working engine, vector search, RETURNING, WHERE and DELETE.
 //
 // ---------------------------------------------------------------------------
 // EXTEND: — not built yet. Added one statement at a time, as emission demands.
 // ---------------------------------------------------------------------------
 //
 // DML
-//   Delete       cur                  delete the row under the cursor
-//   Update       cur, rec             replace the row under the cursor
+//   UPDATE extends `Mutate` with an install side (the copy-on-write rows) rather
+//   than getting a per-row `Update cur, rec`: one statement stays one record.
 //
 // SEARCH — the rest
 //   GRANULARITY NOTE: KnnScan is deliberately COARSE. Interpreting the distance

@@ -91,7 +91,6 @@ pub fn compile(plan: LogicalPlan, schema: Option<&Schema>) -> Result<Program, Co
     // back up through a `FnMut`.
     let created = match &plan {
         LogicalPlan::CreateCollection(create) => Some(to_metadata_schema(&create.schema)?),
-        LogicalPlan::Delete(_) => return Err(CompileError::Unsupported { statement: "DELETE" }),
         _ => None,
     };
 
@@ -128,13 +127,6 @@ pub enum CompileError {
     /// collection's catalog schema — there is nothing to translate its
     /// declaration ordinals through.
     MissingSchema,
-    /// The statement plans, but this build cannot emit code for it yet. The
-    /// compiler's counterpart to `BindError::Unbound`: a clean error in the
-    /// window between a plan node landing and its emission landing.
-    Unsupported {
-        /// Which statement kind.
-        statement: &'static str,
-    },
 }
 
 impl From<SchemaError> for CompileError {
@@ -150,9 +142,6 @@ impl fmt::Display for CompileError {
             CompileError::MissingSchema => {
                 write!(f, "no catalog schema for the target collection")
             }
-            CompileError::Unsupported { statement } => {
-                write!(f, "{statement} plans but cannot be compiled yet")
-            }
         }
     }
 }
@@ -161,7 +150,7 @@ impl std::error::Error for CompileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             CompileError::Schema(e) => Some(e),
-            CompileError::MissingSchema | CompileError::Unsupported { .. } => None,
+            CompileError::MissingSchema => None,
         }
     }
 }
@@ -426,7 +415,7 @@ impl<'a> Compiler<'a> {
 
     /// Emit `node`. WRAPPER nodes (`Scan`, `Knn`; later `Limit`) emit a loop top, then
     /// run `body` to fill the loop, then emit the loop bottom. LEAF nodes
-    /// (`Insert`, `CreateCollection`) emit directly and ignore `body`. `Project`
+    /// (`Insert`, `CreateCollection`, `Delete`) emit directly and ignore `body`. `Project`
     /// is the middle case: it owns no loop and hands its per-row code down to
     /// its child via `body`.
     ///
@@ -600,9 +589,17 @@ impl<'a> Compiler<'a> {
                 });
             }
 
-            // `compile` refuses a DELETE before emission begins, so reaching
-            // here means the two dispatches disagree about the plan.
-            LogicalPlan::Delete(_) => unreachable!("compile refuses DELETE before emission"),
+            LogicalPlan::Delete(delete) => {
+                // LEAF: the predicate's bitmap, then ONE Mutate over it. No
+                // cursor and no loop — the bitmap already IS the set of rows,
+                // and handing it to the engine whole is what makes the
+                // statement a single durable record.
+                let retire = self.emit_predicate(&delete.predicate, &delete.collection);
+                self.emit(Op::Mutate {
+                    collection: delete.collection.clone(),
+                    retire,
+                });
+            }
         }
     }
 
