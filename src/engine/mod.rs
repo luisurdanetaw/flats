@@ -1767,6 +1767,133 @@ mod tests {
         assert_eq!(db.live_snapshot(0).unwrap().len(), rows as u64);
     }
 
+    // -----------------------------------------------------------------------
+    // DELETE — a predicate resolved to a bitmap, logged as one Mutate
+    // -----------------------------------------------------------------------
+
+    /// Resolve `c = value` against the CURRENT snapshot and delete the matches,
+    /// exactly as the VM's `Op::Mutate` will: the predicate becomes a bitmap on
+    /// the logging side, and the bitmap becomes one `Record::Mutate` with
+    /// nothing installed. Returns what was matched.
+    fn delete_where_c(db: &Db, value: &str) -> RoaringBitmap {
+        let snapshot = db.live_snapshot(0).unwrap();
+        let matched = db
+            .metadata_reader(0)
+            .unwrap()
+            .lookup_eq(1, &Value::Text(value.into()), &snapshot)
+            .unwrap();
+        db.mutate(0, matched.clone(), vec![]).unwrap();
+        matched
+    }
+
+    fn seed_alice_bob_alice(db: &Db) {
+        db.insert(0, &[1.0, 0.0], meta_row(1, "alice")).unwrap(); // ord 0
+        db.insert(0, &[2.0, 0.0], meta_row(2, "bob")).unwrap(); // ord 1
+        db.insert(0, &[3.0, 0.0], meta_row(3, "alice")).unwrap(); // ord 2
+    }
+
+    /// The core contract, through every read path: a deleted row is gone from
+    /// search, from scans, and from metadata lookups — and nothing else is.
+    #[test]
+    fn delete_by_bitmap_retires_exactly_the_matched_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        seed_alice_bob_alice(&db);
+
+        let matched = delete_where_c(&db, "alice");
+        assert_eq!(matched.iter().collect::<Vec<_>>(), vec![0, 2]);
+
+        let hits = db.search(0, &[1.0, 0.0], 8).unwrap();
+        assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![Ordinal(1)]);
+
+        let mut cursor = db.scan(0).unwrap();
+        assert!(cursor.seek_first().unwrap());
+        assert_eq!(cursor.ordinal().unwrap(), Ordinal(1));
+        assert!(!cursor.next().unwrap(), "the scan sees nothing but bob");
+
+        let snapshot = db.live_snapshot(0).unwrap();
+        let meta = db.metadata_reader(0).unwrap();
+        assert!(
+            meta.lookup_eq(1, &Value::Text("alice".into()), &snapshot)
+                .unwrap()
+                .is_empty(),
+            "a deleted row satisfies no predicate"
+        );
+    }
+
+    /// Drop skips the closing checkpoint, so the delete survives only if the
+    /// WAL replays it on open.
+    #[test]
+    fn delete_by_bitmap_replays_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfgs = [cfg_meta(0, 2, 64)];
+        {
+            let db = Db::open(dir.path(), &cfgs, manual_opts()).unwrap();
+            seed_alice_bob_alice(&db);
+            delete_where_c(&db, "alice");
+            drop(db);
+        }
+        let db = Db::open(dir.path(), &cfgs, manual_opts()).unwrap();
+        assert_eq!(db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(), vec![1]);
+    }
+
+    /// Two statements racing to delete the same rows, or one replayed after a
+    /// crash, must both succeed: retiring a retired row is a no-op, not an error.
+    #[test]
+    fn deleting_already_deleted_rows_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        seed_alice_bob_alice(&db);
+
+        let stale: RoaringBitmap = [0u32, 2].into_iter().collect();
+        db.mutate(0, stale.clone(), vec![]).unwrap();
+        db.mutate(0, stale, vec![]).expect("retiring retired rows succeeds");
+        assert_eq!(db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(), vec![1]);
+    }
+
+    /// `DELETE … WHERE <matches nothing>` is a successful no-op that costs no
+    /// fsync.
+    #[test]
+    fn zero_match_delete_logs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        seed_alice_bob_alice(&db);
+
+        let wal = dir.path().join("wal.log");
+        let before = std::fs::metadata(&wal).unwrap().len();
+        assert!(delete_where_c(&db, "carol").is_empty());
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), before);
+        assert_eq!(db.live_snapshot(0).unwrap().len(), 3);
+    }
+
+    /// A DELETE deletes what matched in the snapshot it read. A row inserted
+    /// after that snapshot survives even if it matches — and it can never be
+    /// hit by accident, because ordinals are never reused, so a stale bitmap
+    /// cannot name a newer row.
+    #[test]
+    fn delete_resolved_on_an_old_snapshot_spares_later_inserts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], meta_row(1, "alice")).unwrap(); // ord 0
+
+        let snapshot = db.live_snapshot(0).unwrap();
+        let matched = db
+            .metadata_reader(0)
+            .unwrap()
+            .lookup_eq(1, &Value::Text("alice".into()), &snapshot)
+            .unwrap();
+
+        // A matching row lands between resolving and logging.
+        let late = db.insert(0, &[2.0, 0.0], meta_row(2, "alice")).unwrap();
+        db.mutate(0, matched, vec![]).unwrap();
+
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![late.0],
+            "the late insert was not in the statement's snapshot"
+        );
+    }
+
     #[test]
     fn insert_search_delete_e2e() {
         let dir = tempfile::tempdir().unwrap();
