@@ -63,7 +63,7 @@ use crate::metadata::common::{Row, Schema};
 use crate::metadata::index::MetadataIndex;
 use crate::metadata::tuples::TupleStore;
 use crate::metadata::{crc32, index as meta, tuples, write_snapshot_atomic};
-use crate::wal::wal::{Apply, Bitmap, Install, Lsn, Record, Wal, WalHandle};
+use crate::wal::wal::{Apply, Bitmap, Install, Lsn, Outcome, Record, Wal, WalHandle};
 
 /// Ceiling on the installed payload of one `Record::Mutate`, in bytes.
 ///
@@ -323,7 +323,7 @@ impl Apply for IndexApplier {
     /// consult must already hold it by then. Inserts publish liveness last,
     /// deletes publish it first. Do not reorder — `concurrent_stores.rs`
     /// asserts the resulting property directly.
-    fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<()> {
+    fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<Outcome> {
         match record {
             Record::Insert {
                 collection,
@@ -401,7 +401,7 @@ impl Apply for IndexApplier {
         // The catalog watermark advances only on success — a `?` above skips
         // this, so a failed record can never be claimed as reflected.
         self.last_applied = self.last_applied.max(lsn.0);
-        Ok(())
+        Ok(Outcome::Applied)
     }
 
     /// Checkpoint every store of every collection, returning the WAL
@@ -2463,8 +2463,8 @@ mod tests {
     /// `tests/reconciliation.rs`'s `LogOnly`.
     struct LogOnly;
     impl Apply for LogOnly {
-        fn apply(&mut self, _lsn: Lsn, _record: &Record) -> io::Result<()> {
-            Ok(())
+        fn apply(&mut self, _lsn: Lsn, _record: &Record) -> io::Result<Outcome> {
+            Ok(Outcome::Applied)
         }
         fn checkpoint(&mut self) -> io::Result<Option<u64>> {
             Ok(None)

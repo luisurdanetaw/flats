@@ -201,8 +201,46 @@ impl Record {
     }
 }
 
+/// What the applier DID with a record that was already made durable.
+///
+/// Distinct from `Err`, and the distinction matters since Phase 7: an `Err`
+/// from apply means the index could not absorb a committed record, which halts
+/// the database (`Poison`). A conflict is not that — it is a correct, expected
+/// decision that the record is stale and must not be applied, reached the same
+/// way on every replay. The caller retries; nothing is broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The record was folded into the index.
+    Applied,
+    /// The record was skipped as stale — the rows it was built from moved on
+    /// between the moment its writer read them and the moment it was applied.
+    Conflicted,
+}
+
+/// A durable record plus what became of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Committed {
+    /// The LSN assigned to the record. Assigned — and the frame fsynced —
+    /// whatever the outcome: a conflicted record is durable, it just does
+    /// nothing.
+    pub lsn: Lsn,
+    /// Applied, or skipped as stale.
+    pub outcome: Outcome,
+}
+
+impl Committed {
+    /// True when the record was folded in rather than skipped as stale.
+    pub fn applied(&self) -> bool {
+        self.outcome == Outcome::Applied
+    }
+}
+
 pub trait Apply {
-    fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<()>;
+    /// Fold one durable record into the index.
+    ///
+    /// Returns `Outcome::Conflicted` — NOT an error — for a record that is
+    /// stale by the time it arrives. See `Outcome`.
+    fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<Outcome>;
 
     /// Make all applied state durable and return the LSN through which the log
     /// may now be truncated (the minimum durable watermark), or `None` if there
@@ -317,7 +355,7 @@ enum Command {
     /// Append a record; reply with its durable LSN.
     Append {
         record: Record,
-        ack: Sender<io::Result<Lsn>>,
+        ack: Sender<io::Result<Committed>>,
     },
     /// Drop every frame with `lsn <= up_to` from the front of the log. Used by
     /// callers that manage durability themselves (e.g. tests).
@@ -343,7 +381,7 @@ impl WalHandle {
     /// Append a record and BLOCK until it is durable. Returns the assigned LSN.
     /// The caller acks the client only after this returns Ok — that ordering is
     /// the entire durability contract.
-    pub fn append(&self, record: Record) -> io::Result<Lsn> {
+    pub fn append(&self, record: Record) -> io::Result<Committed> {
         let (ack_tx, ack_rx) = mpsc::channel();
         self.tx
             .send(Command::Append {
@@ -548,7 +586,7 @@ impl Wal {
 const MAX_BATCH: usize = 1024;
 
 /// One queued append awaiting commit: the record and the waiter to ack.
-type Pending = (Record, Sender<io::Result<Lsn>>);
+type Pending = (Record, Sender<io::Result<Committed>>);
 
 /// A control op pulled off the command stream, deferred until the current append
 /// batch has been committed.
@@ -759,8 +797,12 @@ fn commit_batch<A: Apply>(
             continue;
         }
         match applier.apply(lsn, &record) {
-            Ok(()) => {
-                let _ = ack.send(Ok(lsn)); // waiter gone == nobody to tell; fine
+            Ok(_outcome) => {
+                // C2 reports the applier's actual verdict here.
+                let _ = ack.send(Ok(Committed {
+                    lsn,
+                    outcome: Outcome::Applied,
+                })); // waiter gone == nobody to tell; fine
             }
             Err(e) => {
                 let _ = poison.set(Poison {
@@ -1068,6 +1110,9 @@ mod tests {
         /// fsynced, so this models the single failure the WAL cannot ack
         /// honestly — durable, but not reflected in the index.
         fail_at: Option<u64>,
+        /// When set, `apply` reports this one LSN as stale rather than
+        /// applying it — the applier's verdict, not a failure.
+        conflict_at: Option<u64>,
         /// How many times `checkpoint` was called. A poisoned log must never
         /// call it: checkpoint advances the durable watermark and truncates.
         checkpoints: Arc<AtomicUsize>,
@@ -1078,7 +1123,16 @@ mod tests {
             CollectingApplier {
                 log: Arc::new(Mutex::new(Vec::new())),
                 fail_at: None,
+                conflict_at: None,
                 checkpoints: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        /// An applier that judges exactly `lsn` stale.
+        fn conflicting_at(lsn: u64) -> Self {
+            CollectingApplier {
+                conflict_at: Some(lsn),
+                ..CollectingApplier::new()
             }
         }
 
@@ -1100,15 +1154,18 @@ mod tests {
     }
 
     impl Apply for CollectingApplier {
-        fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<()> {
+        fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<Outcome> {
             if self.fail_at == Some(lsn.0) {
                 return Err(io::Error::other(format!("injected apply failure at {}", lsn.0)));
+            }
+            if self.conflict_at == Some(lsn.0) {
+                return Ok(Outcome::Conflicted);
             }
             self.log
                 .lock()
                 .expect("lock not poisoned")
                 .push((lsn.0, record.clone()));
-            Ok(())
+            Ok(Outcome::Applied)
         }
         fn checkpoint(&mut self) -> io::Result<Option<u64>> {
             // These WAL tests never checkpoint; nothing to make durable. The
@@ -1147,6 +1204,47 @@ mod tests {
         // the index is missing rather than carrying on as if nothing happened.
         let poison = wal.poison().expect("a failed apply poisons the log");
         assert_eq!(poison.lsn, Lsn(2));
+
+        drop(handle);
+        wal.shutdown();
+    }
+
+    /// A stale record is NOT a failure. It was fsynced, the applier looked at
+    /// it and correctly declined to fold it in, and the database is perfectly
+    /// healthy — so the verdict must reach the waiter as success, the log must
+    /// not poison, and the next write must go through normally.
+    #[test]
+    fn a_conflicted_apply_is_reported_without_poisoning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+
+        let applier = CollectingApplier::conflicting_at(2);
+        let wal = Wal::start(&path, applier.clone(), 0).unwrap();
+        let handle = wal.handle();
+
+        let first = handle.append(insert(0, 0, &[1.0])).unwrap();
+        assert_eq!(first.outcome, Outcome::Applied);
+
+        let stale = handle
+            .append(insert(0, 1, &[2.0]))
+            .expect("a conflict is success, not an error");
+        assert_eq!(stale.lsn, Lsn(2));
+        assert_eq!(stale.outcome, Outcome::Conflicted);
+        assert!(!stale.applied());
+
+        assert!(wal.poison().is_none(), "a conflict must never halt the log");
+
+        // The log carries on: the conflicted record burned its LSN and its
+        // frame (it IS durable — it just did nothing), and the next write
+        // applies normally.
+        let next = handle.append(insert(0, 2, &[3.0])).unwrap();
+        assert_eq!(next.lsn, Lsn(3));
+        assert_eq!(next.outcome, Outcome::Applied);
+        assert_eq!(
+            applier.snapshot().iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            vec![1, 3],
+            "the stale record was never folded in"
+        );
 
         drop(handle);
         wal.shutdown();
@@ -1532,8 +1630,12 @@ mod tests {
             let wal = Wal::start(&path, live.clone(), 0).unwrap();
             let handle = wal.handle();
             for (i, rec) in records.iter().enumerate() {
-                let lsn = handle.append(rec.clone()).unwrap();
-                assert_eq!(lsn.0, (i + 1) as u64, "LSNs are 1-based, monotonic, gap-free");
+                let committed = handle.append(rec.clone()).unwrap();
+                assert_eq!(
+                    committed.lsn.0,
+                    (i + 1) as u64,
+                    "LSNs are 1-based, monotonic, gap-free"
+                );
             }
             // Drop our handle clone BEFORE shutdown: the commit thread only
             // exits once every sender is gone, so a lingering clone would hang
@@ -1565,7 +1667,7 @@ mod tests {
 
             // Recovery resumes the counter past the highest LSN seen.
             let next = wal.handle().append(insert(0, 2, &[5.0, 6.0])).unwrap();
-            assert_eq!(next.0, records.len() as u64 + 1);
+            assert_eq!(next.lsn.0, records.len() as u64 + 1);
             wal.shutdown();
         }
     }
@@ -1664,7 +1766,7 @@ mod tests {
         let wal = Wal::start(&path, recovered.clone(), 0).unwrap();
         assert_eq!(recovered.snapshot().len(), 2);
         let next = wal.handle().append(insert(0, 2, &[3.0])).unwrap();
-        assert_eq!(next.0, 3);
+        assert_eq!(next.lsn.0, 3);
         wal.shutdown();
     }
 }
