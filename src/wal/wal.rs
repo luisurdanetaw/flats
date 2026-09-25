@@ -797,12 +797,11 @@ fn commit_batch<A: Apply>(
             continue;
         }
         match applier.apply(lsn, &record) {
-            Ok(_outcome) => {
-                // C2 reports the applier's actual verdict here.
-                let _ = ack.send(Ok(Committed {
-                    lsn,
-                    outcome: Outcome::Applied,
-                })); // waiter gone == nobody to tell; fine
+            // Applied or judged stale — both are successful commits. Only an
+            // `Err` below means the index could not absorb a durable record,
+            // which is the condition that halts the log.
+            Ok(outcome) => {
+                let _ = ack.send(Ok(Committed { lsn, outcome })); // waiter gone == nobody to tell; fine
             }
             Err(e) => {
                 let _ = poison.set(Poison {
