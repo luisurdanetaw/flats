@@ -465,6 +465,44 @@ impl Writer {
         Ok(())
     }
 
+    /// Is this statement STALE — built from rows that have since moved on?
+    ///
+    /// A copy-on-write statement (an UPDATE) is assembled on its caller's
+    /// thread: find the rows, read them, log "retire the old, install the
+    /// copy". Two callers can do that concurrently against the same row, and
+    /// both records are perfectly valid by the time the commit thread sees
+    /// them — so applying both would install two copies of one row. This is
+    /// the check that stops it, asked on the commit thread where everything is
+    /// already serialized.
+    ///
+    /// Stale means BOTH of:
+    ///
+    ///  * some ordinal it retires is already retired — someone got there first;
+    ///  * none of the ordinals it installs are live — its own copy never landed.
+    ///
+    /// The second clause is not redundant, it is what keeps REPLAY correct. A
+    /// record that applied successfully gets redelivered (replay covers every
+    /// frame above the checkpoint, and the conservative global watermark
+    /// re-delivers more than that). Its retires are done by then, so the first
+    /// clause alone would call it stale and skip it — losing the row if some
+    /// store had not yet absorbed its installs. Its installs ARE live, so the
+    /// second clause re-applies it idempotently instead. The loser's record
+    /// satisfies neither clause, on the first pass and on every replay after
+    /// it, which is what makes the verdict deterministic.
+    ///
+    /// A statement that installs nothing (a DELETE) is never stale: retiring a
+    /// retired row is already a no-op, so there is nothing to protect.
+    pub fn is_stale(&self, retire: &RoaringBitmap, install: &[Ordinal]) -> bool {
+        if install.is_empty() {
+            return false;
+        }
+        let inner = self.lock();
+        if retire.is_subset(&inner.live) {
+            return false; // nobody got there first
+        }
+        !install.iter().any(|o| inner.live.contains(o.0))
+    }
+
     /// Apply ONE `Record::Mutate` — every retirement and every installation —
     /// under a SINGLE lock hold.
     ///

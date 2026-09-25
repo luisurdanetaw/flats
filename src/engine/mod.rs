@@ -373,6 +373,32 @@ impl Apply for IndexApplier {
                 install,
             } => {
                 let w = self.writers(*collection)?;
+                let rows: Vec<(Ordinal, &Row)> = install
+                    .iter()
+                    .map(|r| ordinal32(r.ordinal).map(|o| (o, &r.metadata)))
+                    .collect::<io::Result<_>>()?;
+
+                // STALENESS, checked before anything is written. A statement
+                // built from rows that have since been retired by someone else
+                // must not land, or one row becomes two — see
+                // `Writer::is_stale`. Deliberately NOT an error: the record is
+                // durable and the database is healthy, so halting on it (see
+                // `wal::Poison`) would be wrong. The waiter is told, and
+                // retries.
+                let installed: Vec<Ordinal> = rows.iter().map(|(o, _)| *o).collect();
+                if w.meta.is_stale(&retire.0, &installed) {
+                    // The watermarks still advance: a skipped record IS fully
+                    // reflected (it changed nothing), and the verdict is
+                    // deterministic, so replay reaches it again and skips it
+                    // again. Stalling them here would wedge truncation behind
+                    // a record that will never do anything.
+                    w.flat.advance_applied_lsn(lsn.0);
+                    w.meta.advance_applied_lsn(lsn);
+                    w.tuple.advance_applied_lsn(lsn);
+                    self.last_applied = self.last_applied.max(lsn.0);
+                    return Ok(Outcome::Conflicted);
+                }
+
                 // DATA FIRST, LIVENESS LAST — the same rule as `Insert`, but
                 // now spanning a whole statement. Every installed row must be
                 // readable in both stores before anything publishes it, or a
@@ -387,10 +413,6 @@ impl Apply for IndexApplier {
                 // so no reader can materialize a snapshot mid-statement — see
                 // its doc. A loop of insert_row/remove_row here would be
                 // correct on disk and wrong in memory.
-                let rows: Vec<(Ordinal, &Row)> = install
-                    .iter()
-                    .map(|r| ordinal32(r.ordinal).map(|o| (o, &r.metadata)))
-                    .collect::<io::Result<_>>()?;
                 w.meta.apply_mutation(&retire.0, &rows).map_err(to_io)?;
                 w.live.bump();
                 w.flat.advance_applied_lsn(lsn.0);
