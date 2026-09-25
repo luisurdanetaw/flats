@@ -41,7 +41,7 @@ use std::fmt;
 
 use crate::sql::ast::{
     ColumnType, CompareOp, CreateStmt, DeleteStmt, Expr, InsertStmt, Literal, Projection,
-    SearchStmt, SelectStmt, Statement,
+    SearchStmt, SelectStmt, Statement, UpdateStmt,
 };
 
 // ---------------------------------------------------------------------------
@@ -514,9 +514,7 @@ pub fn analyze(stmt: Statement, catalog: &impl Catalog) -> Result<BoundStatement
         }
         Statement::Search(s) => bind_search(s, catalog).map(BoundStatement::Search),
         Statement::Delete(d) => bind_delete(d, catalog).map(BoundStatement::Delete),
-        Statement::Update(_) => Err(BindError::Unbound {
-            statement: "UPDATE",
-        }),
+        Statement::Update(u) => bind_update(u, catalog).map(BoundStatement::Update),
     }
 }
 
@@ -713,6 +711,56 @@ fn bind_delete(stmt: DeleteStmt, catalog: &impl Catalog) -> Result<BoundDelete, 
     Ok(BoundDelete {
         from: stmt.from,
         schema,
+        filter,
+    })
+}
+
+/// `UPDATE collection SET assignments WHERE filter`.
+///
+/// Three checks, in the usual order of how fundamental the failure is: the
+/// collection exists, then each assignment resolves and type-checks, then the
+/// predicate binds. Both halves reuse the routines the other statements use —
+/// `typecheck`, the same one an INSERT's values go through, and
+/// `bind_predicate`, the same one a SELECT's WHERE goes through — so an UPDATE
+/// cannot drift into accepting values an INSERT would reject or matching rows a
+/// SELECT would not.
+///
+/// Assignments keep SOURCE order rather than being sorted into schema order the
+/// way an INSERT's row is. An UPDATE is a sequence of overrides applied to a
+/// copy of an existing row, so `SET a = 1, a = 2` must mean 2; sorting would
+/// make that order arbitrary.
+fn bind_update(stmt: UpdateStmt, catalog: &impl Catalog) -> Result<BoundUpdate, BindError> {
+    let schema = catalog
+        .get_collection(&stmt.collection)
+        .ok_or_else(|| BindError::CollectionNotFound(stmt.collection.clone()))?;
+
+    let mut assignments = Vec::with_capacity(stmt.assignments.len());
+    for assignment in stmt.assignments {
+        let col = schema
+            .column(&assignment.column)
+            .ok_or_else(|| BindError::ColumnNotFound(assignment.column.clone()))?;
+        // Metadata-only for now: the embedding is copied across untouched, so
+        // assigning it would be a silent no-op. See `BindError::CannotSetVector`.
+        if col.is_vector {
+            return Err(BindError::CannotSetVector {
+                column: col.name.clone(),
+            });
+        }
+        let typed = typecheck(col, assignment.value)?;
+        assignments.push((
+            ColumnRef {
+                name: col.name.clone(),
+                ordinal: col.ordinal,
+            },
+            typed,
+        ));
+    }
+
+    let filter = bind_predicate(stmt.filter, &schema)?;
+    Ok(BoundUpdate {
+        collection: stmt.collection,
+        schema,
+        assignments,
         filter,
     })
 }
@@ -1192,7 +1240,7 @@ mod tests {
         // Source order is application order: a column set twice takes the LAST
         // value, which only works if the order survives binding.
         let bound =
-            bound_update("UPDATE docs SET title = 'a', author = 'b', title = 'c' WHERE z = 1;");
+            bound_update("UPDATE docs SET title = 'a', author = 'b', title = 'c' WHERE published_at = 1;");
         assert_eq!(
             bound
                 .assignments
@@ -1207,13 +1255,16 @@ mod tests {
     fn update_values_are_type_checked_like_an_insert() {
         assert!(matches!(
             analyze_err(
-                "UPDATE docs SET published_at = 'soon' WHERE z = 1;",
+                "UPDATE docs SET published_at = 'soon' WHERE published_at = 1;",
                 &docs_catalog()
             ),
             BindError::TypeMismatch { .. }
         ));
         assert_eq!(
-            analyze_err("UPDATE docs SET nope = 1 WHERE z = 1;", &docs_catalog()),
+            analyze_err(
+                "UPDATE docs SET nope = 1 WHERE published_at = 1;",
+                &docs_catalog()
+            ),
             BindError::ColumnNotFound("nope".into())
         );
     }
@@ -1224,7 +1275,10 @@ mod tests {
     fn setting_the_embedding_is_refused() {
         assert!(matches!(
             analyze_err(
-                &format!("UPDATE docs SET vector = {} WHERE z = 1;", vec_lit(768)),
+                &format!(
+                    "UPDATE docs SET vector = {} WHERE published_at = 1;",
+                    vec_lit(768)
+                ),
                 &docs_catalog()
             ),
             BindError::CannotSetVector { .. }
@@ -1234,7 +1288,10 @@ mod tests {
     #[test]
     fn update_on_a_missing_collection_is_not_found() {
         assert_eq!(
-            analyze_err("UPDATE nope SET author = 'x' WHERE z = 1;", &docs_catalog()),
+            analyze_err(
+                "UPDATE nope SET author = 'x' WHERE published_at = 1;",
+                &docs_catalog()
+            ),
             BindError::CollectionNotFound("nope".into())
         );
     }
