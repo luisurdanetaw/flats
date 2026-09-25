@@ -857,6 +857,41 @@ fn bind_create(stmt: CreateStmt, catalog: &impl Catalog) -> Result<BoundCreate, 
     })
 }
 
+/// `id = <n>` — the only comparison a pseudo-column supports.
+///
+/// EQUALITY ONLY. An ordinal is an identity, not a user-meaningful ordering:
+/// `id < 7` reads like "the first seven rows", which is not what it would mean,
+/// and ranges over ordinals have no index path behind them. `score` is not
+/// filterable at all — it exists only once a ranked read has computed it, so
+/// there is nothing to resolve to a bitmap before the scan.
+fn bind_pseudo_comparison(
+    pseudo: Pseudo,
+    op: CompareOp,
+    literal: Literal,
+) -> Result<BoundPredicate, BindError> {
+    if pseudo == Pseudo::Score {
+        return Err(BindError::UnsupportedPredicate {
+            what: "filtering on score (it is computed by the ranking, not stored)".to_string(),
+        });
+    }
+    if op != CompareOp::Eq {
+        return Err(BindError::UnsupportedPredicate {
+            what: format!("comparing id with {op:?}: only `id = <n>` is supported"),
+        });
+    }
+    match literal {
+        Literal::Int(n) if n >= 0 => Ok(BoundPredicate::Id(n as u64)),
+        Literal::Int(n) => Err(BindError::UnsupportedPredicate {
+            what: format!("a negative ordinal ({n})"),
+        }),
+        other => Err(BindError::TypeMismatch {
+            column: "id".to_string(),
+            expected: ColumnType::Int,
+            found: literal_type(&other),
+        }),
+    }
+}
+
 /// Type-check `value` against `column`, producing a [`TypedValue`]. `INT`→
 /// `FLOAT` coercion into a `FLOAT` column is allowed; a vector column requires
 /// a vector literal of the exact declared dimension.
@@ -984,6 +1019,13 @@ fn bind_comparison(
             });
         }
     };
+
+    // Pseudo-columns are checked FIRST, exactly as in a projection, so `id`
+    // means the same thing everywhere regardless of what a collection calls its
+    // own columns.
+    if let Some(pseudo) = Pseudo::from_name(&name) {
+        return bind_pseudo_comparison(pseudo, op, literal);
+    }
 
     let column = schema
         .column(&name)
