@@ -751,19 +751,37 @@ fn bind_update(stmt: UpdateStmt, catalog: &impl Catalog) -> Result<BoundUpdate, 
         .get_collection(&stmt.collection)
         .ok_or_else(|| BindError::CollectionNotFound(stmt.collection.clone()))?;
 
+    // The predicate binds FIRST, because whether the embedding may be
+    // assigned depends on it: only a statement that names one row by ordinal
+    // can carry a replacement vector.
+    let filter = bind_predicate(stmt.filter, &schema)?;
+    let names_one_row = matches!(filter, BoundPredicate::Id(_));
+
     let mut assignments = Vec::with_capacity(stmt.assignments.len());
+    let mut vector = None;
     for assignment in stmt.assignments {
         let col = schema
             .column(&assignment.column)
             .ok_or_else(|| BindError::ColumnNotFound(assignment.column.clone()))?;
-        // Metadata-only for now: the embedding is copied across untouched, so
-        // assigning it would be a silent no-op. See `BindError::CannotSetVector`.
-        if col.is_vector {
-            return Err(BindError::CannotSetVector {
-                column: col.name.clone(),
-            });
-        }
         let typed = typecheck(col, assignment.value)?;
+        if col.is_vector {
+            // One statement carries one vector, so it has to name one row —
+            // see `BindError::CannotSetVector`. Checked AFTER `typecheck`, so a
+            // wrong-dimension literal is reported as the dimension error it is
+            // rather than as a predicate complaint.
+            if !names_one_row {
+                return Err(BindError::CannotSetVector {
+                    column: col.name.clone(),
+                });
+            }
+            // Last assignment wins here too, matching the scalar rule.
+            vector = match typed.value {
+                Literal::Vector(v) => Some(v),
+                // `typecheck` against a vector column accepts nothing else.
+                other => unreachable!("a vector column type-checked to {other:?}"),
+            };
+            continue;
+        }
         assignments.push((
             ColumnRef {
                 name: col.name.clone(),
@@ -773,13 +791,11 @@ fn bind_update(stmt: UpdateStmt, catalog: &impl Catalog) -> Result<BoundUpdate, 
         ));
     }
 
-    let filter = bind_predicate(stmt.filter, &schema)?;
     Ok(BoundUpdate {
         collection: stmt.collection,
         schema,
         assignments,
-        // E6 fills this in when the statement assigns the vector.
-        vector: None,
+        vector,
         filter,
     })
 }
