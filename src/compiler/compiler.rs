@@ -61,9 +61,11 @@
 use crate::compiler::bytecode::{Addr, Cursor, Op, Program, Reg};
 use crate::compiler::constants::{Const, ConstPool};
 use crate::compiler::schema::{SchemaError, to_metadata_schema};
-use crate::metadata::common::{ColumnId, ColumnLocation, DeclarationOrdinal, RangeOp, Schema};
+use crate::metadata::common::{
+    ColumnId, ColumnLocation, DeclarationOrdinal, RangeOp, Schema, Value,
+};
 use crate::sql::ast::{CompareOp, Literal};
-use crate::sql::bind::{BoundPredicate, Projected, Pseudo};
+use crate::sql::bind::{BoundPredicate, ColumnRef, Projected, Pseudo, TypedValue};
 use crate::sql::plan::LogicalPlan;
 use std::fmt;
 
@@ -91,11 +93,6 @@ pub fn compile(plan: LogicalPlan, schema: Option<&Schema>) -> Result<Program, Co
     // back up through a `FnMut`.
     let created = match &plan {
         LogicalPlan::CreateCollection(create) => Some(to_metadata_schema(&create.schema)?),
-        LogicalPlan::Update(_) => {
-            return Err(CompileError::Unsupported {
-                statement: "UPDATE",
-            });
-        }
         _ => None,
     };
 
@@ -132,13 +129,6 @@ pub enum CompileError {
     /// collection's catalog schema — there is nothing to translate its
     /// declaration ordinals through.
     MissingSchema,
-    /// The statement plans, but this build cannot emit code for it yet. The
-    /// compiler's counterpart to `BindError::Unbound`: a clean error in the
-    /// window between a plan node landing and its emission landing.
-    Unsupported {
-        /// Which statement kind.
-        statement: &'static str,
-    },
 }
 
 impl From<SchemaError> for CompileError {
@@ -154,9 +144,6 @@ impl fmt::Display for CompileError {
             CompileError::MissingSchema => {
                 write!(f, "no catalog schema for the target collection")
             }
-            CompileError::Unsupported { statement } => {
-                write!(f, "{statement} plans but cannot be compiled yet")
-            }
         }
     }
 }
@@ -165,7 +152,7 @@ impl std::error::Error for CompileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             CompileError::Schema(e) => Some(e),
-            CompileError::MissingSchema | CompileError::Unsupported { .. } => None,
+            CompileError::MissingSchema => None,
         }
     }
 }
@@ -604,10 +591,21 @@ impl<'a> Compiler<'a> {
                 });
             }
 
-            // Emission lands in D10, with the SET list interned in the pool.
-            // `compile` refuses an UPDATE before emission begins, so this is
-            // unreachable from a compiled plan.
-            LogicalPlan::Update(_) => unreachable!("compile refuses UPDATE before emission"),
+            LogicalPlan::Update(update) => {
+                // LEAF, exactly like `Delete`: the predicate's bitmap, then ONE
+                // Mutate over it — with the SET list attached, which is what
+                // turns "retire these" into "rewrite these". The rewrite is
+                // per STATEMENT, not per row, so the assignments are interned
+                // once rather than loaded into registers.
+                let retire = self.emit_predicate(&update.predicate, &update.collection);
+                let assignments = self.lower_assignments(&update.assignments);
+                let set = self.consts.add(Const::Assignments(assignments));
+                self.emit(Op::Mutate {
+                    collection: update.collection.clone(),
+                    retire,
+                    set: Some(set),
+                });
+            }
 
             LogicalPlan::Delete(delete) => {
                 // LEAF: the predicate's bitmap, then ONE Mutate over it. No
@@ -623,6 +621,40 @@ impl<'a> Compiler<'a> {
                 });
             }
         }
+    }
+
+    /// Translate a bound SET list into storage terms: declaration ordinals
+    /// become `ColumnId`s through the catalog schema — the same translation a
+    /// projected column or a predicate's column goes through — and literals
+    /// become storage values.
+    ///
+    /// Source ORDER is preserved, because it is application order: `SET a = 1,
+    /// a = 2` means 2, and sorting or de-duplicating here would quietly change
+    /// what the statement means.
+    fn lower_assignments(&self, assignments: &[(ColumnRef, TypedValue)]) -> Vec<(ColumnId, Value)> {
+        let schema = match self.schema {
+            Some(schema) => schema,
+            None => unreachable!("an UPDATE compiled without a catalog schema"),
+        };
+        assignments
+            .iter()
+            .map(|(column, typed)| {
+                let id = match schema.locate(DeclarationOrdinal::new(column.ordinal)) {
+                    Some(ColumnLocation::Scalar(id)) => id,
+                    // The binder refuses `SET vector = ...` outright
+                    // (`BindError::CannotSetVector`), so a bound plan never
+                    // carries one.
+                    Some(ColumnLocation::Vector { .. }) => {
+                        unreachable!("the binder rejects assigning the vector column")
+                    }
+                    None => unreachable!("plan ordinal {} not in schema", column.ordinal),
+                };
+                let value = Value::try_from(&typed.value)
+                    // Scalars only: the vector arm is unreachable per above.
+                    .unwrap_or_else(|_| unreachable!("a scalar assignment lowers to a Value"));
+                (id, value)
+            })
+            .collect()
     }
 
     /// Finish the compile, moving the accumulated state into a [`Program`]. The

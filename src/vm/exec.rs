@@ -801,7 +801,7 @@ impl Vm {
                 Op::Mutate {
                     collection,
                     retire,
-                    set: _set,
+                    set,
                 } => {
                     let retire = *retire;
                     let db = db.ok_or(ExecError::Detached { op: "Mutate" })?;
@@ -814,8 +814,25 @@ impl Vm {
                     let id = db.collection_id(collection).map_err(ExecError::Engine)?;
                     // Blocks until durable AND applied: on return, no new
                     // snapshot admits any of these rows.
-                    db.mutate(id, bitmap.as_ref().clone(), Vec::new())
-                        .map_err(ExecError::Engine)?;
+                    let outcome = match set {
+                        // UPDATE: copy each matched row with the assignments
+                        // applied, retire the originals, all in one record.
+                        Some(set) => {
+                            let assignments = match self.program.consts.get(*set) {
+                                Some(Const::Assignments(a)) => a.clone(),
+                                other => {
+                                    return Err(ExecError::bad_const(set.0, "a SET list", other));
+                                }
+                            };
+                            db.update_rows(id, bitmap.as_ref(), &assignments)
+                                .map_err(ExecError::Engine)?
+                        }
+                        // DELETE: retire and nothing else.
+                        None => db
+                            .mutate(id, bitmap.as_ref().clone(), Vec::new())
+                            .map_err(ExecError::Engine)?,
+                    };
+                    let _ = outcome; // D12 turns a conflict into a retry.
                 }
 
                 // -- DDL: one fat op, nothing about it varies at runtime -------
