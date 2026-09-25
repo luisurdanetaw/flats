@@ -161,8 +161,10 @@ pub struct Update {
     pub collection: String,
     /// Its resolved schema.
     pub schema: Schema,
-    /// The SET list in source order, resolved and type-checked.
+    /// The scalar SET list in source order, resolved and type-checked.
     pub assignments: Vec<(ColumnRef, TypedValue)>,
+    /// A replacement embedding, or `None` to copy the old row's across.
+    pub vector: Option<Vec<f32>>,
     /// Which rows to rewrite. Not optional.
     pub predicate: BoundPredicate,
 }

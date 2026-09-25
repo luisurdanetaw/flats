@@ -865,6 +865,7 @@ mod tests {
             collection: "docs".to_string(),
             schema: docs_bind_schema(),
             assignments,
+            vector: None,
             predicate,
         });
         compile(plan, Some(&docs_meta_schema())).expect("an UPDATE compiles")

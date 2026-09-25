@@ -47,6 +47,7 @@ fn plan_update(bound: BoundUpdate) -> LogicalPlan {
         collection: bound.collection,
         schema: bound.schema,
         assignments: bound.assignments,
+        vector: bound.vector,
         predicate: bound.filter,
     })
 }
@@ -275,6 +276,7 @@ mod tests {
             collection: "docs".to_string(),
             schema: docs_schema(),
             assignments: assignments.clone(),
+            vector: None,
             filter: filter.clone(),
         });
         assert_eq!(
@@ -283,6 +285,7 @@ mod tests {
                 collection: "docs".to_string(),
                 schema: docs_schema(),
                 assignments,
+                vector: None,
                 predicate: filter,
             })
         );

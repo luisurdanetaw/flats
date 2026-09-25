@@ -204,10 +204,17 @@ pub struct BoundUpdate {
     pub collection: String,
     /// Its resolved schema.
     pub schema: Schema,
-    /// The SET list, each column bound to its ordinal and its value
+    /// The SCALAR SET list, each column bound to its ordinal and its value
     /// type-checked. Source order, which is also application order — a column
     /// named twice is applied twice, last one winning.
     pub assignments: Vec<(ColumnRef, TypedValue)>,
+    /// A replacement embedding, when the statement assigns the vector column.
+    /// `None` copies the old row's vector across unchanged.
+    ///
+    /// Separate from `assignments` because the two go to different stores and
+    /// because only this one carries the `id = <n>` restriction — see
+    /// `BindError::CannotSetVector`.
+    pub vector: Option<Vec<f32>>,
     /// Which rows to rewrite. Required.
     pub filter: BoundPredicate,
 }
@@ -380,13 +387,14 @@ pub enum BindError {
     CollectionNotFound(String),
     /// A `CREATE COLLECTION` names a collection that already exists.
     CollectionExists(String),
-    /// An `UPDATE` tried to assign the embedding.
+    /// An `UPDATE` assigned the embedding without naming exactly one row.
     ///
-    /// Phase 7's UPDATE is metadata-only: it copies the vector across
-    /// unchanged. Replacing an embedding is a different statement shape —
-    /// it only makes sense for ONE row, so it will require an `id = <literal>`
-    /// predicate rather than a general WHERE. Until that lands, refusing here
-    /// is better than silently ignoring the assignment.
+    /// One statement supplies ONE vector, so assigning it to whatever a
+    /// predicate happens to match would give every matched row the same
+    /// embedding — always a mistake, and a silent one. `SET vector = [...]`
+    /// therefore requires the predicate to be exactly `id = <n>`: not a column
+    /// predicate, and not `id = 7 AND ...`, which would still read as a filter
+    /// rather than a row name.
     CannotSetVector {
         /// The vector column's name.
         column: String,
@@ -499,7 +507,8 @@ impl fmt::Display for BindError {
             }
             BindError::CannotSetVector { column } => write!(
                 f,
-                "cannot SET the embedding column {column}: UPDATE copies the vector unchanged"
+                "cannot SET the embedding column {column} without a `WHERE id = <n>` predicate: \
+                 one statement carries one vector, so it must name one row"
             ),
         }
     }
@@ -769,6 +778,8 @@ fn bind_update(stmt: UpdateStmt, catalog: &impl Catalog) -> Result<BoundUpdate, 
         collection: stmt.collection,
         schema,
         assignments,
+        // E6 fills this in when the statement assigns the vector.
+        vector: None,
         filter,
     })
 }
@@ -1387,19 +1398,63 @@ mod tests {
         );
     }
 
-    /// Phase 7's UPDATE is metadata-only — the vector is copied across
-    /// untouched — so assigning it must be refused rather than ignored.
     #[test]
-    fn setting_the_embedding_is_refused() {
+    fn setting_the_embedding_needs_an_id_predicate() {
+        let bound = bound_update(&format!(
+            "UPDATE docs SET vector = {} WHERE id = 7;",
+            vec_lit(768)
+        ));
+        assert_eq!(bound.vector, Some(vec![0.1f32; 768]));
+        assert!(
+            bound.assignments.is_empty(),
+            "the embedding is not a scalar assignment"
+        );
+        assert_eq!(bound.filter, BoundPredicate::Id(7));
+    }
+
+    #[test]
+    fn the_embedding_and_scalars_can_change_together() {
+        let bound = bound_update(&format!(
+            "UPDATE docs SET vector = {}, title = 'v2' WHERE id = 7;",
+            vec_lit(768)
+        ));
+        assert_eq!(bound.vector, Some(vec![0.1f32; 768]));
+        assert_eq!(
+            bound.assignments,
+            vec![(
+                colref("title", 2),
+                TypedValue {
+                    value: Literal::Str("v2".to_string()),
+                    ty: ColumnType::Text,
+                },
+            )]
+        );
+    }
+
+    /// One statement carries one vector, so it must name one row. A column
+    /// predicate would hand the same embedding to everything it matched.
+    #[test]
+    fn setting_the_embedding_without_naming_one_row_is_refused() {
+        for clause in ["published_at = 1", "id = 7 AND author = 'alice'", "id = 7 OR id = 8"] {
+            let sql = format!("UPDATE docs SET vector = {} WHERE {clause};", vec_lit(768));
+            assert!(
+                matches!(
+                    analyze_err(&sql, &docs_catalog()),
+                    BindError::CannotSetVector { .. }
+                ),
+                "`{clause}` must not be allowed to set the embedding"
+            );
+        }
+    }
+
+    #[test]
+    fn a_replacement_embedding_is_dimension_checked() {
         assert!(matches!(
             analyze_err(
-                &format!(
-                    "UPDATE docs SET vector = {} WHERE published_at = 1;",
-                    vec_lit(768)
-                ),
+                &format!("UPDATE docs SET vector = {} WHERE id = 7;", vec_lit(3)),
                 &docs_catalog()
             ),
-            BindError::CannotSetVector { .. }
+            BindError::DimensionMismatch { .. }
         ));
     }
 
