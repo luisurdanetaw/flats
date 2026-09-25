@@ -25,7 +25,7 @@
 // Every node derives Debug + Clone + PartialEq: the planner tests assert whole
 // plans with `assert_eq!`, so structural equality is load-bearing.
 
-use crate::sql::bind::{BoundPredicate, Projected, Schema, TypedValue};
+use crate::sql::bind::{BoundPredicate, ColumnRef, Projected, Schema, TypedValue};
 
 /// One resolved query plan — the relational-algebra root the compiler consumes.
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +43,8 @@ pub enum LogicalPlan {
     Knn(Knn),
     /// Retire every row a predicate admits, as one statement.
     Delete(Delete),
+    /// Rewrite every row a predicate admits, as one statement.
+    Update(Update),
 }
 
 // NOTE: there is deliberately no `Filter` node. A `WHERE` predicate in V-SQL is
@@ -143,6 +145,25 @@ pub struct Delete {
     /// Its resolved schema — the predicate's ordinals are relative to it.
     pub schema: Schema,
     /// Which rows go. Not optional: V-SQL has no whole-collection DELETE.
+    pub predicate: BoundPredicate,
+}
+
+/// Rewrite every row `predicate` admits — one statement, one durable record.
+///
+/// A LEAF, like [`Delete`], and for the same reason: the predicate is one
+/// bitmap and the whole statement is one `Record::Mutate`. There is no row loop
+/// because the rewrite is copy-on-write in bulk — read the matched rows, write
+/// their edited copies at fresh ordinals, retire the originals — and that must
+/// land atomically or a row is lost or duplicated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Update {
+    /// The collection rewritten (already confirmed to exist by the binder).
+    pub collection: String,
+    /// Its resolved schema.
+    pub schema: Schema,
+    /// The SET list in source order, resolved and type-checked.
+    pub assignments: Vec<(ColumnRef, TypedValue)>,
+    /// Which rows to rewrite. Not optional.
     pub predicate: BoundPredicate,
 }
 

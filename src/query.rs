@@ -354,7 +354,8 @@ fn labels_of(bound: &BoundStatement) -> Vec<String> {
             .collect(),
         BoundStatement::Insert(_)
         | BoundStatement::CreateCollection(_)
-        | BoundStatement::Delete(_) => Vec::new(),
+        | BoundStatement::Delete(_)
+        | BoundStatement::Update(_) => Vec::new(),
     }
 }
 

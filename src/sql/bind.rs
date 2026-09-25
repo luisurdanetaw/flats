@@ -181,7 +181,27 @@ pub enum BoundStatement {
     Search(BoundSearch),
     /// A resolved `DELETE`.
     Delete(BoundDelete),
-    // EXTEND: Update(BoundUpdate).
+    /// A resolved `UPDATE`.
+    Update(BoundUpdate),
+}
+
+/// A resolved `UPDATE collection SET assignments WHERE filter`.
+///
+/// Both halves go through the SAME routines a SELECT's do — `typecheck` for the
+/// values, `bind_predicate` for the WHERE — so an UPDATE accepts exactly the
+/// values an INSERT would and matches exactly the rows a SELECT would.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundUpdate {
+    /// The collection rewritten (confirmed to exist).
+    pub collection: String,
+    /// Its resolved schema.
+    pub schema: Schema,
+    /// The SET list, each column bound to its ordinal and its value
+    /// type-checked. Source order, which is also application order — a column
+    /// named twice is applied twice, last one winning.
+    pub assignments: Vec<(ColumnRef, TypedValue)>,
+    /// Which rows to rewrite. Required.
+    pub filter: BoundPredicate,
 }
 
 /// A resolved `DELETE FROM from WHERE filter`.
@@ -352,6 +372,17 @@ pub enum BindError {
     CollectionNotFound(String),
     /// A `CREATE COLLECTION` names a collection that already exists.
     CollectionExists(String),
+    /// An `UPDATE` tried to assign the embedding.
+    ///
+    /// Phase 7's UPDATE is metadata-only: it copies the vector across
+    /// unchanged. Replacing an embedding is a different statement shape —
+    /// it only makes sense for ONE row, so it will require an `id = <literal>`
+    /// predicate rather than a general WHERE. Until that lands, refusing here
+    /// is better than silently ignoring the assignment.
+    CannotSetVector {
+        /// The vector column's name.
+        column: String,
+    },
     /// A projected/inserted column name is not in the collection's schema.
     ColumnNotFound(String),
     /// An inserted value's type does not match its target column.
@@ -458,6 +489,10 @@ impl fmt::Display for BindError {
             BindError::Unbound { statement } => {
                 write!(f, "{statement} is parsed but not implemented yet")
             }
+            BindError::CannotSetVector { column } => write!(
+                f,
+                "cannot SET the embedding column {column}: UPDATE copies the vector unchanged"
+            ),
         }
     }
 }
@@ -1121,6 +1156,101 @@ mod tests {
             pred("published_at < 4 OR published_at = 9"),
             BoundPredicate::Or(..)
         ));
+    }
+
+    // -- UPDATE ------------------------------------------------------------
+
+    fn bound_update(src: &str) -> BoundUpdate {
+        match analyze_ok(src, &docs_catalog()) {
+            BoundStatement::Update(u) => u,
+            other => panic!("expected an UPDATE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_binds_its_assignments_and_predicate() {
+        let bound = bound_update("UPDATE docs SET author = 'bob' WHERE published_at < 5;");
+        assert_eq!(bound.collection, "docs");
+        assert_eq!(
+            bound.assignments,
+            vec![(
+                colref("author", 1),
+                TypedValue {
+                    value: Literal::Str("bob".to_string()),
+                    ty: ColumnType::Text,
+                },
+            )]
+        );
+        assert_eq!(
+            bound.filter,
+            compare("published_at", 3, CompareOp::Lt, Literal::Int(5))
+        );
+    }
+
+    #[test]
+    fn update_keeps_assignments_in_source_order() {
+        // Source order is application order: a column set twice takes the LAST
+        // value, which only works if the order survives binding.
+        let bound =
+            bound_update("UPDATE docs SET title = 'a', author = 'b', title = 'c' WHERE z = 1;");
+        assert_eq!(
+            bound
+                .assignments
+                .iter()
+                .map(|(col, _)| col.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["title", "author", "title"]
+        );
+    }
+
+    #[test]
+    fn update_values_are_type_checked_like_an_insert() {
+        assert!(matches!(
+            analyze_err(
+                "UPDATE docs SET published_at = 'soon' WHERE z = 1;",
+                &docs_catalog()
+            ),
+            BindError::TypeMismatch { .. }
+        ));
+        assert_eq!(
+            analyze_err("UPDATE docs SET nope = 1 WHERE z = 1;", &docs_catalog()),
+            BindError::ColumnNotFound("nope".into())
+        );
+    }
+
+    /// Phase 7's UPDATE is metadata-only — the vector is copied across
+    /// untouched — so assigning it must be refused rather than ignored.
+    #[test]
+    fn setting_the_embedding_is_refused() {
+        assert!(matches!(
+            analyze_err(
+                &format!("UPDATE docs SET vector = {} WHERE z = 1;", vec_lit(768)),
+                &docs_catalog()
+            ),
+            BindError::CannotSetVector { .. }
+        ));
+    }
+
+    #[test]
+    fn update_on_a_missing_collection_is_not_found() {
+        assert_eq!(
+            analyze_err("UPDATE nope SET author = 'x' WHERE z = 1;", &docs_catalog()),
+            BindError::CollectionNotFound("nope".into())
+        );
+    }
+
+    /// The same rule DELETE follows: an UPDATE's predicate must accept and
+    /// refuse exactly what the previewing SELECT's does.
+    #[test]
+    fn update_predicates_fail_exactly_like_select_predicates() {
+        for clause in ["nope < 2", "vector = 'x'", "author < 'm'"] {
+            let sql = format!("UPDATE docs SET title = 'x' WHERE {clause};");
+            assert_eq!(
+                analyze_err(&sql, &docs_catalog()),
+                pred_err(clause),
+                "UPDATE and SELECT disagree on `{clause}`"
+            );
+        }
     }
 
     // -- DELETE ------------------------------------------------------------

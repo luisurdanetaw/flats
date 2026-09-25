@@ -91,6 +91,11 @@ pub fn compile(plan: LogicalPlan, schema: Option<&Schema>) -> Result<Program, Co
     // back up through a `FnMut`.
     let created = match &plan {
         LogicalPlan::CreateCollection(create) => Some(to_metadata_schema(&create.schema)?),
+        LogicalPlan::Update(_) => {
+            return Err(CompileError::Unsupported {
+                statement: "UPDATE",
+            });
+        }
         _ => None,
     };
 
@@ -127,6 +132,13 @@ pub enum CompileError {
     /// collection's catalog schema — there is nothing to translate its
     /// declaration ordinals through.
     MissingSchema,
+    /// The statement plans, but this build cannot emit code for it yet. The
+    /// compiler's counterpart to `BindError::Unbound`: a clean error in the
+    /// window between a plan node landing and its emission landing.
+    Unsupported {
+        /// Which statement kind.
+        statement: &'static str,
+    },
 }
 
 impl From<SchemaError> for CompileError {
@@ -142,6 +154,9 @@ impl fmt::Display for CompileError {
             CompileError::MissingSchema => {
                 write!(f, "no catalog schema for the target collection")
             }
+            CompileError::Unsupported { statement } => {
+                write!(f, "{statement} plans but cannot be compiled yet")
+            }
         }
     }
 }
@@ -150,7 +165,7 @@ impl std::error::Error for CompileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             CompileError::Schema(e) => Some(e),
-            CompileError::MissingSchema => None,
+            CompileError::MissingSchema | CompileError::Unsupported { .. } => None,
         }
     }
 }
@@ -588,6 +603,11 @@ impl<'a> Compiler<'a> {
                     capacity: create.capacity,
                 });
             }
+
+            // Emission lands in D10, with the SET list interned in the pool.
+            // `compile` refuses an UPDATE before emission begins, so this is
+            // unreachable from a compiled plan.
+            LogicalPlan::Update(_) => unreachable!("compile refuses UPDATE before emission"),
 
             LogicalPlan::Delete(delete) => {
                 // LEAF: the predicate's bitmap, then ONE Mutate over it. No

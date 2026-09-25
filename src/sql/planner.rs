@@ -21,9 +21,12 @@
 //!
 
 use crate::sql::bind::{
-    BoundCreate, BoundDelete, BoundInsert, BoundSearch, BoundSelect, BoundStatement, Projected,
+    BoundCreate, BoundDelete, BoundInsert, BoundSearch, BoundSelect, BoundStatement, BoundUpdate,
+    Projected,
 };
-use crate::sql::plan::{CreateCollection, Delete, Insert, Knn, LogicalPlan, Project, Scan};
+use crate::sql::plan::{
+    CreateCollection, Delete, Insert, Knn, LogicalPlan, Project, Scan, Update,
+};
 
 /// Build the [`LogicalPlan`] for an already-bound statement. Infallible: the
 /// binder validated everything, so this only reshapes statement-shaped IR into
@@ -35,8 +38,19 @@ pub fn plan(bound: BoundStatement) -> LogicalPlan {
         BoundStatement::CreateCollection(c) => plan_create(c),
         BoundStatement::Search(s) => plan_search(s),
         BoundStatement::Delete(d) => plan_delete(d),
-        // EXTEND: Update -> its own node.
+        BoundStatement::Update(u) => plan_update(u),
     }
+}
+
+/// `BoundUpdate` → a single `Update` leaf. Same shape as `plan_delete`, and
+/// for the same reason: one bitmap, one record, no row loop.
+fn plan_update(bound: BoundUpdate) -> LogicalPlan {
+    LogicalPlan::Update(Update {
+        collection: bound.collection,
+        schema: bound.schema,
+        assignments: bound.assignments,
+        predicate: bound.filter,
+    })
 }
 
 /// `BoundDelete` → a single `Delete` leaf.
@@ -126,10 +140,13 @@ mod tests {
     use crate::sql::ast::{ColumnType, CompareOp, Literal};
     use crate::sql::bind::{
         BoundCreate, BoundDelete, BoundInsert, BoundPredicate, BoundSearch, BoundSelect,
-        BoundStatement, Catalog, ColumnRef, ColumnSchema, Projected, Schema, TypedValue, analyze,
+        BoundStatement, BoundUpdate, Catalog, ColumnRef, ColumnSchema, Projected, Schema,
+        TypedValue, analyze,
     };
     use crate::sql::parser::parse;
-    use crate::sql::plan::{CreateCollection, Delete, Insert, Knn, LogicalPlan, Project, Scan};
+    use crate::sql::plan::{
+        CreateCollection, Delete, Insert, Knn, LogicalPlan, Project, Scan, Update,
+    };
     use std::collections::HashMap;
 
     // -- resolved-value helpers (mirror the binder's docs fixture) ---------
@@ -238,6 +255,40 @@ mod tests {
     }
 
     // -- unit: plan(bound) shape transform (Bound* built directly) ---------
+
+    #[test]
+    fn plans_update_as_a_single_leaf() {
+        let filter = BoundPredicate::Compare {
+            column: colref("published_at", 3),
+            op: CompareOp::Lt,
+            value: TypedValue {
+                value: Literal::Int(5),
+                ty: ColumnType::Int,
+            },
+        };
+        let assignments = vec![(
+            colref("author", 1),
+            TypedValue {
+                value: Literal::Str("bob".to_string()),
+                ty: ColumnType::Text,
+            },
+        )];
+        let bound = BoundStatement::Update(BoundUpdate {
+            collection: "docs".to_string(),
+            schema: docs_schema(),
+            assignments: assignments.clone(),
+            filter: filter.clone(),
+        });
+        assert_eq!(
+            plan(bound),
+            LogicalPlan::Update(Update {
+                collection: "docs".to_string(),
+                schema: docs_schema(),
+                assignments,
+                predicate: filter,
+            })
+        );
+    }
 
     /// A DELETE is ONE leaf — no `Scan`, no row loop. Its predicate resolves to
     /// a single bitmap that is logged whole, so there is never a per-row step
