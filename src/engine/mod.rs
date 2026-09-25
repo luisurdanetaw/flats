@@ -1937,6 +1937,102 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Staleness — a copy-on-write statement whose rows moved on
+    // -----------------------------------------------------------------------
+    //
+    // An UPDATE is built on the caller's thread: find the rows, read them,
+    // then log "retire the old, install the copy". Two callers can do that
+    // concurrently and both read the same row, so both log a copy of it — and
+    // the WAL, doing exactly its job, applies both and the row exists twice.
+    //
+    // The fix is a precondition checked where everything is already
+    // serialized, on the commit thread: a record that INSTALLS rows is stale
+    // if the rows it retires are already retired AND none of the rows it
+    // installs are live. Stale records are skipped whole.
+
+    /// The loser of a race: it retires a row someone else already retired, and
+    /// its own copy never landed. Skipping it is what stops the duplicate.
+    #[test]
+    fn a_stale_mutate_is_skipped_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap(); // ord 0
+        db.insert(0, &[2.0, 0.0], vec![]).unwrap(); // ord 1
+
+        // The winner retires ordinal 0 and installs its copy at 2.
+        db.mutate(0, [0u32].into_iter().collect(), vec![install(2, 9.0)])
+            .unwrap();
+
+        // The loser was built from the same read: same retire set, its own
+        // fresh ordinal. By now ordinal 0 is gone and 3 was never installed.
+        db.mutate(0, [0u32].into_iter().collect(), vec![install(3, 9.0)])
+            .unwrap();
+
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![1, 2],
+            "the loser's copy must not be installed — that is the duplicate"
+        );
+        assert!(
+            db.reader(0).unwrap().vector_at(Ordinal(3)).is_none()
+                || !db.live_snapshot(0).unwrap().contains(3),
+            "ordinal 3 is not live"
+        );
+    }
+
+    /// The winner, and the ordinary case: the rows it retires are still live,
+    /// so it applies.
+    #[test]
+    fn a_fresh_mutate_still_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap(); // ord 0
+
+        db.mutate(0, [0u32].into_iter().collect(), vec![install(1, 9.0)])
+            .unwrap();
+
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![1]
+        );
+        let hits = db.search(0, &[9.0, 0.0], 8).unwrap();
+        assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![Ordinal(1)]);
+    }
+
+    /// Retiring nothing cannot be stale. This is the bulk-load shape the WAL
+    /// and delete tests seed with, and the precondition must leave it alone.
+    #[test]
+    fn a_bulk_install_with_no_retire_is_never_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+
+        let rows: Vec<Install> = (0..8u64).map(|o| install(o, o as f32)).collect();
+        db.mutate(0, RoaringBitmap::new(), rows).unwrap();
+
+        assert_eq!(db.live_snapshot(0).unwrap().len(), 8);
+    }
+
+    /// A DELETE retires rows and installs nothing, so it is idempotent and must
+    /// never be judged stale — replay redelivers it and it must stay a no-op
+    /// rather than becoming a skipped record.
+    #[test]
+    fn a_retire_only_mutate_is_never_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap(); // ord 0
+        db.insert(0, &[2.0, 0.0], vec![]).unwrap(); // ord 1
+
+        let retire: RoaringBitmap = [0u32].into_iter().collect();
+        db.mutate(0, retire.clone(), vec![]).unwrap();
+        db.mutate(0, retire, vec![]).unwrap();
+
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
     #[test]
     fn insert_search_delete_e2e() {
         let dir = tempfile::tempdir().unwrap();
