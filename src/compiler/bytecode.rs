@@ -74,12 +74,16 @@
 //                                     stores. One fat op — nothing about DDL
 //                                     varies at runtime, so there is nothing to
 //                                     interpret.
-//   Mutate       collection, retireReg
+//   Mutate       collection, retireReg, #set?
 //                                     retire every ordinal in the bitmap as ONE
 //                                     statement: one Record::Mutate, one fsync.
 //                                     What DELETE compiles to — no cursor, no
 //                                     loop, because a per-row delete would be N
 //                                     commit points instead of one.
+//                                     With a SET list it is UPDATE: each matched
+//                                     row is copied to a fresh ordinal with the
+//                                     assignments applied (vector unchanged) and
+//                                     the original retired, in the same record.
 //
 // WHERE — predicates are SET ALGEBRA, not per-row comparisons
 //   BitmapEq     collection, colId, valueReg, dst
@@ -477,6 +481,12 @@ pub enum Op {
         collection: String,
         /// Register holding the bitmap of ordinals to retire.
         retire: Reg,
+        /// An UPDATE's SET list in the constant pool, or `None` for a DELETE.
+        ///
+        /// With it, the op is copy-on-write: read each matched row, write an
+        /// edited copy at a fresh ordinal, retire the original — still ONE
+        /// record. Without it, the matched rows are simply retired.
+        set: Option<ConstId>,
     },
     /// Provision a collection. One fat op — nothing about DDL varies at runtime.
     CreateCollection {
@@ -593,8 +603,11 @@ impl Program {
                     self.check_reg(at, *src)?;
                     self.check_reg(at, *dst)?;
                 }
-                Op::Mutate { retire, .. } => {
+                Op::Mutate { retire, set, .. } => {
                     self.check_reg(at, *retire)?;
+                    if let Some(id) = set {
+                        self.check_const(at, *id)?;
+                    }
                 }
                 Op::CreateCollection { schema, .. } => {
                     self.check_const(at, *schema)?;

@@ -618,6 +618,8 @@ impl<'a> Compiler<'a> {
                 self.emit(Op::Mutate {
                     collection: delete.collection.clone(),
                     retire,
+                    // No SET list: a DELETE only retires.
+                    set: None,
                 });
             }
         }
@@ -642,12 +644,13 @@ mod tests {
     use crate::compiler::constants::{Const, ConstId, ConstPool};
     use crate::metadata::common::{
         CollectionConfig, ColumnSpec, ColumnType as MetaColumnType, RangeOp, Schema,
+        Value as MetaValue,
     };
     use crate::sql::ast::{ColumnType, CompareOp, Literal};
     use crate::sql::bind::{
         BoundPredicate, ColumnRef, ColumnSchema, Projected, Schema as BindSchema, TypedValue,
     };
-    use crate::sql::plan::{CreateCollection, Delete, Insert, LogicalPlan, Project, Scan};
+    use crate::sql::plan::{CreateCollection, Delete, Insert, LogicalPlan, Project, Scan, Update};
     use std::num::NonZeroUsize;
 
     // ------------------------------------------------------------------------
@@ -808,6 +811,98 @@ mod tests {
         }
     }
 
+    /// `UPDATE docs SET <col> = <value> WHERE <pred>`, compiled.
+    fn update_program(
+        assignments: Vec<(ColumnRef, TypedValue)>,
+        predicate: BoundPredicate,
+    ) -> Program {
+        let plan = LogicalPlan::Update(Update {
+            collection: "docs".to_string(),
+            schema: docs_bind_schema(),
+            assignments,
+            predicate,
+        });
+        compile(plan, Some(&docs_meta_schema())).expect("an UPDATE compiles")
+    }
+
+    fn text_assignment(name: &str, ordinal: usize, value: &str) -> (ColumnRef, TypedValue) {
+        (
+            colref(name, ordinal),
+            TypedValue {
+                value: Literal::Str(value.to_string()),
+                ty: ColumnType::Text,
+            },
+        )
+    }
+
+    #[test]
+    fn update_compiles_to_its_predicate_then_one_mutate_with_a_set_list() {
+        let program = update_program(
+            vec![text_assignment("author", 1, "bob")],
+            cmp_pred("published_at", 3, CompareOp::Lt, 2),
+        );
+
+        let set = match program.ops.as_slice() {
+            [
+                Op::Integer { value: 2, dst: d0 },
+                Op::BitmapRange { dst: d1, .. },
+                Op::Mutate {
+                    collection,
+                    retire,
+                    set: Some(set),
+                },
+                Op::Halt,
+            ] => {
+                assert_eq!(*d0, Reg(0));
+                assert_eq!(collection, "docs");
+                assert_eq!(retire, d1, "Mutate retires what the predicate produced");
+                *set
+            }
+            other => panic!("unexpected program: {other:?}"),
+        };
+
+        // The SET list is interned, translated to STORAGE columns: `author` is
+        // declaration ordinal 1 and ColumnId 0.
+        assert_eq!(
+            program.consts.get(set),
+            Some(&Const::Assignments(vec![(
+                0,
+                MetaValue::Text("bob".into())
+            )]))
+        );
+        assert_eq!(program.n_cursors, 0, "an UPDATE walks no rows");
+        program.validate().expect("an UPDATE program validates");
+    }
+
+    #[test]
+    fn several_assignments_keep_source_order_in_the_pool() {
+        let program = update_program(
+            vec![
+                text_assignment("title", 2, "first"),
+                text_assignment("author", 1, "bob"),
+                text_assignment("title", 2, "last"),
+            ],
+            cmp_pred("published_at", 3, CompareOp::Lt, 2),
+        );
+        let set = program
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::Mutate { set, .. } => *set,
+                _ => None,
+            })
+            .expect("an UPDATE emits a SET list");
+        assert_eq!(
+            program.consts.get(set),
+            Some(&Const::Assignments(vec![
+                (1, MetaValue::Text("first".into())),
+                (0, MetaValue::Text("bob".into())),
+                (1, MetaValue::Text("last".into())),
+            ])),
+            "order is preserved, so the last assignment to a column wins"
+        );
+    }
+
     /// `DELETE FROM docs WHERE <pred>`, compiled.
     fn delete_program(predicate: BoundPredicate) -> Program {
         let plan = LogicalPlan::Delete(Delete {
@@ -839,6 +934,7 @@ mod tests {
                 Op::Mutate {
                     collection: "docs".to_string(),
                     retire: Reg(1),
+                    set: None,
                 },
                 Op::Halt,
             ]
@@ -867,6 +963,7 @@ mod tests {
             Op::Mutate {
                 collection: "docs".to_string(),
                 retire: or_dst,
+                set: None,
             },
             "Mutate retires the combined bitmap, not either operand"
         );

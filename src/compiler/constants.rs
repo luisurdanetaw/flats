@@ -9,7 +9,7 @@
 //!
 //! This is plain infrastructure — no compilation logic lives here.
 
-use crate::metadata::common::Schema;
+use crate::metadata::common::{ColumnId, Schema, Value};
 
 /// A handle into a [`ConstPool`]. Instructions carry this, never the payload.
 ///
@@ -33,6 +33,11 @@ pub enum Const {
     Str(String),
     /// The resolved storage schema a `CREATE COLLECTION` provisions.
     Schema(Schema),
+    /// An `UPDATE`'s SET list: storage columns and their new values, in source
+    /// order, so a column assigned twice takes its last value. Interned rather
+    /// than loaded into registers because it is one operand of one fat op — the
+    /// rewrite happens per statement, not per row.
+    Assignments(Vec<(ColumnId, Value)>),
 }
 
 /// The append-only pool of a program's constants. Handles are dense indices

@@ -798,7 +798,11 @@ impl Vm {
                 }
 
                 // -- DELETE: one statement, one record --------------------------
-                Op::Mutate { collection, retire } => {
+                Op::Mutate {
+                    collection,
+                    retire,
+                    set: _set,
+                } => {
                     let retire = *retire;
                     let db = db.ok_or(ExecError::Detached { op: "Mutate" })?;
                     // The bitmap the predicate ops computed against THIS
@@ -1170,6 +1174,7 @@ impl ExecError {
                 Some(Const::Vector(_)) => "a vector",
                 Some(Const::Str(_)) => "a string",
                 Some(Const::Schema(_)) => "a schema",
+                Some(Const::Assignments(_)) => "a SET list",
                 None => "nothing",
             },
         }
@@ -1758,6 +1763,7 @@ mod tests {
                 Op::Mutate {
                     collection: "docs".into(),
                     retire: Reg(1),
+                    set: None,
                 },
                 Op::Halt,
             ],
@@ -1771,6 +1777,85 @@ mod tests {
         let mut vm = Vm::new(program)?;
         while vm.step(db)?.is_some() {}
         Ok(())
+    }
+
+    /// `UPDATE docs SET title = 'archived' WHERE author = 'alice'`, as the
+    /// compiler emits it: the predicate's bitmap, then one `Mutate` carrying
+    /// the SET list.
+    fn update_where_author_program(author: &str, new_title: &str) -> Program {
+        let mut consts = ConstPool::new();
+        let needle = consts.add(Const::Str(author.into()));
+        // title is ColumnId 1 in the docs storage schema.
+        let set = consts.add(Const::Assignments(vec![(
+            1,
+            Value::Text(new_title.into()),
+        )]));
+        Program {
+            ops: vec![
+                Op::String {
+                    id: needle,
+                    dst: Reg(0),
+                },
+                Op::BitmapEq {
+                    collection: "docs".into(),
+                    col: 0, // author
+                    value: Reg(0),
+                    dst: Reg(1),
+                },
+                Op::Mutate {
+                    collection: "docs".into(),
+                    retire: Reg(1),
+                    set: Some(set),
+                },
+                Op::Halt,
+            ],
+            consts,
+            n_regs: 2,
+            n_cursors: 0,
+        }
+    }
+
+    #[test]
+    fn mutate_with_a_set_list_rewrites_the_matched_rows() {
+        let (_dir, db) = docs_db();
+        for (author, n) in [("alice", 1), ("bob", 2), ("alice", 3)] {
+            run_to_halt(&db, insert_program(author, n)).expect("inserts");
+        }
+
+        run_to_halt(&db, update_where_author_program("alice", "archived")).expect("updates");
+
+        // Still three rows: two rewritten in place of their originals.
+        assert_eq!(live_rows(&db), 3);
+        let mut rows = Vec::new();
+        let mut cursor = db.scan(0).expect("collection 0 exists");
+        let mut has_row = cursor.seek_first().expect("reads");
+        while has_row {
+            rows.push(cursor.row().expect("parked on a row").to_vec());
+            has_row = cursor.next().expect("reads");
+        }
+        // bob is untouched; both alices carry the new title and their own
+        // published_at, which the copy preserved.
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Value::Text("bob".into()),
+                    Value::Text("doc 2".into()),
+                    Value::Int(2)
+                ],
+                vec![
+                    Value::Text("alice".into()),
+                    Value::Text("archived".into()),
+                    Value::Int(1)
+                ],
+                vec![
+                    Value::Text("alice".into()),
+                    Value::Text("archived".into()),
+                    Value::Int(3)
+                ],
+            ]
+        );
+        db.close().unwrap();
     }
 
     #[test]
@@ -1801,6 +1886,7 @@ mod tests {
                 Op::Mutate {
                     collection: "docs".into(),
                     retire: Reg(0),
+                    set: None,
                 },
                 Op::Halt,
             ],
@@ -1822,6 +1908,7 @@ mod tests {
                 Op::Mutate {
                     collection: "docs".into(),
                     retire: Reg(5),
+                    set: None,
                 },
                 Op::Halt,
             ],
