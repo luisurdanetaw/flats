@@ -2465,6 +2465,57 @@ mod tests {
         );
     }
 
+    /// Roadmap step 8, as it applies to UPDATE: the room for every copy is
+    /// checked in ONE reservation, before the record is built. Half a statement
+    /// is not a thing that can happen — a per-row allocator could pass its
+    /// check, claim some ordinals, then fail, leaving the statement abandoned
+    /// with capacity burned.
+    #[test]
+    fn an_update_that_would_exceed_capacity_is_refused_before_logging() {
+        let dir = tempfile::tempdir().unwrap();
+        // Capacity 8, five rows used: four copies need 5..9, one past the end.
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 8)], manual_opts()).unwrap();
+        for n in 0..5i64 {
+            db.insert(0, &[n as f32, 0.0], meta_row(n, "draft")).unwrap();
+        }
+
+        let wal = dir.path().join("wal.log");
+        let before = std::fs::metadata(&wal).unwrap().len();
+        let matched: RoaringBitmap = [0u32, 1, 2, 3].into_iter().collect();
+        match db.update_rows(0, &matched, &[(1, Value::Text("archived".into()))]) {
+            Err(Error::CapacityExceeded { capacity }) => assert_eq!(capacity, 8),
+            other => panic!("expected CapacityExceeded, got {other:?}"),
+        }
+
+        assert_eq!(
+            std::fs::metadata(&wal).unwrap().len(),
+            before,
+            "a refused update must never reach the log"
+        );
+        assert_eq!(db.live_snapshot(0).unwrap().len(), 5, "no row changed");
+        // The allocator did not move either: the next insert takes ordinal 5.
+        assert_eq!(db.insert(0, &[9.0, 0.0], meta_row(9, "draft")).unwrap(), Ordinal(5));
+    }
+
+    #[test]
+    fn an_update_that_exactly_fills_capacity_is_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        // Capacity 9, five rows used, four copies land at 5..9 exactly.
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 9)], manual_opts()).unwrap();
+        for n in 0..5i64 {
+            db.insert(0, &[n as f32, 0.0], meta_row(n, "draft")).unwrap();
+        }
+
+        let matched: RoaringBitmap = [0u32, 1, 2, 3].into_iter().collect();
+        db.update_rows(0, &matched, &[(1, Value::Text("archived".into()))])
+            .expect("the copies fit exactly");
+
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![4, 5, 6, 7, 8]
+        );
+    }
+
     #[test]
     fn insert_search_delete_e2e() {
         let dir = tempfile::tempdir().unwrap();
