@@ -1081,13 +1081,13 @@ impl Db {
         // the statement by hand — a record that cannot apply must still never
         // reach the WAL.
         let dim = coll.config.schema.vector().dim.get();
-        if let Some(vector) = vector {
-            if vector.len() != dim {
-                return Err(Error::DimensionMismatch {
-                    expected: dim,
-                    got: vector.len(),
-                });
-            }
+        if let Some(vector) = vector
+            && vector.len() != dim
+        {
+            return Err(Error::DimensionMismatch {
+                expected: dim,
+                got: vector.len(),
+            });
         }
 
         let tuples = self
@@ -2467,7 +2467,12 @@ mod tests {
         let wal = dir.path().join("wal.log");
         let before = std::fs::metadata(&wal).unwrap().len();
         let outcome = db
-            .update_rows(0, &RoaringBitmap::new(), &[(1, Value::Text("x".into()))], None)
+            .update_rows(
+                0,
+                &RoaringBitmap::new(),
+                &[(1, Value::Text("x".into()))],
+                None,
+            )
             .unwrap();
 
         assert_eq!(outcome, Outcome::Applied);

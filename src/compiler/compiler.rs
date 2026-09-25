@@ -613,11 +613,18 @@ impl<'a> Compiler<'a> {
                 let retire = self.emit_predicate(&update.predicate, &update.collection);
                 let assignments = self.lower_assignments(&update.assignments);
                 let set = self.consts.add(Const::Assignments(assignments));
+                // The embedding is a large payload and there is exactly one of
+                // it per statement, so it is interned rather than loaded into a
+                // register — the same treatment a SEARCH's query vector gets.
+                let vector = update
+                    .vector
+                    .as_ref()
+                    .map(|v| self.consts.add(Const::Vector(v.clone())));
                 self.emit(Op::Mutate {
                     collection: update.collection.clone(),
                     retire,
                     set: Some(set),
-                    vector: None,
+                    vector,
                 });
             }
 
@@ -1048,7 +1055,7 @@ mod tests {
                 collection: "docs".to_string(),
                 retire: or_dst,
                 set: None,
-                    vector: None,
+                vector: None,
             },
             "Mutate retires the combined bitmap, not either operand"
         );

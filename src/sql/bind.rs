@@ -1451,7 +1451,11 @@ mod tests {
     /// predicate would hand the same embedding to everything it matched.
     #[test]
     fn setting_the_embedding_without_naming_one_row_is_refused() {
-        for clause in ["published_at = 1", "id = 7 AND author = 'alice'", "id = 7 OR id = 8"] {
+        for clause in [
+            "published_at = 1",
+            "id = 7 AND author = 'alice'",
+            "id = 7 OR id = 8",
+        ] {
             let sql = format!("UPDATE docs SET vector = {} WHERE {clause};", vec_lit(768));
             assert!(
                 matches!(

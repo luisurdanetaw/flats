@@ -1776,7 +1776,10 @@ mod tests {
         let (_dir, db) = docs_db();
         seed_filterable(&db);
 
-        assert_eq!(where_authors(&db, "id = 1 AND published_at = 5"), vec!["bob"]);
+        assert_eq!(
+            where_authors(&db, "id = 1 AND published_at = 5"),
+            vec!["bob"]
+        );
         assert!(where_authors(&db, "id = 1 AND published_at = 9").is_empty());
         db.close().unwrap();
     }

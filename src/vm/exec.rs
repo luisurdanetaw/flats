@@ -526,10 +526,10 @@ impl Vm {
                     // its ordinal must not resurrect it, and an ordinal past
                     // the high-water mark simply matches nothing.
                     let mut found = RoaringBitmap::new();
-                    if let Ok(ordinal) = u32::try_from(ordinal) {
-                        if live.contains(ordinal) {
-                            found.insert(ordinal);
-                        }
+                    if let Ok(ordinal) = u32::try_from(ordinal)
+                        && live.contains(ordinal)
+                    {
+                        found.insert(ordinal);
                     }
                     self.store(dst, RegValue::Bitmap(Arc::new(found)))?;
                 }
@@ -847,8 +847,24 @@ impl Vm {
                                     return Err(ExecError::bad_const(set.0, "a SET list", other));
                                 }
                             };
-                            db.update_rows(id, bitmap.as_ref(), &assignments, None)
-                                .map_err(ExecError::Engine)?
+                            // A replacement embedding, when the statement named
+                            // one row and carried one.
+                            let replacement = match vector {
+                                Some(id) => match self.program.consts.get(*id) {
+                                    Some(Const::Vector(v)) => Some(v.clone()),
+                                    other => {
+                                        return Err(ExecError::bad_const(id.0, "a vector", other));
+                                    }
+                                },
+                                None => None,
+                            };
+                            db.update_rows(
+                                id,
+                                bitmap.as_ref(),
+                                &assignments,
+                                replacement.as_deref(),
+                            )
+                            .map_err(ExecError::Engine)?
                         }
                         // DELETE: retire and nothing else.
                         None => db
