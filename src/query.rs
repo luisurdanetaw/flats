@@ -1691,4 +1691,149 @@ mod tests {
         assert_eq!(remaining(&db).len(), 4, "a refused DELETE removes nothing");
         db.close().unwrap();
     }
+    // -- UPDATE, end to end through the front door ---------------------------
+
+    /// Run an UPDATE and insist it behaves like every mutation: no rows out.
+    fn update(db: &Db, sql: &str) {
+        let stream = db.execute(sql).expect("the update runs");
+        assert!(collect(stream).is_empty(), "an UPDATE yields no rows");
+    }
+
+    /// `(author, published_at)` of every live row, sorted.
+    fn rows_of(db: &Db) -> Vec<(String, i64)> {
+        let stream = db
+            .execute("SELECT author, published_at FROM docs WHERE published_at > 0;")
+            .expect("the select runs");
+        let mut out: Vec<(String, i64)> = collect(stream)
+            .into_iter()
+            .map(|row| match (&row[0], &row[1]) {
+                (RegValue::Str(a), RegValue::Int(n)) => (a.clone(), *n),
+                other => panic!("unexpected row shape: {other:?}"),
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn update_rewrites_the_rows_its_where_admits() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        update(&db, "UPDATE docs SET author = 'archived' WHERE published_at = 1;");
+
+        assert_eq!(
+            rows_of(&db),
+            vec![
+                ("archived".to_string(), 1),
+                ("archived".to_string(), 1),
+                ("bob".to_string(), 5),
+                ("dave".to_string(), 9),
+            ],
+            "alice and carol were rewritten; their other columns survived"
+        );
+        db.close().unwrap();
+    }
+
+    /// The embedding is copied across untouched, which only a vector search can
+    /// show: the rewritten row must still be found by its original vector.
+    #[test]
+    fn update_copies_the_embedding_unchanged() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db); // alice's vector is [1.0, 0, 0, 0]
+
+        update(&db, "UPDATE docs SET author = 'archived' WHERE published_at = 1;");
+
+        let found = authors(
+            db.execute("SEARCH TOP 1 NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM docs;")
+                .expect("the search runs"),
+        );
+        assert_eq!(
+            found,
+            vec!["archived"],
+            "the rewritten row is still reachable by its original embedding"
+        );
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn an_update_matching_nothing_succeeds_and_logs_nothing() {
+        let (dir, db) = docs_db();
+        seed_filterable(&db);
+
+        let wal = dir.path().join("wal.log");
+        let before = std::fs::metadata(&wal).expect("wal exists").len();
+        update(&db, "UPDATE docs SET author = 'x' WHERE published_at = 404;");
+
+        assert_eq!(std::fs::metadata(&wal).expect("wal exists").len(), before);
+        assert_eq!(rows_of(&db).len(), 4);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn an_update_survives_reopen() {
+        let (dir, db) = docs_db();
+        seed_filterable(&db);
+        update(&db, "UPDATE docs SET author = 'archived' WHERE published_at = 9;");
+        drop(db); // no closing checkpoint: the WAL must carry it
+
+        let db = Db::open(dir.path(), &[], DbOptions::default()).expect("reopen");
+        assert_eq!(
+            rows_of(&db),
+            vec![
+                ("alice".to_string(), 1),
+                ("archived".to_string(), 9),
+                ("bob".to_string(), 5),
+                ("carol".to_string(), 1),
+            ]
+        );
+        db.close().unwrap();
+    }
+
+    /// Two threads updating the same row at the same time. Both statements
+    /// must TAKE EFFECT — the loser re-resolves and tries again inside
+    /// `execute` — and the row must stay one row.
+    ///
+    /// The liveness version is the witness: an applied Mutate bumps it, a
+    /// conflicted one does not. So a statement whose conflict was swallowed
+    /// instead of retried shows up as a missing bump, which is exactly the
+    /// silent lost update this has to rule out.
+    #[test]
+    fn concurrent_updates_through_execute_all_take_effect() {
+        use std::sync::{Arc, Barrier};
+
+        const ROUNDS: usize = 8;
+        let (_dir, db) = docs_db();
+        insert(&db, "alice", "doc", 1); // the single contended row
+
+        let db = Arc::new(db);
+        let barrier = Arc::new(Barrier::new(2));
+        let before = db.live_snapshot(0).expect("collection open").version();
+
+        let workers: Vec<_> = (0..2)
+            .map(|tag| {
+                let db = Arc::clone(&db);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    for round in 0..ROUNDS {
+                        barrier.wait();
+                        db.execute(&format!(
+                            "UPDATE docs SET title = 't{tag}-{round}' WHERE author = 'alice';"
+                        ))
+                        .expect("every update eventually applies");
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+
+        assert_eq!(
+            db.live_snapshot(0).expect("collection open").version(),
+            before + (2 * ROUNDS) as u64,
+            "every statement applied: none was silently dropped on a conflict"
+        );
+        assert_eq!(rows_of(&db).len(), 1, "one row stays one row");
+    }
 }
