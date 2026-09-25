@@ -59,7 +59,7 @@ use crate::error::{Error, Result};
 use crate::index::index::{FlatIndex, Ordinal, Reader, SearchResult, Writer};
 use roaring::RoaringBitmap;
 
-use crate::metadata::common::{Row, Schema};
+use crate::metadata::common::{ColumnId, Row, Schema, Value};
 use crate::metadata::index::MetadataIndex;
 use crate::metadata::tuples::TupleStore;
 use crate::metadata::{crc32, index as meta, tuples, write_snapshot_atomic};
@@ -1020,6 +1020,27 @@ impl Db {
         // the commit thread judged it stale, and the caller's move is to read
         // the rows again and retry. Ordinals reserved above stay burned.
         Ok(committed.outcome)
+    }
+
+    /// Rewrite every row in `matched`, copy-on-write: read each row, apply the
+    /// `set` overrides to a copy at a FRESH ordinal, and retire the original —
+    /// all as one `Record::Mutate`, so the statement lands whole or not at all.
+    ///
+    /// The vector is copied across untouched. `set` is storage-level
+    /// (`ColumnId`), already resolved and type-checked by the binder, and is
+    /// applied in order so a column named twice takes its last value.
+    ///
+    /// Returns `Outcome::Conflicted` when the rows moved on between the read
+    /// and the commit — the caller re-resolves its predicate and tries again.
+    pub fn update_rows(
+        &self,
+        collection: u32,
+        matched: &RoaringBitmap,
+        set: &[(ColumnId, Value)],
+    ) -> Result<Outcome> {
+        let _ = (collection, matched, set);
+        // D6 does the copying.
+        Ok(Outcome::Applied)
     }
 
     /// Brute-force top-`k` search within `collection`. Tombstoned vectors are
@@ -2199,6 +2220,151 @@ mod tests {
         assert_eq!(
             conflicts, ROUNDS,
             "each round has exactly one winner and one loser"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // UPDATE — copy-on-write, one statement, one record
+    // -----------------------------------------------------------------------
+
+    fn seed_three(db: &Db) {
+        db.insert(0, &[1.0, 0.0], meta_row(1, "draft")).unwrap(); // ord 0
+        db.insert(0, &[2.0, 0.0], meta_row(2, "draft")).unwrap(); // ord 1
+        db.insert(0, &[3.0, 0.0], meta_row(3, "draft")).unwrap(); // ord 2
+    }
+
+    /// Read a live row's (a, c) values plus its vector, by ordinal.
+    fn row_at(db: &Db, ordinal: u32) -> (Vec<Value>, Vec<f32>) {
+        let values = match db.tuple_reader(0).unwrap().get(Ordinal(ordinal), &[0, 1]).unwrap() {
+            tuples::RowGet::Live(values) => values,
+            other => panic!("ordinal {ordinal} is not readable: {other:?}"),
+        };
+        let vector = db
+            .reader(0)
+            .unwrap()
+            .vector_at(Ordinal(ordinal))
+            .expect("live row has a vector")
+            .to_vec();
+        (values, vector)
+    }
+
+    /// The whole contract of a metadata-only UPDATE: the SET columns change,
+    /// everything else survives — including the embedding, byte for byte —
+    /// the originals retire, and rows nobody matched are untouched.
+    #[test]
+    fn update_rows_copies_each_row_with_the_set_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        seed_three(&db);
+
+        let matched: RoaringBitmap = [0u32, 2].into_iter().collect();
+        let outcome = db
+            .update_rows(0, &matched, &[(1, Value::Text("archived".into()))])
+            .unwrap();
+        assert_eq!(outcome, Outcome::Applied);
+
+        let live: Vec<u32> = db.live_snapshot(0).unwrap().iter().collect();
+        assert_eq!(live, vec![1, 3, 4], "originals retired, copies at fresh ordinals");
+
+        // The untouched row is exactly as it was.
+        assert_eq!(
+            row_at(&db, 1).0,
+            vec![Value::Int(2), Value::Text("draft".into())]
+        );
+
+        // Each copy: SET column changed, other column kept, vector identical.
+        let (values, vector) = row_at(&db, 3);
+        assert_eq!(values, vec![Value::Int(1), Value::Text("archived".into())]);
+        assert_eq!(vector, vec![1.0, 0.0], "the embedding is copied unchanged");
+
+        let (values, vector) = row_at(&db, 4);
+        assert_eq!(values, vec![Value::Int(3), Value::Text("archived".into())]);
+        assert_eq!(vector, vec![3.0, 0.0]);
+    }
+
+    /// One statement is one publish, however many rows it rewrites. The
+    /// liveness version is what readers watch, so a multi-row UPDATE that
+    /// bumped it per row would invalidate every cached snapshot N times and,
+    /// worse, expose the half-rewritten states in between.
+    #[test]
+    fn a_multi_row_update_publishes_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        seed_three(&db);
+
+        let before = db.live_snapshot(0).unwrap().version();
+        let matched: RoaringBitmap = [0u32, 1, 2].into_iter().collect();
+        db.update_rows(0, &matched, &[(1, Value::Text("archived".into()))])
+            .unwrap();
+
+        assert_eq!(
+            db.live_snapshot(0).unwrap().version(),
+            before + 1,
+            "three rows rewritten, one publish"
+        );
+    }
+
+    /// Later assignments win, so `SET c = 'a', c = 'b'` means 'b'.
+    #[test]
+    fn update_applies_assignments_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        seed_three(&db);
+
+        let matched: RoaringBitmap = [0u32].into_iter().collect();
+        db.update_rows(
+            0,
+            &matched,
+            &[
+                (1, Value::Text("first".into())),
+                (1, Value::Text("last".into())),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            row_at(&db, 3).0,
+            vec![Value::Int(1), Value::Text("last".into())]
+        );
+    }
+
+    #[test]
+    fn an_update_matching_nothing_logs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        seed_three(&db);
+
+        let wal = dir.path().join("wal.log");
+        let before = std::fs::metadata(&wal).unwrap().len();
+        let outcome = db
+            .update_rows(0, &RoaringBitmap::new(), &[(1, Value::Text("x".into()))])
+            .unwrap();
+
+        assert_eq!(outcome, Outcome::Applied);
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), before);
+        assert_eq!(db.live_snapshot(0).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn an_update_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfgs = [cfg_meta(0, 2, 64)];
+        {
+            let db = Db::open(dir.path(), &cfgs, manual_opts()).unwrap();
+            seed_three(&db);
+            let matched: RoaringBitmap = [1u32].into_iter().collect();
+            db.update_rows(0, &matched, &[(1, Value::Text("archived".into()))])
+                .unwrap();
+            drop(db); // no closing checkpoint: the WAL must carry it
+        }
+        let db = Db::open(dir.path(), &cfgs, manual_opts()).unwrap();
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
+        assert_eq!(
+            row_at(&db, 3).0,
+            vec![Value::Int(2), Value::Text("archived".into())]
         );
     }
 
