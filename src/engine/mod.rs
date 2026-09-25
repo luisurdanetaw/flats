@@ -1068,7 +1068,6 @@ impl Db {
         set: &[(ColumnId, Value)],
         vector: Option<&[f32]>,
     ) -> Result<Outcome> {
-        let _ = vector; // E8 uses it.
         let coll = self.collection(collection)?;
         // A predicate matching no rows is a successful no-op, like a DELETE's:
         // nothing to copy, nothing to log, no fsync spent.
@@ -1076,6 +1075,20 @@ impl Db {
             return Ok(Outcome::Applied);
         }
         self.check_poison()?;
+
+        // Checked before anything is read or logged, exactly as `insert` does.
+        // The binder already enforces it, so reaching this means a caller built
+        // the statement by hand — a record that cannot apply must still never
+        // reach the WAL.
+        let dim = coll.config.schema.vector().dim.get();
+        if let Some(vector) = vector {
+            if vector.len() != dim {
+                return Err(Error::DimensionMismatch {
+                    expected: dim,
+                    got: vector.len(),
+                });
+            }
+        }
 
         let tuples = self
             .tuple_reader(collection)
@@ -1106,13 +1119,18 @@ impl Db {
                     });
                 }
             };
-            let vector = vectors
-                .vector_at(ordinal)
-                .ok_or(Error::SnapshotRowMissing {
-                    collection,
-                    ordinal: ordinal.0,
-                })?
-                .to_vec();
+            // The statement's embedding replaces the old one when it carries
+            // one; otherwise the row's own vector rides along unchanged.
+            let vector = match vector {
+                Some(replacement) => replacement.to_vec(),
+                None => vectors
+                    .vector_at(ordinal)
+                    .ok_or(Error::SnapshotRowMissing {
+                        collection,
+                        ordinal: ordinal.0,
+                    })?
+                    .to_vec(),
+            };
 
             let mut row: Row = values
                 .into_iter()
