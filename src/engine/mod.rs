@@ -2023,7 +2023,10 @@ mod tests {
             vec![1]
         );
         let hits = db.search(0, &[9.0, 0.0], 8).unwrap();
-        assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![Ordinal(1)]);
+        assert_eq!(
+            hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![Ordinal(1)]
+        );
     }
 
     /// Retiring nothing cannot be stale. This is the bulk-load shape the WAL
@@ -2111,6 +2114,91 @@ mod tests {
         assert_eq!(
             db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
             vec![1]
+        );
+    }
+
+    /// THE test this whole mechanism exists for.
+    ///
+    /// Two threads run the copy-on-write shape of an UPDATE against the same
+    /// single row: read the live row, then log "retire it, install my copy at
+    /// my own fresh ordinal". Barriers make both threads read BEFORE either
+    /// logs, which is exactly the interleaving that produces the bug — both
+    /// records are built from the same row, and applying both leaves two live
+    /// copies of one row.
+    ///
+    /// Two invariants, checked every round: the collection still holds exactly
+    /// one row, and exactly one of the two writers was told it conflicted. The
+    /// loser simply re-reads on the next round, which is what the UPDATE
+    /// executor will do in a retry loop.
+    #[test]
+    fn concurrent_copy_on_write_updates_cannot_duplicate_a_row() {
+        use std::sync::Barrier;
+
+        const ROUNDS: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open(dir.path(), &[cfg(0, 2, 256)], manual_opts()).unwrap());
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap(); // ord 0: the row
+
+        // Each thread draws its own fresh ordinals, as the executor will from
+        // the collection's allocator.
+        let next_ordinal = Arc::new(AtomicU64::new(1));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let workers: Vec<_> = (0..2)
+            .map(|tag| {
+                let db = Arc::clone(&db);
+                let next_ordinal = Arc::clone(&next_ordinal);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut conflicts = 0usize;
+                    for _ in 0..ROUNDS {
+                        // PHASE 1 — read. The barrier below guarantees the
+                        // other thread has also read before either writes.
+                        let live = db.live_snapshot(0).expect("collection open");
+                        let current = live.iter().next().expect("exactly one row");
+                        let old = db
+                            .reader(0)
+                            .expect("collection open")
+                            .vector_at(Ordinal(current))
+                            .expect("the live row has a vector")
+                            .to_vec();
+                        barrier.wait();
+
+                        // PHASE 2 — copy-on-write: retire what we read,
+                        // install our edit of it at a fresh ordinal.
+                        let ordinal = next_ordinal.fetch_add(1, Ordering::SeqCst);
+                        let edited = vec![old[0] + 1.0, tag as f32];
+                        let outcome = db
+                            .mutate(
+                                0,
+                                [current].into_iter().collect::<RoaringBitmap>(),
+                                vec![Install {
+                                    ordinal,
+                                    vector: edited,
+                                    metadata: vec![],
+                                }],
+                            )
+                            .expect("a conflict is not an error");
+                        if outcome == Outcome::Conflicted {
+                            conflicts += 1;
+                        }
+                        barrier.wait();
+                    }
+                    conflicts
+                })
+            })
+            .collect();
+
+        let conflicts: usize = workers.into_iter().map(|w| w.join().unwrap()).sum();
+
+        assert_eq!(
+            db.live_snapshot(0).unwrap().len(),
+            1,
+            "one row must stay one row, however the two writers interleaved"
+        );
+        assert_eq!(
+            conflicts, ROUNDS,
+            "each round has exactly one winner and one loser"
         );
     }
 
