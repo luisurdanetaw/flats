@@ -1052,9 +1052,12 @@ impl Db {
     /// `set` overrides to a copy at a FRESH ordinal, and retire the original —
     /// all as one `Record::Mutate`, so the statement lands whole or not at all.
     ///
-    /// The vector is copied across untouched. `set` is storage-level
-    /// (`ColumnId`), already resolved and type-checked by the binder, and is
-    /// applied in order so a column named twice takes its last value.
+    /// `vector` REPLACES each copy's embedding; `None` copies the old row's
+    /// across untouched. The binder only allows a replacement when the
+    /// statement names one row by ordinal, so in practice `Some` arrives with
+    /// exactly one matched row. `set` is storage-level (`ColumnId`), already
+    /// resolved and type-checked by the binder, and is applied in order so a
+    /// column named twice takes its last value.
     ///
     /// Returns `Outcome::Conflicted` when the rows moved on between the read
     /// and the commit — the caller re-resolves its predicate and tries again.
@@ -1063,7 +1066,9 @@ impl Db {
         collection: u32,
         matched: &RoaringBitmap,
         set: &[(ColumnId, Value)],
+        vector: Option<&[f32]>,
     ) -> Result<Outcome> {
+        let _ = vector; // E8 uses it.
         let coll = self.collection(collection)?;
         // A predicate matching no rows is a successful no-op, like a DELETE's:
         // nothing to copy, nothing to log, no fsync spent.
@@ -2361,7 +2366,7 @@ mod tests {
 
         let matched: RoaringBitmap = [0u32, 2].into_iter().collect();
         let outcome = db
-            .update_rows(0, &matched, &[(1, Value::Text("archived".into()))])
+            .update_rows(0, &matched, &[(1, Value::Text("archived".into()))], None)
             .unwrap();
         assert_eq!(outcome, Outcome::Applied);
 
@@ -2400,7 +2405,7 @@ mod tests {
 
         let before = db.live_snapshot(0).unwrap().version();
         let matched: RoaringBitmap = [0u32, 1, 2].into_iter().collect();
-        db.update_rows(0, &matched, &[(1, Value::Text("archived".into()))])
+        db.update_rows(0, &matched, &[(1, Value::Text("archived".into()))], None)
             .unwrap();
 
         assert_eq!(
@@ -2425,6 +2430,7 @@ mod tests {
                 (1, Value::Text("first".into())),
                 (1, Value::Text("last".into())),
             ],
+            None,
         )
         .unwrap();
 
@@ -2443,7 +2449,7 @@ mod tests {
         let wal = dir.path().join("wal.log");
         let before = std::fs::metadata(&wal).unwrap().len();
         let outcome = db
-            .update_rows(0, &RoaringBitmap::new(), &[(1, Value::Text("x".into()))])
+            .update_rows(0, &RoaringBitmap::new(), &[(1, Value::Text("x".into()))], None)
             .unwrap();
 
         assert_eq!(outcome, Outcome::Applied);
@@ -2459,7 +2465,7 @@ mod tests {
             let db = Db::open(dir.path(), &cfgs, manual_opts()).unwrap();
             seed_three(&db);
             let matched: RoaringBitmap = [1u32].into_iter().collect();
-            db.update_rows(0, &matched, &[(1, Value::Text("archived".into()))])
+            db.update_rows(0, &matched, &[(1, Value::Text("archived".into()))], None)
                 .unwrap();
             drop(db); // no closing checkpoint: the WAL must carry it
         }
@@ -2492,7 +2498,7 @@ mod tests {
         let wal = dir.path().join("wal.log");
         let before = std::fs::metadata(&wal).unwrap().len();
         let matched: RoaringBitmap = [0u32, 1, 2, 3].into_iter().collect();
-        match db.update_rows(0, &matched, &[(1, Value::Text("archived".into()))]) {
+        match db.update_rows(0, &matched, &[(1, Value::Text("archived".into()))], None) {
             Err(Error::CapacityExceeded { capacity }) => assert_eq!(capacity, 8),
             other => panic!("expected CapacityExceeded, got {other:?}"),
         }
@@ -2521,13 +2527,65 @@ mod tests {
         }
 
         let matched: RoaringBitmap = [0u32, 1, 2, 3].into_iter().collect();
-        db.update_rows(0, &matched, &[(1, Value::Text("archived".into()))])
+        db.update_rows(0, &matched, &[(1, Value::Text("archived".into()))], None)
             .expect("the copies fit exactly");
 
         assert_eq!(
             db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
             vec![4, 5, 6, 7, 8]
         );
+    }
+
+    /// Full replacement: the new embedding comes from the statement instead of
+    /// the old row, while every column the statement did not name still copies
+    /// across.
+    #[test]
+    fn update_rows_takes_a_replacement_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        seed_three(&db);
+
+        let matched: RoaringBitmap = [1u32].into_iter().collect();
+        db.update_rows(
+            0,
+            &matched,
+            &[(1, Value::Text("v2".into()))],
+            Some(&[9.0, 9.0]),
+        )
+        .unwrap();
+
+        let (values, vector) = row_at(&db, 3);
+        assert_eq!(vector, vec![9.0, 9.0], "the statement's embedding won");
+        assert_eq!(
+            values,
+            vec![Value::Int(2), Value::Text("v2".into())],
+            "the unnamed column still copied across"
+        );
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
+    }
+
+    /// The binder already checks this, so reaching it means a caller built the
+    /// record by hand — the same belt-and-braces `insert` keeps.
+    #[test]
+    fn a_replacement_vector_is_dimension_checked_before_logging() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        seed_three(&db);
+
+        let wal = dir.path().join("wal.log");
+        let before = std::fs::metadata(&wal).unwrap().len();
+        let matched: RoaringBitmap = [1u32].into_iter().collect();
+        match db.update_rows(0, &matched, &[], Some(&[9.0, 9.0, 9.0])) {
+            Err(Error::DimensionMismatch { expected, got }) => {
+                assert_eq!((expected, got), (2, 3));
+            }
+            other => panic!("expected DimensionMismatch, got {other:?}"),
+        }
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), before);
+        assert_eq!(db.live_snapshot(0).unwrap().len(), 3);
     }
 
     #[test]

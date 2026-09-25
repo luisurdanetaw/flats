@@ -846,7 +846,7 @@ impl Vm {
                                     return Err(ExecError::bad_const(set.0, "a SET list", other));
                                 }
                             };
-                            db.update_rows(id, bitmap.as_ref(), &assignments)
+                            db.update_rows(id, bitmap.as_ref(), &assignments, None)
                                 .map_err(ExecError::Engine)?
                         }
                         // DELETE: retire and nothing else.
