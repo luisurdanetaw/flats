@@ -79,8 +79,12 @@ pub enum Token {
     Or,
     /// `DELETE`
     Delete,
-    // EXTEND: future reserved keywords (Update, Set, …) get a variant here AND
-    // an arm in `keyword()` — nothing else changes.
+    /// `UPDATE`
+    Update,
+    /// `SET`
+    Set,
+    // EXTEND: future reserved keywords get a variant here AND an arm in
+    // `keyword()` — nothing else changes.
 
     // -- identifiers & literals ---------------------------------------------
     /// An identifier. Also carries *type names* (`VECTOR`, `INT`, `TEXT`,
@@ -546,6 +550,14 @@ mod tests {
         assert_eq!(lex("select"), vec![Token::Select]);
         assert_eq!(lex("SELECT"), vec![Token::Select]);
         assert_eq!(lex("SeLeCt"), vec![Token::Select]);
+    }
+
+    #[test]
+    fn update_and_set_are_keywords() {
+        assert_eq!(lex("update"), vec![Token::Update]);
+        assert_eq!(lex("UPDATE"), vec![Token::Update]);
+        assert_eq!(lex("set"), vec![Token::Set]);
+        assert_eq!(lex("SET"), vec![Token::Set]);
     }
 
     #[test]

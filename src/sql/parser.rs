@@ -29,8 +29,8 @@
 use std::fmt;
 
 use crate::sql::ast::{
-    CollectionOption, ColumnDef, ColumnType, CompareOp, CreateStmt, DeleteStmt, Expr, InsertStmt,
-    Literal, Projection, SearchStmt, SelectStmt, Statement,
+    Assignment, CollectionOption, ColumnDef, ColumnType, CompareOp, CreateStmt, DeleteStmt, Expr,
+    InsertStmt, Literal, Projection, SearchStmt, SelectStmt, Statement, UpdateStmt,
 };
 use crate::sql::lexer::{LexError, Lexer, Span, SpannedToken, Token};
 
@@ -860,6 +860,84 @@ mod tests {
 
     fn cmp(left: Box<Expr>, op: CompareOp, right: Box<Expr>) -> Box<Expr> {
         Box::new(Expr::Compare { left, op, right })
+    }
+
+    // -- UPDATE ------------------------------------------------------------
+    //
+    // `update := UPDATE ident SET assignment (',' assignment)* WHERE expr`
+
+    fn update_of(sql: &str) -> UpdateStmt {
+        match ok(sql) {
+            Statement::Update(u) => u,
+            other => panic!("expected an UPDATE, got {other:?}"),
+        }
+    }
+
+    fn assign(column: &str, value: Literal) -> Assignment {
+        Assignment {
+            column: column.to_string(),
+            value,
+        }
+    }
+
+    #[test]
+    fn parses_update_with_one_assignment() {
+        assert_eq!(
+            ok("UPDATE docs SET category = 'archived' WHERE published_at < 5;"),
+            Statement::Update(UpdateStmt {
+                collection: "docs".to_string(),
+                assignments: vec![assign("category", Literal::Str("archived".into()))],
+                filter: *cmp(col("published_at"), CompareOp::Lt, int(5)),
+            })
+        );
+        // Keywords are case-insensitive; the collection keeps its source case.
+        assert_eq!(
+            update_of("update MyDocs set a = 1 where z < 2;").collection,
+            "MyDocs"
+        );
+    }
+
+    #[test]
+    fn parses_several_assignments_in_source_order() {
+        assert_eq!(
+            update_of("UPDATE docs SET a = 1, b = 2.5, c = 'x' WHERE z < 2;").assignments,
+            vec![
+                assign("a", Literal::Int(1)),
+                assign("b", Literal::Float(2.5)),
+                assign("c", Literal::Str("x".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn update_takes_the_full_where_grammar() {
+        assert_eq!(
+            update_of("UPDATE docs SET a = 1 WHERE b = 2 OR c = 3 AND d = 4;").filter,
+            Expr::Or(
+                cmp(col("b"), CompareOp::Eq, int(2)),
+                Box::new(Expr::And(
+                    cmp(col("c"), CompareOp::Eq, int(3)),
+                    cmp(col("d"), CompareOp::Eq, int(4)),
+                )),
+            )
+        );
+    }
+
+    #[test]
+    fn update_without_where_is_an_error() {
+        // No accidental whole-collection rewrite.
+        err("UPDATE docs SET a = 1;");
+        err("UPDATE docs SET a = 1 WHERE;");
+    }
+
+    #[test]
+    fn malformed_updates_are_errors() {
+        err("UPDATE docs a = 1 WHERE z < 2;"); // no SET
+        err("UPDATE SET a = 1 WHERE z < 2;"); // no collection
+        err("UPDATE docs SET WHERE z < 2;"); // empty SET list
+        err("UPDATE docs SET a WHERE z < 2;"); // assignment without a value
+        err("UPDATE docs SET a = 1, WHERE z < 2;"); // trailing comma
+        err("UPDATE docs SET a = 1 WHERE z < 2"); // no semicolon
     }
 
     // -- DELETE ------------------------------------------------------------

@@ -46,7 +46,33 @@ pub enum Statement {
     Search(SearchStmt),
     /// `DELETE FROM … WHERE …`
     Delete(DeleteStmt),
-    // EXTEND: Update(UpdateStmt).
+    /// `UPDATE … SET … WHERE …`
+    Update(UpdateStmt),
+}
+
+/// `UPDATE ident SET col = literal, … WHERE expr`.
+///
+/// The predicate is REQUIRED, for the same reason a DELETE's is: V-SQL has no
+/// statement that rewrites a whole collection by leaving a clause out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateStmt {
+    /// The collection named after `UPDATE`.
+    pub collection: String,
+    /// The `SET` list, in source order. Names are unresolved and values
+    /// untyped — both are the binder's to check.
+    pub assignments: Vec<Assignment>,
+    /// Which rows to rewrite.
+    pub filter: Expr,
+}
+
+/// One `column = value` in a `SET` list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Assignment {
+    /// Target column name, as written.
+    pub column: String,
+    /// The new value. A literal, not an expression: V-SQL has no arithmetic,
+    /// so `SET n = n + 1` is not in the language.
+    pub value: Literal,
 }
 
 /// `DELETE FROM ident WHERE expr`.

@@ -321,6 +321,8 @@ impl Target {
             Statement::Search(s) => Target::Existing(s.collection.clone()),
             // A DELETE's predicate is resolved against the collection it names.
             Statement::Delete(d) => Target::Existing(d.from.clone()),
+            // An UPDATE reads and rewrites rows of the collection it names.
+            Statement::Update(u) => Target::Existing(u.collection.clone()),
         }
     }
 }
