@@ -219,7 +219,7 @@ impl Parser {
 
     // -- one function per grammar rule -------------------------------------
 
-    /// `statement := (select | insert | create | search | delete) ';'`
+    /// `statement := (select | insert | create | search | delete | update) ';'`
     pub fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         let stmt = match self.peek() {
             Token::Select => Statement::Select(self.parse_select()?),
@@ -227,12 +227,12 @@ impl Parser {
             Token::Create => Statement::CreateCollection(self.parse_create()?),
             Token::Search => Statement::Search(self.parse_search()?),
             Token::Delete => Statement::Delete(self.parse_delete()?),
-            // EXTEND: dispatch Update on its leading keyword.
+            Token::Update => Statement::Update(self.parse_update()?),
             Token::Eof => return Err(self.error(ParseErrorKind::UnexpectedEof)),
             _ => {
                 let found = format!("{:?}", self.peek());
                 return Err(self.error(ParseErrorKind::UnexpectedToken {
-                    expected: "SELECT, INSERT, CREATE, SEARCH, or DELETE".to_string(),
+                    expected: "SELECT, INSERT, CREATE, SEARCH, DELETE, or UPDATE".to_string(),
                     found,
                 }));
             }
@@ -253,6 +253,45 @@ impl Parser {
             from,
             filter,
         })
+    }
+
+    /// `update := UPDATE ident SET assignment (',' assignment)* WHERE expr`
+    ///
+    /// `WHERE` is required, like a DELETE's: leaving it out would rewrite every
+    /// row, which is not a thing a user should be able to type by accident.
+    /// The predicate uses the shared expression grammar, so it means the same
+    /// here as in the SELECT that previews which rows are about to change.
+    fn parse_update(&mut self) -> Result<UpdateStmt, ParseError> {
+        self.expect(Token::Update)?;
+        let collection = self.expect_ident()?;
+        self.expect(Token::Set)?;
+
+        let mut assignments = vec![self.parse_assignment()?];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            assignments.push(self.parse_assignment()?);
+        }
+
+        self.expect(Token::Where)?;
+        let filter = self.parse_expr()?;
+        Ok(UpdateStmt {
+            collection,
+            assignments,
+            filter,
+        })
+    }
+
+    /// `assignment := ident '=' literal`
+    ///
+    /// The right-hand side is a LITERAL, not an expression. V-SQL has no
+    /// arithmetic, so `SET n = n + 1` is not in the language — and accepting
+    /// the expression grammar here would parse `SET a = b` into something the
+    /// binder could only reject with a worse message.
+    fn parse_assignment(&mut self) -> Result<Assignment, ParseError> {
+        let column = self.expect_ident()?;
+        self.expect(Token::Eq)?;
+        let value = self.parse_literal()?;
+        Ok(Assignment { column, value })
     }
 
     /// `delete := DELETE FROM ident WHERE expr`
