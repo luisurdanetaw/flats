@@ -959,10 +959,10 @@ impl Db {
         collection: u32,
         mut retire: RoaringBitmap,
         install: Vec<Install>,
-    ) -> Result<()> {
+    ) -> Result<Outcome> {
         let coll = self.collection(collection)?;
         if retire.is_empty() && install.is_empty() {
-            return Ok(());
+            return Ok(Outcome::Applied);
         }
         // Collapse contiguous runs into run containers before the bitmap is
         // encoded. A bulk DELETE retires long runs, and this is the difference
@@ -1008,14 +1008,16 @@ impl Db {
             coll.reserve_through(highest + 1);
         }
 
-        self.wal_handle()?
+        let _committed = self
+            .wal_handle()?
             .append(Record::Mutate {
                 collection,
                 retire: Bitmap(retire),
                 install,
             })
             .map_err(|e| self.wal_err(e))?;
-        Ok(())
+        // C6 reports the commit thread's actual verdict here.
+        Ok(Outcome::Applied)
     }
 
     /// Brute-force top-`k` search within `collection`. Tombstoned vectors are
@@ -2049,6 +2051,61 @@ mod tests {
         db.mutate(0, retire.clone(), vec![]).unwrap();
         db.mutate(0, retire, vec![]).unwrap();
 
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    /// The loser of the race has to LEARN it lost, or it silently drops the
+    /// user's update. Applied vs conflicted is the difference between "done"
+    /// and "read the row again and try once more".
+    #[test]
+    fn mutate_tells_its_caller_it_conflicted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap(); // ord 0
+
+        let retire: RoaringBitmap = [0u32].into_iter().collect();
+        assert_eq!(
+            db.mutate(0, retire.clone(), vec![install(1, 9.0)]).unwrap(),
+            Outcome::Applied,
+            "the winner applies"
+        );
+        assert_eq!(
+            db.mutate(0, retire, vec![install(2, 9.0)]).unwrap(),
+            Outcome::Conflicted,
+            "the loser is told, rather than silently dropped"
+        );
+    }
+
+    /// The second staleness clause, seen from outside. A record that already
+    /// applied gets redelivered by replay; its retires are long done, so the
+    /// first clause alone would call it stale. Its installs are live, so it
+    /// must be re-applied idempotently instead — otherwise a store that had
+    /// not yet absorbed it would never get the row.
+    #[test]
+    fn a_redelivered_mutate_reports_applied_not_conflicted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap(); // ord 0
+
+        let record = Record::Mutate {
+            collection: 0,
+            retire: Bitmap([0u32].into_iter().collect()),
+            install: vec![install(1, 9.0)],
+        };
+        let handle = db.wal.as_ref().expect("wal present").handle();
+        assert_eq!(
+            handle.append(record.clone()).unwrap().outcome,
+            Outcome::Applied
+        );
+        // The same record again — exactly what recovery delivers.
+        assert_eq!(
+            handle.append(record).unwrap().outcome,
+            Outcome::Applied,
+            "a record whose installs are live is redone, not skipped"
+        );
         assert_eq!(
             db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
             vec![1]
