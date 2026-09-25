@@ -1900,6 +1900,60 @@ mod tests {
     /// conflicted one does not. So a statement whose conflict was swallowed
     /// instead of retried shows up as a missing bump, which is exactly the
     /// silent lost update this has to rule out.
+    /// Full replacement, the statement from the roadmap. Proving the embedding
+    /// REALLY changed takes two searches: the row must be found by its new
+    /// vector, and a search for its old one must now prefer a different row.
+    #[test]
+    fn update_replaces_a_named_rows_embedding() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db); // alice [1.0,0,0,0] at id 0, bob [0.9,0,0,0] at id 1
+
+        update(
+            &db,
+            "UPDATE docs SET vector = [0.0, 0.0, 0.0, 1.0], title = 'v2' WHERE id = 0;",
+        );
+
+        // Found by the NEW embedding...
+        assert_eq!(
+            authors(
+                db.execute("SEARCH TOP 1 NEAREST TO [0.0, 0.0, 0.0, 1.0] FROM docs;")
+                    .expect("the search runs")
+            ),
+            vec!["alice"]
+        );
+        // ...and no longer by the old one: bob is now the nearest to it.
+        assert_eq!(
+            authors(
+                db.execute("SEARCH TOP 1 NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM docs;")
+                    .expect("the search runs")
+            ),
+            vec!["bob"],
+            "alice's old embedding is gone, not merely shadowed"
+        );
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn a_replaced_embedding_survives_reopen() {
+        let (dir, db) = docs_db();
+        seed_filterable(&db);
+        update(
+            &db,
+            "UPDATE docs SET vector = [0.0, 0.0, 0.0, 1.0] WHERE id = 0;",
+        );
+        drop(db); // no closing checkpoint: the WAL must carry it
+
+        let db = Db::open(dir.path(), &[], DbOptions::default()).expect("reopen");
+        assert_eq!(
+            authors(
+                db.execute("SEARCH TOP 1 NEAREST TO [0.0, 0.0, 0.0, 1.0] FROM docs;")
+                    .expect("the search runs")
+            ),
+            vec!["alice"]
+        );
+        db.close().unwrap();
+    }
+
     #[test]
     fn concurrent_updates_through_execute_all_take_effect() {
         use std::sync::{Arc, Barrier};

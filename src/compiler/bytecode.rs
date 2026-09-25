@@ -82,8 +82,11 @@
 //                                     commit points instead of one.
 //                                     With a SET list it is UPDATE: each matched
 //                                     row is copied to a fresh ordinal with the
-//                                     assignments applied (vector unchanged) and
-//                                     the original retired, in the same record.
+//                                     assignments applied and the original
+//                                     retired, in the same record. A replacement
+//                                     embedding rides in the optional #vector
+//                                     operand; without it each copy keeps its
+//                                     own.
 //
 // WHERE — predicates are SET ALGEBRA, not per-row comparisons
 //   BitmapEq     collection, colId, valueReg, dst
@@ -504,6 +507,13 @@ pub enum Op {
         /// edited copy at a fresh ordinal, retire the original — still ONE
         /// record. Without it, the matched rows are simply retired.
         set: Option<ConstId>,
+        /// A replacement embedding in the constant pool, or `None` to copy each
+        /// row's own across.
+        ///
+        /// Separate from `set` because a vector is not a scalar `Value`, and
+        /// because the binder only permits it when the statement names ONE row
+        /// by ordinal — one statement carries one embedding.
+        vector: Option<ConstId>,
     },
     /// Provision a collection. One fat op — nothing about DDL varies at runtime.
     CreateCollection {
@@ -623,9 +633,14 @@ impl Program {
                 Op::BitmapId { dst, .. } => {
                     self.check_reg(at, *dst)?;
                 }
-                Op::Mutate { retire, set, .. } => {
+                Op::Mutate {
+                    retire,
+                    set,
+                    vector,
+                    ..
+                } => {
                     self.check_reg(at, *retire)?;
-                    if let Some(id) = set {
+                    for id in set.iter().chain(vector.iter()) {
                         self.check_const(at, *id)?;
                     }
                 }

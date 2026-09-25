@@ -824,6 +824,7 @@ impl Vm {
                     collection,
                     retire,
                     set,
+                    vector,
                 } => {
                     let retire = *retire;
                     let db = db.ok_or(ExecError::Detached { op: "Mutate" })?;
@@ -1818,6 +1819,7 @@ mod tests {
                     collection: "docs".into(),
                     retire: Reg(1),
                     set: None,
+                    vector: None,
                 },
                 Op::Halt,
             ],
@@ -1857,6 +1859,7 @@ mod tests {
                     collection: "docs".into(),
                     retire: Reg(1),
                     set: Some(set),
+                    vector: None,
                 },
                 Op::Halt,
             ],
@@ -1938,6 +1941,7 @@ mod tests {
                     collection: "docs".into(),
                     retire: Reg(0),
                     set: None,
+                    vector: None,
                 },
                 Op::Halt,
             ],
@@ -1960,6 +1964,7 @@ mod tests {
                     collection: "docs".into(),
                     retire: Reg(5),
                     set: None,
+                    vector: None,
                 },
                 Op::Halt,
             ],

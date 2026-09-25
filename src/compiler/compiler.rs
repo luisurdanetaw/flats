@@ -617,6 +617,7 @@ impl<'a> Compiler<'a> {
                     collection: update.collection.clone(),
                     retire,
                     set: Some(set),
+                    vector: None,
                 });
             }
 
@@ -631,6 +632,7 @@ impl<'a> Compiler<'a> {
                     retire,
                     // No SET list: a DELETE only retires.
                     set: None,
+                    vector: None,
                 });
             }
         }
@@ -896,6 +898,7 @@ mod tests {
                     collection,
                     retire,
                     set: Some(set),
+                    vector: None,
                 },
                 Op::Halt,
             ] => {
@@ -918,6 +921,40 @@ mod tests {
         );
         assert_eq!(program.n_cursors, 0, "an UPDATE walks no rows");
         program.validate().expect("an UPDATE program validates");
+    }
+
+    #[test]
+    fn a_replacement_vector_is_interned_beside_the_set_list() {
+        let plan = LogicalPlan::Update(Update {
+            collection: "docs".to_string(),
+            schema: docs_bind_schema(),
+            assignments: vec![text_assignment("title", 2, "v2")],
+            vector: Some(vec![0.5; 768]),
+            predicate: BoundPredicate::Id(7),
+        });
+        let program = compile(plan, Some(&docs_meta_schema())).expect("an UPDATE compiles");
+
+        let (set, vector) = match program.ops.as_slice() {
+            [
+                Op::BitmapId { ordinal: 7, .. },
+                Op::Mutate {
+                    set: Some(set),
+                    vector: Some(vector),
+                    ..
+                },
+                Op::Halt,
+            ] => (*set, *vector),
+            other => panic!("unexpected program: {other:?}"),
+        };
+        assert_eq!(
+            program.consts.get(set),
+            Some(&Const::Assignments(vec![(1, MetaValue::Text("v2".into()))]))
+        );
+        assert_eq!(
+            program.consts.get(vector),
+            Some(&Const::Vector(vec![0.5; 768])),
+            "the embedding rides in the pool, not in the SET list"
+        );
     }
 
     #[test]
@@ -981,6 +1018,7 @@ mod tests {
                     collection: "docs".to_string(),
                     retire: Reg(1),
                     set: None,
+                    vector: None,
                 },
                 Op::Halt,
             ]
@@ -1010,6 +1048,7 @@ mod tests {
                 collection: "docs".to_string(),
                 retire: or_dst,
                 set: None,
+                    vector: None,
             },
             "Mutate retires the combined bitmap, not either operand"
         );
