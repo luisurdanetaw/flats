@@ -268,6 +268,8 @@ impl<'a> Compiler<'a> {
     /// the WHERE section of the `bytecode` module header.
     fn emit_predicate(&mut self, pred: &BoundPredicate, collection: &str) -> Reg {
         match pred {
+            // Emission lands in E4. The binder does not produce this yet.
+            BoundPredicate::Id(_) => unreachable!("id predicates are not emitted yet"),
             BoundPredicate::And(l, r) => {
                 let a = self.emit_predicate(l, collection);
                 let b = self.emit_predicate(r, collection);

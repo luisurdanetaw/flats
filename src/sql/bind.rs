@@ -157,6 +157,14 @@ pub enum BoundPredicate {
         /// The comparand, type-checked against the column.
         value: TypedValue,
     },
+    /// `id = <n>` — ONE row, named by its ordinal.
+    ///
+    /// Needs no index lookup: the ordinal IS the answer, so this resolves to a
+    /// singleton bitmap intersected with the query's liveness snapshot. The
+    /// intersection is not optional — a retired row satisfies no predicate, the
+    /// same rule the complement in `BitmapNot` follows — so `id = 7` matches
+    /// nothing once row 7 is gone.
+    Id(u64),
     /// Both sides must hold — bitmap intersection.
     And(Box<BoundPredicate>, Box<BoundPredicate>),
     /// Either side may hold — bitmap union.
@@ -1204,6 +1212,73 @@ mod tests {
             pred("published_at < 4 OR published_at = 9"),
             BoundPredicate::Or(..)
         ));
+    }
+
+    // -- the id pseudo-column in predicates --------------------------------
+
+    #[test]
+    fn id_binds_to_an_ordinal_predicate() {
+        assert_eq!(pred("id = 7"), BoundPredicate::Id(7));
+        // Flipped, like every other comparison.
+        assert_eq!(pred("7 = id"), BoundPredicate::Id(7));
+        // Case-insensitive, like `RETURNING id`.
+        assert_eq!(pred("ID = 7"), BoundPredicate::Id(7));
+    }
+
+    #[test]
+    fn id_composes_with_other_predicates() {
+        assert_eq!(
+            pred("id = 7 AND author = 'alice'"),
+            BoundPredicate::And(
+                Box::new(BoundPredicate::Id(7)),
+                Box::new(compare(
+                    "author",
+                    1,
+                    CompareOp::Eq,
+                    Literal::Str("alice".into())
+                )),
+            )
+        );
+    }
+
+    /// Only equality. An ordinal is an identity, not a user-meaningful
+    /// ordering, and `id < 7` would invite reading it as "the first 7 rows".
+    #[test]
+    fn ordered_comparisons_on_id_are_refused() {
+        for clause in ["id < 7", "id >= 7", "id != 7"] {
+            assert!(
+                matches!(pred_err(clause), BindError::UnsupportedPredicate { .. }),
+                "`{clause}` must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn id_takes_an_integer_and_nothing_else() {
+        assert!(matches!(
+            pred_err("id = 'seven'"),
+            BindError::TypeMismatch { .. }
+        ));
+        assert!(matches!(
+            pred_err("id = 1.5"),
+            BindError::TypeMismatch { .. }
+        ));
+        // Negative ordinals do not exist.
+        assert!(matches!(
+            pred_err("id = -1"),
+            BindError::UnsupportedPredicate { .. }
+        ));
+    }
+
+    /// A collection with its own `id` column would be ambiguous; pseudo-columns
+    /// win, exactly as they do in a projection.
+    #[test]
+    fn id_still_projects() {
+        let bound = bound_search(&format!(
+            "SEARCH TOP 1 NEAREST TO {} FROM docs RETURNING id;",
+            vec_lit(768)
+        ));
+        assert_eq!(bound.projection, vec![Projected::Pseudo(Pseudo::Id)]);
     }
 
     // -- UPDATE ------------------------------------------------------------
