@@ -156,6 +156,32 @@ impl Collection {
         }
     }
 
+    /// Reserve `count` CONSECUTIVE ordinals, or fail if they would not fit.
+    ///
+    /// One CAS for the whole run, which is what makes an UPDATE's capacity
+    /// check meaningful: a per-row loop could pass its check, allocate half
+    /// the rows, and then fail — leaving a statement that must be abandoned
+    /// with ordinals already burned. Either the whole run is reserved or
+    /// nothing is, and the check happens before the record is built at all.
+    fn alloc_ordinals(&self, count: u64) -> Result<u64> {
+        loop {
+            let cur = self.next_ordinal.load(Ordering::Acquire);
+            let end = cur
+                .checked_add(count)
+                .filter(|end| *end <= self.config.capacity as u64)
+                .ok_or(Error::CapacityExceeded {
+                    capacity: self.config.capacity,
+                })?;
+            if self
+                .next_ordinal
+                .compare_exchange_weak(cur, end, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(cur);
+            }
+        }
+    }
+
     /// Reserve the next ordinal, or fail if the collection is at capacity.
     /// CAS loop so a full collection never overshoots the high-water mark.
     fn alloc_ordinal(&self) -> Result<u64> {
@@ -1038,9 +1064,80 @@ impl Db {
         matched: &RoaringBitmap,
         set: &[(ColumnId, Value)],
     ) -> Result<Outcome> {
-        let _ = (collection, matched, set);
-        // D6 does the copying.
-        Ok(Outcome::Applied)
+        let coll = self.collection(collection)?;
+        // A predicate matching no rows is a successful no-op, like a DELETE's:
+        // nothing to copy, nothing to log, no fsync spent.
+        if matched.is_empty() {
+            return Ok(Outcome::Applied);
+        }
+        self.check_poison()?;
+
+        let tuples = self
+            .tuple_reader(collection)
+            .ok_or(Error::UnknownCollection { id: collection })?;
+        let vectors = self
+            .reader(collection)
+            .ok_or(Error::UnknownCollection { id: collection })?;
+        // Every scalar column: an UPDATE rewrites the WHOLE row, so the copy
+        // must carry the columns it does not change as well as the ones it does.
+        let scalars: Vec<ColumnId> = (0..coll.config.schema.columns.len() as ColumnId).collect();
+
+        // 1. READ the matched rows and build their edited copies. Nothing is
+        //    logged yet, and no ordinal is claimed — a failure here costs
+        //    nothing but the work.
+        let mut copies: Vec<(Vec<f32>, Row)> = Vec::with_capacity(matched.len() as usize);
+        for ordinal in matched {
+            let ordinal = Ordinal(ordinal);
+            let values = match tuples.get(ordinal, &scalars)? {
+                tuples::RowGet::Live(values) => values,
+                // The caller's bitmap came from a liveness snapshot, so an
+                // ordinal in it that the tuple store never saw means those two
+                // disagree — the same consistency failure `SnapshotRowMissing`
+                // exists to catch, not something to skip past.
+                tuples::RowGet::Missing => {
+                    return Err(Error::SnapshotRowMissing {
+                        collection,
+                        ordinal: ordinal.0,
+                    });
+                }
+            };
+            let vector = vectors
+                .vector_at(ordinal)
+                .ok_or(Error::SnapshotRowMissing {
+                    collection,
+                    ordinal: ordinal.0,
+                })?
+                .to_vec();
+
+            let mut row: Row = values
+                .into_iter()
+                .enumerate()
+                .map(|(id, value)| (id as ColumnId, value))
+                .collect();
+            // Overrides in order: a column assigned twice takes its last value.
+            for (column, value) in set {
+                row[*column as usize] = (*column, value.clone());
+            }
+            copies.push((vector, row));
+        }
+
+        // 2. CLAIM the ordinals for the copies — one reservation, capacity
+        //    checked, before any record exists.
+        let start = coll.alloc_ordinals(copies.len() as u64)?;
+        let install: Vec<Install> = copies
+            .into_iter()
+            .enumerate()
+            .map(|(i, (vector, metadata))| Install {
+                ordinal: start + i as u64,
+                vector,
+                metadata,
+            })
+            .collect();
+
+        // 3. ONE record: retire the originals, install the copies. If the rows
+        //    moved on while we were reading them, the commit thread says so and
+        //    the caller retries — see `Outcome`.
+        self.mutate(collection, matched.clone(), install)
     }
 
     /// Brute-force top-`k` search within `collection`. Tombstoned vectors are
