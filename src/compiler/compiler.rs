@@ -91,6 +91,12 @@ pub fn compile(plan: LogicalPlan, schema: Option<&Schema>) -> Result<Program, Co
     // rather than in the CREATE arm keeps `emit_node` — and the recursive body
     // closures threaded through it — infallible, so the `?` never has to travel
     // back up through a `FnMut`.
+    if plan_predicate(&plan).is_some_and(contains_id) {
+        return Err(CompileError::Unsupported {
+            statement: "WHERE id",
+        });
+    }
+
     let created = match &plan {
         LogicalPlan::CreateCollection(create) => Some(to_metadata_schema(&create.schema)?),
         _ => None,
@@ -129,6 +135,13 @@ pub enum CompileError {
     /// collection's catalog schema — there is nothing to translate its
     /// declaration ordinals through.
     MissingSchema,
+    /// The statement binds, but this build cannot emit code for it yet. The
+    /// compiler's counterpart to `BindError::Unbound`: a clean error in the
+    /// window between a bound form landing and its emission landing.
+    Unsupported {
+        /// Which construct.
+        statement: &'static str,
+    },
 }
 
 impl From<SchemaError> for CompileError {
@@ -144,6 +157,9 @@ impl fmt::Display for CompileError {
             CompileError::MissingSchema => {
                 write!(f, "no catalog schema for the target collection")
             }
+            CompileError::Unsupported { statement } => {
+                write!(f, "{statement} binds but cannot be compiled yet")
+            }
         }
     }
 }
@@ -152,8 +168,29 @@ impl std::error::Error for CompileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             CompileError::Schema(e) => Some(e),
-            CompileError::MissingSchema => None,
+            CompileError::MissingSchema | CompileError::Unsupported { .. } => None,
         }
+    }
+}
+
+/// The predicate a plan node carries, if it has one.
+fn plan_predicate(plan: &LogicalPlan) -> Option<&BoundPredicate> {
+    match plan {
+        LogicalPlan::Scan(scan) => scan.predicate.as_ref(),
+        LogicalPlan::Knn(knn) => knn.predicate.as_ref(),
+        LogicalPlan::Delete(delete) => Some(&delete.predicate),
+        LogicalPlan::Update(update) => Some(&update.predicate),
+        LogicalPlan::Project(project) => plan_predicate(&project.input),
+        LogicalPlan::Insert(_) | LogicalPlan::CreateCollection(_) => None,
+    }
+}
+
+/// Whether a predicate names a row by ordinal anywhere inside it.
+fn contains_id(pred: &BoundPredicate) -> bool {
+    match pred {
+        BoundPredicate::Id(_) => true,
+        BoundPredicate::And(l, r) | BoundPredicate::Or(l, r) => contains_id(l) || contains_id(r),
+        BoundPredicate::Compare { .. } => false,
     }
 }
 
@@ -268,8 +305,10 @@ impl<'a> Compiler<'a> {
     /// the WHERE section of the `bytecode` module header.
     fn emit_predicate(&mut self, pred: &BoundPredicate, collection: &str) -> Reg {
         match pred {
-            // Emission lands in E4. The binder does not produce this yet.
-            BoundPredicate::Id(_) => unreachable!("id predicates are not emitted yet"),
+            // `compile` refuses a plan containing one before emission begins
+            // (E4 replaces both halves), so this is unreachable from a
+            // compiled plan rather than a panic a user can reach.
+            BoundPredicate::Id(_) => unreachable!("compile refuses id predicates before emission"),
             BoundPredicate::And(l, r) => {
                 let a = self.emit_predicate(l, collection);
                 let b = self.emit_predicate(r, collection);
@@ -1000,6 +1039,45 @@ mod tests {
                 set: None,
             },
             "Mutate retires the combined bitmap, not either operand"
+        );
+    }
+
+    #[test]
+    fn an_id_predicate_emits_a_singleton_bitmap() {
+        // No comparand register and no index lookup: the ordinal is the whole
+        // operand, so it rides in the op itself.
+        let ops = filtered_ops(BoundPredicate::Id(7));
+        assert_eq!(
+            ops[0],
+            Op::BitmapId {
+                collection: "docs".to_string(),
+                ordinal: 7,
+                dst: Reg(0),
+            }
+        );
+        assert_eq!(
+            ops[1],
+            Op::OpenRead {
+                cur: Cursor(0),
+                collection: "docs".to_string(),
+                filter: Some(Reg(0)),
+            }
+        );
+    }
+
+    #[test]
+    fn an_id_predicate_composes_with_the_index_ones() {
+        let ops = filtered_ops(BoundPredicate::And(
+            Box::new(BoundPredicate::Id(7)),
+            Box::new(cmp_pred("published_at", 3, CompareOp::Lt, 2)),
+        ));
+        assert!(
+            matches!(ops[0], Op::BitmapId { ordinal: 7, .. }),
+            "the id half emits its own bitmap"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op, Op::BitmapAnd { .. })),
+            "and the two are intersected like any other AND"
         );
     }
 

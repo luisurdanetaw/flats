@@ -1743,6 +1743,44 @@ mod tests {
         assert_eq!(remaining(&db).len(), 4, "a refused DELETE removes nothing");
         db.close().unwrap();
     }
+    // -- WHERE id = <n> ------------------------------------------------------
+
+    #[test]
+    fn a_row_can_be_named_by_its_id() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db); // ordinals 0..3, authors alice/bob/carol/dave
+
+        assert_eq!(where_authors(&db, "id = 2"), vec!["carol"]);
+        assert_eq!(where_authors(&db, "id = 0"), vec!["alice"]);
+        // Past the high-water mark: no row, no error.
+        assert!(where_authors(&db, "id = 999").is_empty());
+        db.close().unwrap();
+    }
+
+    /// An ordinal names a row, not a slot: once the row is retired, naming it
+    /// matches nothing. Otherwise `WHERE id = 2` would be a back door around
+    /// the liveness snapshot every other predicate goes through.
+    #[test]
+    fn a_retired_row_cannot_be_named_by_its_id() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        delete(&db, "DELETE FROM docs WHERE id = 2;");
+        assert!(where_authors(&db, "id = 2").is_empty());
+        assert_eq!(remaining(&db).len(), 3);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn an_id_predicate_composes_with_a_column_one() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        assert_eq!(where_authors(&db, "id = 1 AND published_at = 5"), vec!["bob"]);
+        assert!(where_authors(&db, "id = 1 AND published_at = 9").is_empty());
+        db.close().unwrap();
+    }
+
     // -- UPDATE, end to end through the front door ---------------------------
 
     /// Run an UPDATE and insist it behaves like every mutation: no rows out.

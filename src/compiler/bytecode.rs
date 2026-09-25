@@ -93,6 +93,9 @@
 //   BitmapAnd    rA, rB, dst          intersection
 //   BitmapOr     rA, rB, dst          union
 //   BitmapNot    collection, r, dst   complement WITHIN the live set
+//   BitmapId     collection, ordinal, dst
+//                                     the one ordinal, intersected with the
+//                                     live set — `WHERE id = <n>`
 //
 //   There are deliberately NO `Lt`/`Ge`/`JumpIfFalse` opcodes and no per-row
 //   predicate evaluation. Every V-SQL predicate is `col <op> literal` joined by
@@ -454,6 +457,20 @@ pub enum Op {
         /// Destination register.
         dst: Reg,
     },
+    /// The singleton bitmap for one ordinal — how `WHERE id = <n>` is built.
+    ///
+    /// No index lookup: the ordinal IS the answer. It is still intersected with
+    /// the live set, because a retired row satisfies no predicate — the same
+    /// rule `BitmapNot` follows — so `id = 7` matches nothing once row 7 is
+    /// gone.
+    BitmapId {
+        /// Collection whose live set bounds the result.
+        collection: String,
+        /// The ordinal named by the predicate.
+        ordinal: u64,
+        /// Destination register (receives the bitmap).
+        dst: Reg,
+    },
     /// Complement of a bitmap WITHIN THE LIVE SET — how `!=` is built.
     ///
     /// Complementing against the live rows rather than the whole ordinal space
@@ -601,6 +618,9 @@ impl Program {
                 }
                 Op::BitmapNot { src, dst, .. } => {
                     self.check_reg(at, *src)?;
+                    self.check_reg(at, *dst)?;
+                }
+                Op::BitmapId { dst, .. } => {
                     self.check_reg(at, *dst)?;
                 }
                 Op::Mutate { retire, set, .. } => {
