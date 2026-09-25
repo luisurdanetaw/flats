@@ -1008,7 +1008,7 @@ impl Db {
             coll.reserve_through(highest + 1);
         }
 
-        let _committed = self
+        let committed = self
             .wal_handle()?
             .append(Record::Mutate {
                 collection,
@@ -1016,8 +1016,10 @@ impl Db {
                 install,
             })
             .map_err(|e| self.wal_err(e))?;
-        // C6 reports the commit thread's actual verdict here.
-        Ok(Outcome::Applied)
+        // `Conflicted` is a normal return, not an error: the record committed,
+        // the commit thread judged it stale, and the caller's move is to read
+        // the rows again and retry. Ordinals reserved above stay burned.
+        Ok(committed.outcome)
     }
 
     /// Brute-force top-`k` search within `collection`. Tombstoned vectors are
