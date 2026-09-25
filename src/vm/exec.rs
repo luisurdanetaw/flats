@@ -74,6 +74,7 @@ use crate::metadata::common::{Ordinal, Schema, Value};
 use crate::metadata::index::{self as meta, LiveSet};
 use crate::vm::record::{Record, SplitError, split_record};
 use crate::vm::value;
+use crate::wal::wal::Outcome;
 
 /// A value in a register.
 ///
@@ -832,7 +833,14 @@ impl Vm {
                             .mutate(id, bitmap.as_ref().clone(), Vec::new())
                             .map_err(ExecError::Engine)?,
                     };
-                    let _ = outcome; // D12 turns a conflict into a retry.
+                    // A conflicted statement did nothing: the rows it read
+                    // moved on while it was being built. The VM cannot fix
+                    // that — the predicate has to be resolved again from a
+                    // fresh snapshot — so it hands the decision up to
+                    // `Db::execute`, which re-runs the program.
+                    if outcome == Outcome::Conflicted {
+                        return Err(ExecError::Conflict);
+                    }
                 }
 
                 // -- DDL: one fat op, nothing about it varies at runtime -------
@@ -1065,6 +1073,11 @@ pub enum ExecError {
         at: usize,
     },
     /// `KnnScan`'s query register does not hold a vector.
+    /// A copy-on-write statement was built from rows that moved on before it
+    /// committed. Not a failure, and never surfaced to a caller: `Db::execute`
+    /// catches it, re-resolves the predicate against a fresh snapshot, and runs
+    /// the statement again.
+    Conflict,
     /// A register a bitmap op read does not hold a bitmap.
     NotABitmap {
         /// The offending register.
@@ -1213,6 +1226,9 @@ impl fmt::Display for ExecError {
             ExecError::Engine(e) => write!(f, "{e}"),
             ExecError::NotAVector { reg } => {
                 write!(f, "register r{reg} does not hold a query vector")
+            }
+            ExecError::Conflict => {
+                write!(f, "the rows this statement read were rewritten; retry it")
             }
             ExecError::NotABitmap { reg } => {
                 write!(f, "register r{reg} does not hold a bitmap")
@@ -1803,10 +1819,7 @@ mod tests {
         let mut consts = ConstPool::new();
         let needle = consts.add(Const::Str(author.into()));
         // title is ColumnId 1 in the docs storage schema.
-        let set = consts.add(Const::Assignments(vec![(
-            1,
-            Value::Text(new_title.into()),
-        )]));
+        let set = consts.add(Const::Assignments(vec![(1, Value::Text(new_title.into()))]));
         Program {
             ops: vec![
                 Op::String {

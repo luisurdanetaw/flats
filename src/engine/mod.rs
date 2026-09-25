@@ -2332,7 +2332,12 @@ mod tests {
 
     /// Read a live row's (a, c) values plus its vector, by ordinal.
     fn row_at(db: &Db, ordinal: u32) -> (Vec<Value>, Vec<f32>) {
-        let values = match db.tuple_reader(0).unwrap().get(Ordinal(ordinal), &[0, 1]).unwrap() {
+        let values = match db
+            .tuple_reader(0)
+            .unwrap()
+            .get(Ordinal(ordinal), &[0, 1])
+            .unwrap()
+        {
             tuples::RowGet::Live(values) => values,
             other => panic!("ordinal {ordinal} is not readable: {other:?}"),
         };
@@ -2361,7 +2366,11 @@ mod tests {
         assert_eq!(outcome, Outcome::Applied);
 
         let live: Vec<u32> = db.live_snapshot(0).unwrap().iter().collect();
-        assert_eq!(live, vec![1, 3, 4], "originals retired, copies at fresh ordinals");
+        assert_eq!(
+            live,
+            vec![1, 3, 4],
+            "originals retired, copies at fresh ordinals"
+        );
 
         // The untouched row is exactly as it was.
         assert_eq!(
@@ -2476,7 +2485,8 @@ mod tests {
         // Capacity 8, five rows used: four copies need 5..9, one past the end.
         let db = Db::open(dir.path(), &[cfg_meta(0, 2, 8)], manual_opts()).unwrap();
         for n in 0..5i64 {
-            db.insert(0, &[n as f32, 0.0], meta_row(n, "draft")).unwrap();
+            db.insert(0, &[n as f32, 0.0], meta_row(n, "draft"))
+                .unwrap();
         }
 
         let wal = dir.path().join("wal.log");
@@ -2494,7 +2504,10 @@ mod tests {
         );
         assert_eq!(db.live_snapshot(0).unwrap().len(), 5, "no row changed");
         // The allocator did not move either: the next insert takes ordinal 5.
-        assert_eq!(db.insert(0, &[9.0, 0.0], meta_row(9, "draft")).unwrap(), Ordinal(5));
+        assert_eq!(
+            db.insert(0, &[9.0, 0.0], meta_row(9, "draft")).unwrap(),
+            Ordinal(5)
+        );
     }
 
     #[test]
@@ -2503,7 +2516,8 @@ mod tests {
         // Capacity 9, five rows used, four copies land at 5..9 exactly.
         let db = Db::open(dir.path(), &[cfg_meta(0, 2, 9)], manual_opts()).unwrap();
         for n in 0..5i64 {
-            db.insert(0, &[n as f32, 0.0], meta_row(n, "draft")).unwrap();
+            db.insert(0, &[n as f32, 0.0], meta_row(n, "draft"))
+                .unwrap();
         }
 
         let matched: RoaringBitmap = [0u32, 1, 2, 3].into_iter().collect();

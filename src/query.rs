@@ -61,6 +61,14 @@ use crate::sql::bind::{BoundStatement, Projected};
 use crate::sql::{BindError, ParseError, Statement, analyze, parse, plan};
 use crate::vm::exec::{ExecError, OutputRow, Vm};
 
+/// How many times a conflicted write is run again before giving up.
+///
+/// A copy-on-write UPDATE that loses a race did nothing and is simply re-run
+/// against a fresh snapshot, so retrying is cheap and almost always settles on
+/// the first one. The cap exists so pathological contention surfaces as
+/// `Error::WriteConflict` instead of spinning forever.
+const MAX_WRITE_ATTEMPTS: usize = 10;
+
 /// A lazy stream of result rows.
 ///
 /// Owns the suspended [`Vm`] that produces them, and borrows nothing — see the
@@ -147,6 +155,17 @@ impl Iterator for RowStream {
 /// `ParseError`, so one can never surface here on its own.
 #[derive(Debug)]
 pub enum Error {
+    /// A write kept losing to other writers and ran out of attempts.
+    ///
+    /// A copy-on-write UPDATE that finds its rows already rewritten is retried
+    /// from the top against a fresh snapshot. This is what a caller hears when
+    /// that keeps happening — sustained contention on the same rows, which is
+    /// a real condition rather than something to hide behind an unbounded
+    /// loop. Retrying the statement is a reasonable response.
+    WriteConflict {
+        /// How many times it was run before giving up.
+        attempts: usize,
+    },
     /// Bad syntax (lexing included).
     Parse(ParseError),
     /// Names, types, or arity: the statement parsed but does not mean anything.
@@ -187,6 +206,10 @@ impl From<ExecError> for Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Error::WriteConflict { attempts } => write!(
+                f,
+                "write conflict: the statement lost to concurrent writers {attempts} times"
+            ),
             Error::Parse(e) => write!(f, "parse error: {e}"),
             Error::Bind(e) => write!(f, "bind error: {e}"),
             Error::Compile(e) => write!(f, "compile error: {e}"),
@@ -207,7 +230,7 @@ impl std::error::Error for Error {
             Error::Validate(e) => Some(e),
             Error::Engine(e) => Some(e),
             Error::Exec(e) => Some(e),
-            Error::Unsupported { .. } => None,
+            Error::Unsupported { .. } | Error::WriteConflict { .. } => None,
         }
     }
 }
@@ -248,6 +271,7 @@ impl Db {
             BoundStatement::Insert(_)
                 | BoundStatement::CreateCollection(_)
                 | BoundStatement::Delete(_)
+                | BoundStatement::Update(_)
         );
 
         // 3. PLAN — infallible: binding already validated everything, so this
@@ -283,14 +307,42 @@ impl Db {
         //    unreachable from public input.
         reject_unsupported(&program)?;
 
-        // 6. BUILD — `Vm::new` runs `Program::validate`.
-        let mut vm = Vm::new(program)?;
+        // 6. BUILD — `Vm::new` runs `Program::validate`. The program is kept
+        //    so a conflicted write can be run again from the top.
+        let mut vm = Vm::new(program.clone())?;
 
         if mutates {
             // EAGER: drain inside `execute`. A mutation yields no rows, and its
             // side effect must be durable before this returns.
-            while vm.step(self)?.is_some() {}
-            Ok(RowStream::empty())
+            //
+            // A copy-on-write UPDATE can come back conflicted: the rows it read
+            // were rewritten or retired by another writer between the read and
+            // the commit, so it did nothing. Retrying means running the WHOLE
+            // program again — the predicate must be resolved against a fresh
+            // snapshot, since which rows match may have changed — so a fresh
+            // `Vm` runs the same compiled program. Callers never see the
+            // conflict, only the applied result.
+            for attempt in 1..=MAX_WRITE_ATTEMPTS {
+                match (|| -> Result<(), Error> {
+                    while vm.step(self)?.is_some() {}
+                    Ok(())
+                })() {
+                    Ok(()) => return Ok(RowStream::empty()),
+                    Err(Error::Exec(ExecError::Conflict)) if attempt < MAX_WRITE_ATTEMPTS => {
+                        vm = Vm::new(program.clone())?;
+                    }
+                    // Out of attempts. Sustained contention on one row is a
+                    // real condition a caller has to hear about rather than
+                    // have hidden behind an unbounded loop.
+                    Err(Error::Exec(ExecError::Conflict)) => {
+                        return Err(Error::WriteConflict {
+                            attempts: MAX_WRITE_ATTEMPTS,
+                        });
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            unreachable!("the loop returns on its last attempt")
         } else {
             // LAZY: open the cursors, then detach. Everything after this pulls
             // without a `Db`.
@@ -1720,7 +1772,10 @@ mod tests {
         let (_dir, db) = docs_db();
         seed_filterable(&db);
 
-        update(&db, "UPDATE docs SET author = 'archived' WHERE published_at = 1;");
+        update(
+            &db,
+            "UPDATE docs SET author = 'archived' WHERE published_at = 1;",
+        );
 
         assert_eq!(
             rows_of(&db),
@@ -1742,7 +1797,10 @@ mod tests {
         let (_dir, db) = docs_db();
         seed_filterable(&db); // alice's vector is [1.0, 0, 0, 0]
 
-        update(&db, "UPDATE docs SET author = 'archived' WHERE published_at = 1;");
+        update(
+            &db,
+            "UPDATE docs SET author = 'archived' WHERE published_at = 1;",
+        );
 
         let found = authors(
             db.execute("SEARCH TOP 1 NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM docs;")
@@ -1763,7 +1821,10 @@ mod tests {
 
         let wal = dir.path().join("wal.log");
         let before = std::fs::metadata(&wal).expect("wal exists").len();
-        update(&db, "UPDATE docs SET author = 'x' WHERE published_at = 404;");
+        update(
+            &db,
+            "UPDATE docs SET author = 'x' WHERE published_at = 404;",
+        );
 
         assert_eq!(std::fs::metadata(&wal).expect("wal exists").len(), before);
         assert_eq!(rows_of(&db).len(), 4);
@@ -1774,7 +1835,10 @@ mod tests {
     fn an_update_survives_reopen() {
         let (dir, db) = docs_db();
         seed_filterable(&db);
-        update(&db, "UPDATE docs SET author = 'archived' WHERE published_at = 9;");
+        update(
+            &db,
+            "UPDATE docs SET author = 'archived' WHERE published_at = 9;",
+        );
         drop(db); // no closing checkpoint: the WAL must carry it
 
         let db = Db::open(dir.path(), &[], DbOptions::default()).expect("reopen");
@@ -1815,19 +1879,28 @@ mod tests {
                 let db = Arc::clone(&db);
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
+                    // Failures are COLLECTED, not panicked: every round must
+                    // still reach its barrier, or a failing thread would leave
+                    // the other one blocked forever and the test would hang
+                    // instead of failing.
+                    let mut failures = Vec::new();
                     for round in 0..ROUNDS {
                         barrier.wait();
-                        db.execute(&format!(
+                        if let Err(e) = db.execute(&format!(
                             "UPDATE docs SET title = 't{tag}-{round}' WHERE author = 'alice';"
-                        ))
-                        .expect("every update eventually applies");
+                        )) {
+                            failures.push(e.to_string());
+                        }
                     }
+                    failures
                 })
             })
             .collect();
-        for w in workers {
-            w.join().unwrap();
-        }
+        let failures: Vec<String> = workers
+            .into_iter()
+            .flat_map(|w| w.join().expect("worker thread"))
+            .collect();
+        assert!(failures.is_empty(), "updates failed: {failures:?}");
 
         assert_eq!(
             db.live_snapshot(0).expect("collection open").version(),

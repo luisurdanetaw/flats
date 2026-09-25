@@ -1239,8 +1239,9 @@ mod tests {
     fn update_keeps_assignments_in_source_order() {
         // Source order is application order: a column set twice takes the LAST
         // value, which only works if the order survives binding.
-        let bound =
-            bound_update("UPDATE docs SET title = 'a', author = 'b', title = 'c' WHERE published_at = 1;");
+        let bound = bound_update(
+            "UPDATE docs SET title = 'a', author = 'b', title = 'c' WHERE published_at = 1;",
+        );
         assert_eq!(
             bound
                 .assignments

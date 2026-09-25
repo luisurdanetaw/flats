@@ -24,9 +24,7 @@ use crate::sql::bind::{
     BoundCreate, BoundDelete, BoundInsert, BoundSearch, BoundSelect, BoundStatement, BoundUpdate,
     Projected,
 };
-use crate::sql::plan::{
-    CreateCollection, Delete, Insert, Knn, LogicalPlan, Project, Scan, Update,
-};
+use crate::sql::plan::{CreateCollection, Delete, Insert, Knn, LogicalPlan, Project, Scan, Update};
 
 /// Build the [`LogicalPlan`] for an already-bound statement. Infallible: the
 /// binder validated everything, so this only reshapes statement-shaped IR into
