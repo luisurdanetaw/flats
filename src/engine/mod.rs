@@ -898,6 +898,18 @@ impl Db {
             });
         }
         coll.config.schema.validate_row(&row)?;
+        // A key some live row already holds is refused HERE, before the frame
+        // is written, so the common case costs the caller nothing and the
+        // error can name the column and the value.
+        //
+        // This check alone is NOT the guarantee: two callers can both read
+        // "absent" and both append. The authoritative check runs at apply
+        // time, on the single commit thread, where the answer cannot change
+        // underneath it — see the `Record::Insert` arm. This one exists for
+        // the diagnostic, not the invariant.
+        if let Some(key) = coll.config.schema.primary_key {
+            self.check_duplicate_key(&coll, key, &row)?;
+        }
         // Refuse before allocating: a halted log is going to reject this
         // append anyway, and burning an ordinal for a write that never reaches
         // the file costs the collection a slot of its capacity for nothing.
@@ -1441,6 +1453,39 @@ impl Db {
         Ok(())
     }
 
+    /// The key column's declared name, for an error message. Falls back to the
+    /// `ColumnId` only if the schema and the key disagree, which construction
+    /// rules out.
+    fn key_name(schema: &Schema, key: ColumnId) -> String {
+        schema
+            .columns
+            .iter()
+            .find(|c| c.id == key)
+            .map_or_else(|| format!("#{key}"), |c| c.name.clone())
+    }
+
+    /// Refuse a row whose primary key a LIVE row already holds.
+    ///
+    /// One equality lookup against the metadata index, masked by the current
+    /// liveness snapshot — so a key freed by a DELETE is available again,
+    /// which is the behaviour a caller expects after removing a row.
+    fn check_duplicate_key(&self, coll: &Collection, key: ColumnId, row: &Row) -> Result<()> {
+        let Some(value) = row.iter().find(|(id, _)| *id == key).map(|(_, v)| v) else {
+            // `validate_row` already insisted every column is present, so a
+            // missing key column would be a contradiction rather than a
+            // caller error.
+            return Ok(());
+        };
+        let live = coll.live.resolve();
+        if !coll.meta.lookup_eq(key, value, &live)?.is_empty() {
+            return Err(Error::DuplicateKey {
+                column: Self::key_name(&coll.config.schema, key),
+                value: render_key(value),
+            });
+        }
+        Ok(())
+    }
+
     fn collection(&self, id: u32) -> Result<Arc<Collection>> {
         catalog_snapshot(&self.catalog)
             .get(&id)
@@ -1507,6 +1552,18 @@ impl Drop for Db {
         if let Some(wal) = self.wal.take() {
             wal.shutdown();
         }
+    }
+}
+
+/// A key value as it should read back to the person who typed it — `'alice'`,
+/// not `Text("alice")`. Only for error messages.
+fn render_key(value: &Value) -> String {
+    match value {
+        Value::Text(s) => format!("'{s}'"),
+        Value::Int(n) => n.to_string(),
+        // A FLOAT key is refused at declaration, so this is unreachable from a
+        // declared key; rendered anyway rather than panicking in an error path.
+        Value::Float(f) => f.to_string(),
     }
 }
 

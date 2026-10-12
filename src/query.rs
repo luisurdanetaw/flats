@@ -529,7 +529,7 @@ mod tests {
             matches!(
                 &err,
                 Error::Engine(EngineError::DuplicateKey { column, value })
-                    if column == "author" && value.contains("alice")
+                    if column == "author" && value == "'alice'"
             ),
             "got {err:?}"
         );
@@ -747,10 +747,12 @@ mod tests {
         //     `execute`, so its failure is an outer error, not a stream item.
         db.execute("CREATE COLLECTION tiny (v VECTOR(2), a INT PRIMARY KEY) WITH (capacity = 1);")
             .expect("creates");
-        let fill = "INSERT INTO tiny (v, a) VALUES ([1.0, 0.0], 1);";
-        db.execute(fill).expect("the first row fits");
+        db.execute("INSERT INTO tiny (v, a) VALUES ([1.0, 0.0], 1);")
+            .expect("the first row fits");
+        // A DIFFERENT key, so this is refused for being full rather than for
+        // repeating a key — which is a check that runs earlier.
         assert!(matches!(
-            db.execute(fill),
+            db.execute("INSERT INTO tiny (v, a) VALUES ([1.0, 0.0], 2);"),
             Err(Error::Engine(EngineError::CapacityExceeded { .. }))
         ));
 
@@ -899,7 +901,7 @@ mod tests {
         for (title, x, n) in [("far", 1.0, 1), ("near", 3.0, 2), ("mid", 2.0, 3)] {
             db.execute(&format!(
                 "INSERT INTO docs (author, vector, title, published_at) \
-                 VALUES ('alice', [{x}, 0.0, 0.0, 0.0], '{title}', {n});"
+                 VALUES ('{title} author', [{x}, 0.0, 0.0, 0.0], '{title}', {n});"
             ))
             .expect("seeded row inserts");
         }
@@ -940,7 +942,7 @@ mod tests {
         assert_eq!(
             collect(stream),
             vec![vec![
-                RegValue::Str("alice".into()),
+                RegValue::Str("near author".into()),
                 RegValue::Str("near".into()),
                 RegValue::Int(2),
             ]]
@@ -956,7 +958,7 @@ mod tests {
         for n in 1..=5 {
             db.execute(&format!(
                 "INSERT INTO docs (author, vector, title, published_at) \
-                 VALUES ('alice', [{n}.0, 0.0, 0.0, 0.0], 'doc {n}', {n});"
+                 VALUES ('a{n}', [{n}.0, 0.0, 0.0, 0.0], 'doc {n}', {n});"
             ))
             .expect("inserts");
         }
@@ -1092,17 +1094,17 @@ mod tests {
             collect(stream),
             vec![
                 vec![
-                    RegValue::Str("alice".into()),
+                    RegValue::Str("near author".into()),
                     RegValue::Str("near".into()),
                     RegValue::Int(2),
                 ],
                 vec![
-                    RegValue::Str("alice".into()),
+                    RegValue::Str("mid author".into()),
                     RegValue::Str("mid".into()),
                     RegValue::Int(3),
                 ],
                 vec![
-                    RegValue::Str("alice".into()),
+                    RegValue::Str("far author".into()),
                     RegValue::Str("far".into()),
                     RegValue::Int(1),
                 ],
