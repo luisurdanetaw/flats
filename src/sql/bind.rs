@@ -1925,6 +1925,86 @@ mod tests {
         );
     }
 
+    /// Rule: EXACTLY ONE primary key, always. Making it optional would mean
+    /// carrying two row-targeting paths forever — by key and by ordinal — and
+    /// the ordinal one is the footgun the key exists to remove.
+    #[test]
+    fn create_without_a_primary_key_is_rejected() {
+        let cat = TestCatalog::new();
+        let src = "CREATE COLLECTION c (v VECTOR(4), author TEXT) WITH (capacity = 1);";
+        assert_eq!(
+            analyze_err(src, &cat),
+            BindError::PrimaryKeyCount { found: 0 },
+        );
+    }
+
+    #[test]
+    fn create_with_two_primary_keys_is_rejected() {
+        let cat = TestCatalog::new();
+        let src = "CREATE COLLECTION c (
+            a TEXT PRIMARY KEY,
+            b INT PRIMARY KEY,
+            v VECTOR(4)
+        ) WITH (capacity = 1);";
+        assert_eq!(
+            analyze_err(src, &cat),
+            BindError::PrimaryKeyCount { found: 2 },
+        );
+    }
+
+    /// The embedding cannot be the identity: it has no equality path (that is
+    /// what SEARCH is for), and two rows may legitimately share a vector.
+    #[test]
+    fn the_vector_cannot_be_the_primary_key() {
+        let cat = TestCatalog::new();
+        let src = "CREATE COLLECTION c (v VECTOR(4) PRIMARY KEY, a TEXT) WITH (capacity = 1);";
+        assert_eq!(
+            analyze_err(src, &cat),
+            BindError::PrimaryKeyType {
+                column: "v".to_string(),
+                ty: ColumnType::Vector(4),
+            },
+        );
+    }
+
+    /// FLOAT is refused for the same reason no sane schema keys on one: equality
+    /// over floats is not identity, so `0.1 + 0.2` would address a different row
+    /// than `0.3`.
+    #[test]
+    fn a_float_cannot_be_the_primary_key() {
+        let cat = TestCatalog::new();
+        let src = "CREATE COLLECTION c (f FLOAT PRIMARY KEY, v VECTOR(4)) WITH (capacity = 1);";
+        assert_eq!(
+            analyze_err(src, &cat),
+            BindError::PrimaryKeyType {
+                column: "f".to_string(),
+                ty: ColumnType::Float,
+            },
+        );
+    }
+
+    /// TEXT and INT both work, and the bound schema remembers WHICH column it
+    /// was — every later stage reads the key off the schema rather than
+    /// re-deriving it from the word "id".
+    #[test]
+    fn a_text_or_int_column_can_be_the_primary_key() {
+        let cat = TestCatalog::new();
+        for (decl, ty) in [("doc_id TEXT", ColumnType::Text), ("n INT", ColumnType::Int)] {
+            let src = format!(
+                "CREATE COLLECTION c ({decl} PRIMARY KEY, v VECTOR(4)) WITH (capacity = 1);"
+            );
+            let bound = match analyze_ok(&src, &cat) {
+                BoundStatement::CreateCollection(c) => c,
+                other => panic!("expected a CREATE, got {other:?}"),
+            };
+            let key = bound.schema.primary_key();
+            assert_eq!(key.ordinal, 0);
+            assert_eq!(key.ty, ty);
+            assert!(key.primary_key);
+            assert!(!bound.schema.columns[1].primary_key, "the vector is not it");
+        }
+    }
+
     #[test]
     fn create_existing_collection_is_collection_exists() {
         // `docs` already lives in the fixture.
