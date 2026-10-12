@@ -563,6 +563,15 @@ mod tests {
     }
 
     #[test]
+    fn primary_key_is_two_keywords() {
+        assert_eq!(lex("primary"), vec![Token::Primary]);
+        assert_eq!(lex("PRIMARY"), vec![Token::Primary]);
+        assert_eq!(lex("key"), vec![Token::Key]);
+        assert_eq!(lex("KEY"), vec![Token::Key]);
+        assert_eq!(lex("PRIMARY KEY"), vec![Token::Primary, Token::Key]);
+    }
+
+    #[test]
     fn delete_is_a_keyword() {
         assert_eq!(lex("delete"), vec![Token::Delete]);
         assert_eq!(lex("DELETE"), vec![Token::Delete]);

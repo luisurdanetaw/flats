@@ -1239,6 +1239,42 @@ mod tests {
         );
     }
 
+    /// `PRIMARY KEY` is a column-level marker, so it parses as part of the
+    /// column definition rather than as a separate table constraint. V-SQL has
+    /// no composite keys, which is exactly why the single-column form is the
+    /// only one.
+    #[test]
+    fn a_column_can_be_marked_primary_key() {
+        let stmt = ok(
+            "CREATE COLLECTION c (doc_id TEXT PRIMARY KEY, v VECTOR(2)) WITH (capacity = 1);",
+        );
+        assert_eq!(
+            create_columns(&stmt),
+            vec![
+                ColumnDef {
+                    name: "doc_id".to_string(),
+                    ty: ColumnType::Text,
+                    primary_key: true,
+                },
+                ColumnDef {
+                    name: "v".to_string(),
+                    ty: ColumnType::Vector(2),
+                    primary_key: false,
+                },
+            ]
+        );
+    }
+
+    /// `PRIMARY` alone is a typo, not a shorthand. Accepting it would make the
+    /// key silently depend on a word the user did not finish typing.
+    #[test]
+    fn primary_without_key_is_a_parse_error() {
+        assert!(
+            parse("CREATE COLLECTION c (a TEXT PRIMARY, v VECTOR(2)) WITH (capacity = 1);")
+                .is_err()
+        );
+    }
+
     #[test]
     fn type_keywords_are_case_insensitive() {
         let lower = ok("CREATE COLLECTION c (author text) WITH (capacity = 1);");
