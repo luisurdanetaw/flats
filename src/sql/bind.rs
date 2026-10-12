@@ -174,14 +174,7 @@ pub enum BoundPredicate {
         /// The comparand, type-checked against the column.
         value: TypedValue,
     },
-    /// `id = <n>` — ONE row, named by its ordinal.
-    ///
-    /// Needs no index lookup: the ordinal IS the answer, so this resolves to a
-    /// singleton bitmap intersected with the query's liveness snapshot. The
-    /// intersection is not optional — a retired row satisfies no predicate, the
-    /// same rule the complement in `BitmapNot` follows — so `id = 7` matches
-    /// nothing once row 7 is gone.
-    Id(u64),
+
     /// Both sides must hold — bitmap intersection.
     And(Box<BoundPredicate>, Box<BoundPredicate>),
     /// Either side may hold — bitmap union.
@@ -298,22 +291,27 @@ pub enum Projected {
 
 /// A value a `SEARCH` computes rather than stores.
 ///
-/// # These names are reserved inside a `RETURNING`
+/// # `score` is reserved inside a `RETURNING`
 ///
-/// `id` and `score` are matched case-insensitively and win over any stored
-/// column of the same name, so the meaning of `RETURNING score` does not depend
-/// on which collection it is aimed at.
+/// Matched case-insensitively, and it wins over a stored column of the same
+/// name, so the meaning of `RETURNING score` does not depend on which
+/// collection it is aimed at. A collection may still declare a `score` column;
+/// that column is then unreachable through `RETURNING`. Closing that means
+/// adding `score` to the engine's reserved list, a storage-layer change
+/// deliberately not made here.
 ///
-/// `id` is already reserved engine-wide (`create_collection` rejects a column
-/// called `id`, since it would collide with the ordinal SEARCH returns).
-/// **`score` is NOT** — a collection may currently declare a `score` column, and
-/// that column then becomes unreachable through `RETURNING`. Closing that means
-/// adding `score` to the engine's reserved list, which is a storage-layer change
-/// and deliberately not made here.
+/// # Why `id` is NOT here any more
+///
+/// It used to be: `id` meant the row's ORDINAL, the slot its vector occupies.
+/// That is not an identity. Copy-on-write moves a row to a fresh ordinal when
+/// it is updated, and compaction renumbers every ordinal in the collection — so
+/// a caller who read an `id` and later used it could address a different row,
+/// or none. Identity is now a DECLARED PRIMARY KEY column, which means `id` is
+/// an ordinary column name: it resolves against the schema like any other, and
+/// `RETURNING id` works precisely when the collection declares a column called
+/// `id` (the conventional name for its key).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pseudo {
-    /// The row's ordinal — its stable id within the collection.
-    Id,
     /// The similarity the kernel computed for this row against the query.
     Score,
 }
@@ -322,7 +320,6 @@ impl Pseudo {
     /// The canonical label, for a result header.
     pub fn name(self) -> &'static str {
         match self {
-            Pseudo::Id => "id",
             Pseudo::Score => "score",
         }
     }
@@ -330,9 +327,7 @@ impl Pseudo {
     /// Recognize a pseudo-column by name, case-insensitively. `None` means the
     /// name must resolve against the schema like an ordinary column.
     fn from_name(name: &str) -> Option<Pseudo> {
-        if name.eq_ignore_ascii_case("id") {
-            Some(Pseudo::Id)
-        } else if name.eq_ignore_ascii_case("score") {
+        if name.eq_ignore_ascii_case("score") {
             Some(Pseudo::Score)
         } else {
             None
@@ -550,8 +545,8 @@ impl fmt::Display for BindError {
             }
             BindError::CannotSetVector { column } => write!(
                 f,
-                "cannot SET the embedding column {column} without a `WHERE id = <n>` predicate: \
-                 one statement carries one vector, so it must name one row"
+                "cannot SET the embedding column {column} without naming one row by its \
+                 primary key: one statement carries one vector, so it must name one row"
             ),
         }
     }
@@ -795,10 +790,25 @@ fn bind_update(stmt: UpdateStmt, catalog: &impl Catalog) -> Result<BoundUpdate, 
         .ok_or_else(|| BindError::CollectionNotFound(stmt.collection.clone()))?;
 
     // The predicate binds FIRST, because whether the embedding may be
-    // assigned depends on it: only a statement that names one row by ordinal
-    // can carry a replacement vector.
+    // assigned depends on it: only a statement that names ONE row can carry a
+    // replacement vector, and the only predicate that does so is equality on
+    // the primary key.
+    //
+    // Equality on an ordinary column will not do, however unique its values
+    // happen to be today: nothing stops a second row from arriving with the
+    // same value tomorrow, and the statement would then hand one embedding to
+    // both. The key is the one column the applier guarantees is unique.
     let filter = bind_predicate(stmt.filter, &schema)?;
-    let names_one_row = matches!(filter, BoundPredicate::Id(_));
+    let names_one_row = match &filter {
+        BoundPredicate::Compare {
+            column,
+            op: CompareOp::Eq,
+            ..
+        } => schema
+            .primary_key()
+            .is_some_and(|key| key.ordinal == column.ordinal),
+        _ => false,
+    };
 
     let mut assignments = Vec::with_capacity(stmt.assignments.len());
     let mut vector = None;
@@ -943,37 +953,19 @@ fn bind_create(stmt: CreateStmt, catalog: &impl Catalog) -> Result<BoundCreate, 
     })
 }
 
-/// `id = <n>` — the only comparison a pseudo-column supports.
+/// No pseudo-column is filterable.
 ///
-/// EQUALITY ONLY. An ordinal is an identity, not a user-meaningful ordering:
-/// `id < 7` reads like "the first seven rows", which is not what it would mean,
-/// and ranges over ordinals have no index path behind them. `score` is not
-/// filterable at all — it exists only once a ranked read has computed it, so
-/// there is nothing to resolve to a bitmap before the scan.
+/// `score` is the only one left, and it exists only once a ranked read has
+/// computed it — so there is nothing for a `WHERE` to resolve to a bitmap
+/// before the scan even begins.
 fn bind_pseudo_comparison(
     pseudo: Pseudo,
-    op: CompareOp,
-    literal: Literal,
+    _op: CompareOp,
+    _literal: Literal,
 ) -> Result<BoundPredicate, BindError> {
-    if pseudo == Pseudo::Score {
-        return Err(BindError::UnsupportedPredicate {
+    match pseudo {
+        Pseudo::Score => Err(BindError::UnsupportedPredicate {
             what: "filtering on score (it is computed by the ranking, not stored)".to_string(),
-        });
-    }
-    if op != CompareOp::Eq {
-        return Err(BindError::UnsupportedPredicate {
-            what: format!("comparing id with {op:?}: only `id = <n>` is supported"),
-        });
-    }
-    match literal {
-        Literal::Int(n) if n >= 0 => Ok(BoundPredicate::Id(n as u64)),
-        Literal::Int(n) => Err(BindError::UnsupportedPredicate {
-            what: format!("a negative ordinal ({n})"),
-        }),
-        other => Err(BindError::TypeMismatch {
-            column: "id".to_string(),
-            expected: ColumnType::Int,
-            found: literal_type(&other),
         }),
     }
 }
@@ -1258,6 +1250,26 @@ mod tests {
         }
     }
 
+    /// The same, expecting the bind to fail.
+    fn bound_search_err(src: &str) -> BindError {
+        analyze_err(src, &docs_catalog())
+    }
+
+    /// A collection whose key really is called `id` — the conventional shape,
+    /// and the one that used to be impossible because `id` was reserved.
+    fn keyed_catalog() -> TestCatalog {
+        TestCatalog::new().with(
+            "things",
+            Schema {
+                columns: vec![
+                    col("vector", ColumnType::Vector(4), 0, true),
+                    col_key("id", ColumnType::Int, 1),
+                    col("label", ColumnType::Text, 2, false),
+                ],
+            },
+        )
+    }
+
     /// A vector literal of `n` `0.1` elements, as SQL source.
     fn vec_lit(n: usize) -> String {
         let elems = vec!["0.1"; n].join(", ");
@@ -1354,71 +1366,51 @@ mod tests {
         ));
     }
 
-    // -- the id pseudo-column in predicates --------------------------------
+    // -- the key in predicates ---------------------------------------------
 
+    /// The key is an ORDINARY column in a predicate — same `Compare` node, same
+    /// index lookup, same normalization of a flipped comparison. Nothing about
+    /// naming a row is special any more; what makes it name exactly one row is
+    /// the uniqueness the applier enforces, not the shape of the predicate.
     #[test]
-    fn id_binds_to_an_ordinal_predicate() {
-        assert_eq!(pred("id = 7"), BoundPredicate::Id(7));
-        // Flipped, like every other comparison.
-        assert_eq!(pred("7 = id"), BoundPredicate::Id(7));
-        // Case-insensitive, like `RETURNING id`.
-        assert_eq!(pred("ID = 7"), BoundPredicate::Id(7));
-    }
-
-    #[test]
-    fn id_composes_with_other_predicates() {
+    fn the_key_binds_like_any_other_column() {
         assert_eq!(
-            pred("id = 7 AND author = 'alice'"),
-            BoundPredicate::And(
-                Box::new(BoundPredicate::Id(7)),
-                Box::new(compare(
-                    "author",
-                    1,
-                    CompareOp::Eq,
-                    Literal::Str("alice".into())
-                )),
-            )
+            pred("author = 'alice'"),
+            compare("author", 1, CompareOp::Eq, Literal::Str("alice".into()))
+        );
+        assert_eq!(
+            pred("'alice' = author"),
+            compare("author", 1, CompareOp::Eq, Literal::Str("alice".into()))
         );
     }
 
-    /// Only equality. An ordinal is an identity, not a user-meaningful
-    /// ordering, and `id < 7` would invite reading it as "the first 7 rows".
+    /// `id` is no longer a pseudo-column, so against a collection that declares
+    /// no such column it is simply an unknown name. This is the ordinal back
+    /// door closing: there is nothing left to resolve an ordinal from.
     #[test]
-    fn ordered_comparisons_on_id_are_refused() {
-        for clause in ["id < 7", "id >= 7", "id != 7"] {
-            assert!(
-                matches!(pred_err(clause), BindError::UnsupportedPredicate { .. }),
-                "`{clause}` must be refused"
-            );
-        }
-    }
-
-    #[test]
-    fn id_takes_an_integer_and_nothing_else() {
-        assert!(matches!(
-            pred_err("id = 'seven'"),
-            BindError::TypeMismatch { .. }
-        ));
-        assert!(matches!(
-            pred_err("id = 1.5"),
-            BindError::TypeMismatch { .. }
-        ));
-        // Negative ordinals do not exist.
-        assert!(matches!(
-            pred_err("id = -1"),
-            BindError::UnsupportedPredicate { .. }
-        ));
-    }
-
-    /// A collection with its own `id` column would be ambiguous; pseudo-columns
-    /// win, exactly as they do in a projection.
-    #[test]
-    fn id_still_projects() {
-        let bound = bound_search(&format!(
+    fn id_is_not_a_pseudo_column_any_more() {
+        assert_eq!(pred_err("id = 7"), BindError::ColumnNotFound("id".into()));
+        let bound = bound_search_err(&format!(
             "SEARCH TOP 1 NEAREST TO {} FROM docs RETURNING id;",
             vec_lit(768)
         ));
-        assert_eq!(bound.projection, vec![Projected::Pseudo(Pseudo::Id)]);
+        assert_eq!(bound, BindError::ColumnNotFound("id".into()));
+    }
+
+    /// And when a collection DOES declare `id`, it is an ordinary column that
+    /// binds and projects like any other — the name is no longer reserved.
+    #[test]
+    fn a_column_named_id_is_ordinary() {
+        let cat = keyed_catalog();
+        let bound = match analyze_ok("SELECT id FROM things WHERE id = 7;", &cat) {
+            BoundStatement::Select(s) => s,
+            other => panic!("expected a SELECT, got {other:?}"),
+        };
+        assert_eq!(bound.projection[0].name, "id");
+        assert_eq!(
+            bound.filter,
+            Some(compare("id", 1, CompareOp::Eq, Literal::Int(7)))
+        );
     }
 
     // -- UPDATE ------------------------------------------------------------
@@ -1488,7 +1480,7 @@ mod tests {
     #[test]
     fn setting_the_embedding_needs_an_id_predicate() {
         let bound = bound_update(&format!(
-            "UPDATE docs SET vector = {} WHERE id = 7;",
+            "UPDATE docs SET vector = {} WHERE author = 'alice';",
             vec_lit(768)
         ));
         assert_eq!(bound.vector, Some(vec![0.1f32; 768]));
@@ -1496,13 +1488,16 @@ mod tests {
             bound.assignments.is_empty(),
             "the embedding is not a scalar assignment"
         );
-        assert_eq!(bound.filter, BoundPredicate::Id(7));
+        assert_eq!(
+            bound.filter,
+            compare("author", 1, CompareOp::Eq, Literal::Str("alice".into()))
+        );
     }
 
     #[test]
     fn the_embedding_and_scalars_can_change_together() {
         let bound = bound_update(&format!(
-            "UPDATE docs SET vector = {}, title = 'v2' WHERE id = 7;",
+            "UPDATE docs SET vector = {}, title = 'v2' WHERE author = 'alice';",
             vec_lit(768)
         ));
         assert_eq!(bound.vector, Some(vec![0.1f32; 768]));
@@ -1523,9 +1518,16 @@ mod tests {
     #[test]
     fn setting_the_embedding_without_naming_one_row_is_refused() {
         for clause in [
+            // Not the key at all.
             "published_at = 1",
-            "id = 7 AND author = 'alice'",
-            "id = 7 OR id = 8",
+            // The key, but not alone: the conjunction could still be written
+            // to match nothing, and more importantly a compound predicate is
+            // no longer the single-row shape the rule asks for.
+            "author = 'alice' AND published_at = 1",
+            // Two keys is two rows.
+            "author = 'alice' OR author = 'bob'",
+            // Not equality.
+            "author != 'alice'",
         ] {
             let sql = format!("UPDATE docs SET vector = {} WHERE {clause};", vec_lit(768));
             assert!(
@@ -1542,7 +1544,7 @@ mod tests {
     fn a_replacement_embedding_is_dimension_checked() {
         assert!(matches!(
             analyze_err(
-                &format!("UPDATE docs SET vector = {} WHERE id = 7;", vec_lit(3)),
+                &format!("UPDATE docs SET vector = {} WHERE author = 'a';", vec_lit(3)),
                 &docs_catalog()
             ),
             BindError::DimensionMismatch { .. }
@@ -1704,7 +1706,7 @@ mod tests {
     #[test]
     fn search_binds_its_filter_as_a_prefilter() {
         let search = bound_search(&format!(
-            "SEARCH TOP 5 NEAREST TO {} FROM docs WHERE published_at < 2 RETURNING id, score;",
+            "SEARCH TOP 5 NEAREST TO {} FROM docs WHERE published_at < 2 RETURNING author, score;",
             vec_lit(768)
         ));
         assert_eq!(
@@ -2100,32 +2102,26 @@ mod tests {
     #[test]
     fn id_and_score_bind_as_pseudocolumns() {
         // Both are COMPUTED, not stored: `id` is the row's ordinal and `score`
-        // is what the kernel produced. Neither is looked up in the schema —
-        // `docs` has no column by either name, so a binder that resolved them
-        // like ordinary columns would reject the statement outright.
+        // is what the kernel produced, and it is NOT looked up in the schema —
+        // `docs` has no column by that name, so a binder that resolved it like
+        // an ordinary column would reject the statement outright.
         let bound = bound_search(&format!(
-            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING id, score;",
+            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING author, score;",
             vec_lit(768)
         ));
         assert_eq!(
             bound.projection,
             vec![
-                Projected::Pseudo(Pseudo::Id),
+                Projected::Column(colref("author", 1)),
                 Projected::Pseudo(Pseudo::Score),
             ]
         );
-        // Recognized case-insensitively, like the engine's reserved `id` rule.
+        // Recognized case-insensitively.
         let bound = bound_search(&format!(
-            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING ID, Score;",
+            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING Score;",
             vec_lit(768)
         ));
-        assert_eq!(
-            bound.projection,
-            vec![
-                Projected::Pseudo(Pseudo::Id),
-                Projected::Pseudo(Pseudo::Score),
-            ]
-        );
+        assert_eq!(bound.projection, vec![Projected::Pseudo(Pseudo::Score)]);
     }
 
     #[test]
@@ -2143,7 +2139,7 @@ mod tests {
 
         // Stored and computed items mix freely, in source order.
         let bound = bound_search(&format!(
-            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING score, title, id, author;",
+            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING score, title, author;",
             vec_lit(768)
         ));
         assert_eq!(
@@ -2151,7 +2147,6 @@ mod tests {
             vec![
                 Projected::Pseudo(Pseudo::Score),
                 Projected::Column(colref("title", 2)),
-                Projected::Pseudo(Pseudo::Id),
                 Projected::Column(colref("author", 1)),
             ]
         );
@@ -2205,15 +2200,15 @@ mod tests {
     #[test]
     fn returning_replaces_the_default_projection() {
         // A `RETURNING` clause REPLACES the default outright — it does not add
-        // to it. `id, score` means two columns, not five.
+        // to it. `author, score` means two columns, not five.
         let bound = bound_search(&format!(
-            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING id, score;",
+            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING author, score;",
             vec_lit(768)
         ));
         assert_eq!(
             bound.projection,
             vec![
-                Projected::Pseudo(Pseudo::Id),
+                Projected::Column(colref("author", 1)),
                 Projected::Pseudo(Pseudo::Score),
             ]
         );

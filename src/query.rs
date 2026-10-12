@@ -642,14 +642,8 @@ mod tests {
         ));
 
         // ENGINE — reachable only for rules the BINDER does not know, because
-        // it pre-empts everything it does know. Two exist:
+        // it pre-empts everything it does know. One exists:
         //
-        //   * `id` is the ordinal pseudo-column SEARCH returns, so a stored
-        //     column may not shadow it. A storage rule, invisible to the binder.
-        assert!(matches!(
-            db.execute("CREATE COLLECTION reserved (v VECTOR(2), id INT PRIMARY KEY) WITH (capacity = 4);"),
-            Err(Error::Engine(EngineError::ReservedColumn(name))) if name == "id"
-        ));
         //   * capacity is a RUNTIME property — how many rows are already there —
         //     so only the engine can know the collection is full. This one also
         //     shows why the eager/lazy split matters: the INSERT ran INSIDE
@@ -1038,7 +1032,7 @@ mod tests {
         for i in 0..n {
             db.execute(&format!(
                 "INSERT INTO docs (author, vector, title, published_at) \
-                 VALUES ('alice', [{}.0, 0.0, 0.0, 0.0], 'doc {i}', {i});",
+                 VALUES ('a{i}', [{}.0, 0.0, 0.0, 0.0], 'doc {i}', {i});",
                 i + 1
             ))
             .expect("seeded row inserts");
@@ -1048,18 +1042,18 @@ mod tests {
     const QUERY: &str = "[1.0, 0.0, 0.0, 0.0]";
 
     #[test]
-    fn returning_id_and_score() {
+    fn returning_a_column_and_score() {
         let (_dir, db) = docs_db();
         seed_scored(&db, 4);
 
         let stream = db
             .execute(&format!(
-                "SEARCH TOP 4 NEAREST TO {QUERY} FROM docs RETURNING id, score;"
+                "SEARCH TOP 4 NEAREST TO {QUERY} FROM docs RETURNING published_at, score;"
             ))
             .expect("compiles and runs");
         // Labels are the RETURNING names, in order — NOT the collection's
         // columns, which is what a bare SEARCH would have reported.
-        assert_eq!(stream.labels(), ["id", "score"]);
+        assert_eq!(stream.labels(), ["published_at", "score"]);
 
         let rows = collect(stream);
         assert_eq!(rows.len(), 4);
@@ -1071,26 +1065,26 @@ mod tests {
                 vec![RegValue::Int(1), RegValue::Real(2.0)],
                 vec![RegValue::Int(0), RegValue::Real(1.0)],
             ],
-            "nearest first, each id paired with its own score"
+            "nearest first, each row paired with its own score"
         );
 
         db.close().unwrap();
     }
 
     #[test]
-    fn score_aligns_with_its_ordinal() {
-        // THE load-bearing test. `score == id + 1` holds for every seeded row by
-        // construction, so ANY drift between a row's id and the score reported
-        // beside it breaks the invariant — including an index advanced one step
-        // out of step with the cursor, which is invisible to an assertion that
-        // only checks "scores descend".
+    fn score_aligns_with_its_row() {
+        // THE load-bearing test. `score == published_at + 1` holds for every
+        // seeded row by construction, so ANY drift between a row and the score
+        // reported beside it breaks the invariant — including an index advanced
+        // one step out of step with the cursor, which is invisible to an
+        // assertion that only checks "scores descend".
         let (_dir, db) = docs_db();
         seed_scored(&db, 6);
 
         for k in [1, 3, 6] {
             let stream = db
                 .execute(&format!(
-                    "SEARCH TOP {k} NEAREST TO {QUERY} FROM docs RETURNING id, score;"
+                    "SEARCH TOP {k} NEAREST TO {QUERY} FROM docs RETURNING published_at, score;"
                 ))
                 .expect("compiles and runs");
             let rows = collect(stream);
@@ -1098,16 +1092,16 @@ mod tests {
 
             let mut previous: Option<f64> = None;
             for row in rows {
-                let (id, score) = match (&row[0], &row[1]) {
-                    (RegValue::Int(id), RegValue::Real(score)) => (*id, *score),
+                let (n, score) = match (&row[0], &row[1]) {
+                    (RegValue::Int(n), RegValue::Real(score)) => (*n, *score),
                     other => panic!("expected (Int, Real), got {other:?}"),
                 };
                 assert_eq!(
                     score,
-                    (id + 1) as f64,
-                    "row {id} was reported with score {score}, but its own \
+                    (n + 1) as f64,
+                    "row {n} was reported with score {score}, but its own \
                      similarity is {}",
-                    id + 1
+                    n + 1
                 );
                 // ...and the ranking still descends, so the invariant above is
                 // not being satisfied by an accidentally-sorted-by-id result.
@@ -1128,7 +1122,7 @@ mod tests {
         // (`score`). Both are just registers by the time `ResultRow` runs, which
         // is exactly why this costs nothing. A design that special-cased
         // pseudo-columns — emitting them through a separate path instead of into
-        // the register file — would fail here even if `RETURNING id, score`
+        // the register file — would fail here even if `RETURNING title, score`
         // worked.
         let (_dir, db) = docs_db();
         seed_scored(&db, 3);
@@ -1151,10 +1145,13 @@ mod tests {
         // Interleaved the other way, and with all three kinds at once.
         let stream = db
             .execute(&format!(
-                "SEARCH TOP 2 NEAREST TO {QUERY} FROM docs RETURNING score, id, title, author;"
+                "SEARCH TOP 2 NEAREST TO {QUERY} FROM docs RETURNING score, published_at, title, author;"
             ))
             .expect("compiles and runs");
-        assert_eq!(stream.labels(), ["score", "id", "title", "author"]);
+        assert_eq!(
+            stream.labels(),
+            ["score", "published_at", "title", "author"]
+        );
         assert_eq!(
             collect(stream),
             vec![
@@ -1162,13 +1159,13 @@ mod tests {
                     RegValue::Real(3.0),
                     RegValue::Int(2),
                     RegValue::Str("doc 2".into()),
-                    RegValue::Str("alice".into()),
+                    RegValue::Str("a2".into()),
                 ],
                 vec![
                     RegValue::Real(2.0),
                     RegValue::Int(1),
                     RegValue::Str("doc 1".into()),
-                    RegValue::Str("alice".into()),
+                    RegValue::Str("a1".into()),
                 ],
             ]
         );
@@ -1182,14 +1179,14 @@ mod tests {
         seed_scored(&db, 2);
 
         for (clause, expected) in [
-            ("id", vec!["id"]),
+            ("published_at", vec!["published_at"]),
             ("score", vec!["score"]),
-            ("id, score", vec!["id", "score"]),
-            ("score, id", vec!["score", "id"]),
+            ("published_at, score", vec!["published_at", "score"]),
+            ("score, published_at", vec!["score", "published_at"]),
             ("title", vec!["title"]),
             (
-                "title, id, score, author",
-                vec!["title", "id", "score", "author"],
+                "title, published_at, score, author",
+                vec!["title", "published_at", "score", "author"],
             ),
         ] {
             let stream = db
@@ -1222,10 +1219,10 @@ mod tests {
 
         let stream = db
             .execute(&format!(
-                "SEARCH TOP 5 NEAREST TO {QUERY} FROM docs RETURNING id, score;"
+                "SEARCH TOP 5 NEAREST TO {QUERY} FROM docs RETURNING published_at, score;"
             ))
             .expect("SEARCH compiles");
-        assert_eq!(stream.labels(), ["id", "score"]);
+        assert_eq!(stream.labels(), ["published_at", "score"]);
         assert_eq!(
             collect(stream),
             vec![

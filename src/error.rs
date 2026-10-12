@@ -98,11 +98,6 @@ pub enum Error {
     #[error("capacity must be > 0")]
     InvalidCapacity,
 
-    /// Schema uses a column name the engine reserves (the `id` pseudo-column
-    /// SEARCH returns is the ordinal, not a stored column).
-    #[error("reserved column name: {0}")]
-    ReservedColumn(String),
-
     // -- metadata layer (Phase 4) ------------------------------------------
     // Callers in Phase 4c only distinguish "retryable via WAL replay" (Io)
     // from "caller bug" (everything below). Keep variants coarse.
@@ -145,6 +140,18 @@ pub enum Error {
         column: String,
         /// Its declared type.
         ty: String,
+    },
+
+    /// A statement carrying a replacement embedding matched more than one row.
+    ///
+    /// The binder requires equality on the primary key for exactly this
+    /// reason, and the applier keeps that key unique — so reaching this means
+    /// those two guarantees disagree, not that the caller wrote a loose
+    /// predicate.
+    #[error("a replacement embedding matched {matched} rows; it may name only one")]
+    KeyMatchedManyRows {
+        /// How many rows the predicate matched.
+        matched: u64,
     },
 
     /// An insert or install carries a primary key some LIVE row already holds.

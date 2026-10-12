@@ -1100,6 +1100,18 @@ impl Db {
         // must carry the columns it does not change as well as the ones it does.
         let scalars: Vec<ColumnId> = (0..coll.config.schema.columns.len() as ColumnId).collect();
 
+        // A replacement embedding may reach EXACTLY ONE row. The binder has
+        // already insisted the predicate be equality on the primary key, which
+        // the applier keeps unique — so more than one match means those two
+        // guarantees disagree, and silently handing one vector to several rows
+        // is the specific mistake the key exists to prevent. Checked here
+        // because only the engine sees how many rows actually matched.
+        if vector.is_some() && matched.len() > 1 {
+            return Err(Error::KeyMatchedManyRows {
+                matched: matched.len(),
+            });
+        }
+
         // 1. READ the matched rows and build their edited copies. Nothing is
         //    logged yet, and no ordinal is claimed — a failure here costs
         //    nothing but the work.
@@ -1221,13 +1233,11 @@ impl Db {
         // `Schema::from_columns`. Re-check in case the caller hand-assembled one
         // and bypassed the constructor.
         schema.validate()?;
-        // `id` is the ordinal pseudo-column SEARCH returns — a stored column
-        // by that name would collide with it in RETURNING.
-        for col in &schema.columns {
-            if col.name.eq_ignore_ascii_case("id") {
-                return Err(Error::ReservedColumn(col.name.clone()));
-            }
-        }
+        // `id` used to be reserved here, because it named the ordinal
+        // pseudo-column SEARCH returned. That pseudo-column is gone — identity
+        // is a declared PRIMARY KEY now — so `id` is an ordinary name, and in
+        // fact the conventional one for a key. Reserving it would forbid the
+        // most natural schema a caller can write.
         let snapshot = catalog_snapshot(&self.catalog);
         if snapshot.values().any(|c| c.config.name == name) {
             return Err(Error::CollectionExists { name: name.into() });
@@ -3261,6 +3271,33 @@ mod tests {
         db.close().unwrap();
     }
 
+    /// `id` used to be a reserved column name, because it collided with the
+    /// ordinal pseudo-column SEARCH returned. That pseudo-column is gone, so
+    /// `id` is an ordinary name — and the conventional one for a primary key,
+    /// which means reserving it would have forbidden the most natural schema a
+    /// caller can write.
+    #[test]
+    fn a_column_named_id_is_an_ordinary_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[], manual_opts()).unwrap();
+
+        let schema = Schema::from_columns(vec![
+            ColumnSpec::Vector {
+                name: "vector".into(),
+                dim: NonZeroUsize::new(2).unwrap(),
+            },
+            ColumnSpec::Key {
+                name: "id".into(),
+                ty: ColumnType::Int,
+            },
+        ])
+        .unwrap();
+        assert_eq!(schema.primary_key, Some(0));
+        db.create_collection("things", 8, schema)
+            .expect("`id` is a legal column name");
+        db.close().unwrap();
+    }
+
     #[test]
     fn invalid_create_is_rejected_before_the_wal_and_burns_no_id() {
         let dir = tempfile::tempdir().unwrap();
@@ -3273,25 +3310,6 @@ mod tests {
         assert!(matches!(
             db.create_collection("x", 0, vec_only(2)),
             Err(Error::InvalidCapacity)
-        ));
-        // The `id` pseudo-column collides with SEARCH's ordinal column.
-        assert!(matches!(
-            db.create_collection(
-                "x",
-                8,
-                Schema::from_columns(vec![
-                    ColumnSpec::Vector {
-                        name: "vector".into(),
-                        dim: NonZeroUsize::new(2).unwrap(),
-                    },
-                    ColumnSpec::Scalar {
-                        name: "id".into(),
-                        ty: ColumnType::Int,
-                    },
-                ])
-                .unwrap(),
-            ),
-            Err(Error::ReservedColumn(_))
         ));
         // A hand-built Schema bypassing the `Schema::from_columns` constructor
         // still gets caught — create_collection re-validates it.

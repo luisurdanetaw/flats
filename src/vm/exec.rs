@@ -211,7 +211,6 @@ fn needs_db(op: &Op) -> bool {
             | Op::BitmapEq { .. }
             | Op::BitmapRange { .. }
             | Op::BitmapNot { .. }
-            | Op::BitmapId { .. }
     )
 }
 
@@ -240,7 +239,6 @@ fn mnemonic(op: &Op) -> &'static str {
         Op::BitmapAnd { .. } => "BitmapAnd",
         Op::BitmapOr { .. } => "BitmapOr",
         Op::BitmapNot { .. } => "BitmapNot",
-        Op::BitmapId { .. } => "BitmapId",
         Op::Mutate { .. } => "Mutate",
         Op::Halt => "Halt",
     }
@@ -513,25 +511,6 @@ impl Vm {
                     let (left, right) = (self.bitmap(a)?, self.bitmap(b)?);
                     let out = left.as_ref() | right.as_ref();
                     self.store(dst, RegValue::Bitmap(Arc::new(out)))?;
-                }
-                Op::BitmapId {
-                    collection,
-                    ordinal,
-                    dst,
-                } => {
-                    let (ordinal, dst) = (*ordinal, *dst);
-                    let db = db.ok_or(ExecError::Detached { op: "BitmapId" })?;
-                    let live = self.live_set(db, collection)?;
-                    // Masked by THIS QUERY'S snapshot: naming a retired row by
-                    // its ordinal must not resurrect it, and an ordinal past
-                    // the high-water mark simply matches nothing.
-                    let mut found = RoaringBitmap::new();
-                    if let Ok(ordinal) = u32::try_from(ordinal)
-                        && live.contains(ordinal)
-                    {
-                        found.insert(ordinal);
-                    }
-                    self.store(dst, RegValue::Bitmap(Arc::new(found)))?;
                 }
                 Op::BitmapNot {
                     collection,

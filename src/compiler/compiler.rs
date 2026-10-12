@@ -268,19 +268,7 @@ impl<'a> Compiler<'a> {
     /// the WHERE section of the `bytecode` module header.
     fn emit_predicate(&mut self, pred: &BoundPredicate, collection: &str) -> Reg {
         match pred {
-            BoundPredicate::Id(ordinal) => {
-                // No comparand to load and no index to consult: the ordinal is
-                // the whole operand, so it rides in the op. The intersection
-                // with the live set happens at run time, in the op — see
-                // `Op::BitmapId`.
-                let dst = self.alloc_reg();
-                self.emit(Op::BitmapId {
-                    collection: collection.to_string(),
-                    ordinal: *ordinal,
-                    dst,
-                });
-                dst
-            }
+
             BoundPredicate::And(l, r) => {
                 let a = self.emit_predicate(l, collection);
                 let b = self.emit_predicate(r, collection);
@@ -504,11 +492,6 @@ impl<'a> Compiler<'a> {
                         match item {
                             // A computed pseudo-column: no schema lookup, because
                             // there is nothing stored to look up.
-                            Projected::Pseudo(Pseudo::Id) => {
-                                let dst = c.alloc_reg();
-                                let cur = c.current_cursor();
-                                c.emit(Op::RowId { cur, dst });
-                            }
                             Projected::Pseudo(Pseudo::Score) => {
                                 let dst = c.alloc_reg();
                                 let cur = c.current_cursor();
@@ -892,6 +875,19 @@ mod tests {
         compile(plan, Some(&docs_meta_schema())).expect("an UPDATE compiles")
     }
 
+    /// `author = '<value>'` — equality on the fixture's PRIMARY KEY, which is
+    /// what a statement carrying a replacement embedding must be targeted by.
+    fn key_eq(value: &str) -> BoundPredicate {
+        BoundPredicate::Compare {
+            column: colref("author", 1),
+            op: CompareOp::Eq,
+            value: TypedValue {
+                value: Literal::Str(value.to_string()),
+                ty: ColumnType::Text,
+            },
+        }
+    }
+
     fn text_assignment(name: &str, ordinal: usize, value: &str) -> (ColumnRef, TypedValue) {
         (
             colref(name, ordinal),
@@ -949,13 +945,14 @@ mod tests {
             schema: docs_bind_schema(),
             assignments: vec![text_assignment("title", 2, "v2")],
             vector: Some(vec![0.5; 768]),
-            predicate: BoundPredicate::Id(7),
+            predicate: key_eq("alice"),
         });
         let program = compile(plan, Some(&docs_meta_schema())).expect("an UPDATE compiles");
 
         let (set, vector) = match program.ops.as_slice() {
             [
-                Op::BitmapId { ordinal: 7, .. },
+                Op::String { .. },
+                Op::BitmapEq { .. },
                 Op::Mutate {
                     set: Some(set),
                     vector: Some(vector),
@@ -1073,38 +1070,46 @@ mod tests {
         );
     }
 
+    /// Naming a row by its KEY lowers to the same two ops any other equality
+    /// does — load the comparand, consult the index. There is no dedicated
+    /// opcode for identity any more, because identity is now just a column.
     #[test]
-    fn an_id_predicate_emits_a_singleton_bitmap() {
-        // No comparand register and no index lookup: the ordinal is the whole
-        // operand, so it rides in the op itself.
-        let ops = filtered_ops(BoundPredicate::Id(7));
+    fn a_key_predicate_emits_an_ordinary_equality_lookup() {
+        let ops = filtered_ops(key_eq("alice"));
+        assert!(
+            matches!(ops[0], Op::String { dst: Reg(0), .. }),
+            "got {:?}",
+            ops[0]
+        );
+        // `author` is declaration ordinal 1, ColumnId 0.
         assert_eq!(
-            ops[0],
-            Op::BitmapId {
+            ops[1],
+            Op::BitmapEq {
                 collection: "docs".to_string(),
-                ordinal: 7,
-                dst: Reg(0),
+                col: 0,
+                value: Reg(0),
+                dst: Reg(1),
             }
         );
         assert_eq!(
-            ops[1],
+            ops[2],
             Op::OpenRead {
                 cur: Cursor(0),
                 collection: "docs".to_string(),
-                filter: Some(Reg(0)),
+                filter: Some(Reg(1)),
             }
         );
     }
 
     #[test]
-    fn an_id_predicate_composes_with_the_index_ones() {
+    fn a_key_predicate_composes_with_the_index_ones() {
         let ops = filtered_ops(BoundPredicate::And(
-            Box::new(BoundPredicate::Id(7)),
+            Box::new(key_eq("alice")),
             Box::new(cmp_pred("published_at", 3, CompareOp::Lt, 2)),
         ));
         assert!(
-            matches!(ops[0], Op::BitmapId { ordinal: 7, .. }),
-            "the id half emits its own bitmap"
+            ops.iter().any(|op| matches!(op, Op::BitmapEq { col: 0, .. })),
+            "the key half is an equality lookup on its column"
         );
         assert!(
             ops.iter().any(|op| matches!(op, Op::BitmapAnd { .. })),
