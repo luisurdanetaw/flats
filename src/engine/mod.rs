@@ -2020,6 +2020,106 @@ mod tests {
         );
     }
 
+    /// A keyed collection: (k INT PRIMARY KEY) alongside the vector.
+    fn cfg_keyed(id: u32, dim: usize, capacity: usize) -> CollectionConfig {
+        CollectionConfig {
+            id,
+            name: format!("k{id}"),
+            capacity,
+            schema: Schema::from_columns(vec![
+                ColumnSpec::Vector {
+                    name: "vector".into(),
+                    dim: NonZeroUsize::new(dim).unwrap(),
+                },
+                ColumnSpec::Key {
+                    name: "k".into(),
+                    ty: ColumnType::Int,
+                },
+            ])
+            .unwrap(),
+        }
+    }
+
+    /// Log a duplicate-key insert the way a LOST RACE does: straight to the
+    /// WAL handle, past `Db::insert`'s pre-WAL lookup.
+    ///
+    /// That lookup is what makes the refusal unreachable through the public
+    /// API single-threaded — which is the point of it — so a deterministic
+    /// test of the apply-time verdict has to go around it, exactly as a second
+    /// thread does by reading "absent" before the winner commits.
+    fn log_duplicate(db: &Db, collection: u32, ordinal: u64, key: i64) -> Outcome {
+        db.wal
+            .as_ref()
+            .expect("wal present")
+            .handle()
+            .append(Record::Insert {
+                collection,
+                ordinal,
+                vector: vec![0.0, 1.0],
+                metadata: vec![(0, Value::Int(key))],
+            })
+            .expect("a refusal is success, not an error")
+            .outcome
+    }
+
+    /// A REFUSED record is durable and will never do anything, so the
+    /// watermarks must advance past it exactly as they do past a conflicted
+    /// one. Otherwise one duplicate key wedges truncation forever: the log can
+    /// never shed the refused frame, and every reopen replays it again.
+    #[test]
+    fn a_refused_insert_does_not_wedge_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_keyed(0, 2, 64)], manual_opts()).unwrap();
+
+        db.insert(0, &[1.0, 0.0], vec![(0, Value::Int(1))]).unwrap();
+        // Same key, logged past the pre-WAL check: durable, and refused on the
+        // commit thread. Deliberately the LAST record — a later applied one
+        // would advance the high-water mark past it and hide the stall.
+        assert_eq!(
+            log_duplicate(&db, 0, 1, 1),
+            Outcome::Rejected(RejectReason::DuplicateKey)
+        );
+
+        db.checkpoint().expect("checkpoint runs");
+        let after = std::fs::metadata(dir.path().join("wal.log")).unwrap().len();
+        assert_eq!(
+            after, 8,
+            // A fully truncated log is just its magic+version header.
+            "truncation must get past the refused frame, not stall on it"
+        );
+        db.close().unwrap();
+    }
+
+    /// And the verdict survives a reopen: the refused frame is replayed, and
+    /// must be refused AGAIN rather than installing a second row with the same
+    /// key. Determinism is what makes a refusal safe to reach on the apply
+    /// path at all.
+    #[test]
+    fn a_refusal_is_reached_again_on_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Db::open(dir.path(), &[cfg_keyed(0, 2, 64)], manual_opts()).unwrap();
+            db.insert(0, &[1.0, 0.0], vec![(0, Value::Int(1))]).unwrap();
+            assert_eq!(
+                log_duplicate(&db, 0, 1, 1),
+                Outcome::Rejected(RejectReason::DuplicateKey)
+            );
+            // No checkpoint and no close: both frames stay in the log, so
+            // reopening replays them.
+            drop(db);
+        }
+
+        let db = Db::open(dir.path(), &[cfg_keyed(0, 2, 64)], manual_opts()).unwrap();
+        assert!(!db.is_poisoned(), "replaying a refusal must not halt the db");
+        let live = db.live_snapshot(0).expect("collection open");
+        assert_eq!(
+            live.bitmap().len(),
+            1,
+            "replay must refuse the duplicate again, not install it"
+        );
+        db.close().unwrap();
+    }
+
     /// One record means one buffer, on the commit thread now and on every
     /// replay forever. The cap turns "this UPDATE rewrites a million vectors"
     /// into a named error at the door instead of an allocation failure inside
