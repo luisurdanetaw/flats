@@ -492,6 +492,103 @@ mod tests {
         db.execute(&sql).expect("the row is inserted");
     }
 
+    // -- the key is unique ---------------------------------------------------
+
+    /// Every live row's `title`, from a projection of that column alone.
+    fn only_titles(db: &Db) -> Vec<String> {
+        collect(db.execute("SELECT title FROM docs;").expect("the select runs"))
+            .into_iter()
+            .map(|row| match &row[0] {
+                RegValue::Str(s) => s.clone(),
+                other => panic!("expected a title string, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The promise the whole design rests on: two live rows can never hold the
+    /// same key. Without it, equality on the key would not name one row, and
+    /// `SET vector` — which is only allowed because it does — could hand one
+    /// embedding to several rows.
+    ///
+    /// A duplicate is a REFUSAL, not a failure: the first row stays exactly as
+    /// it was, the database keeps working, and the caller gets an error naming
+    /// the column and the value.
+    #[test]
+    fn a_duplicate_key_is_refused() {
+        let (_dir, db) = docs_db();
+        insert(&db, "alice", "first", 1);
+
+        let err = match db.execute(
+            "INSERT INTO docs (author, vector, title, published_at) \
+             VALUES ('alice', [0.9, 0.0, 0.0, 0.0], 'second', 2);",
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("the second 'alice' must be refused"),
+        };
+        assert!(
+            matches!(
+                &err,
+                Error::Engine(EngineError::DuplicateKey { column, value })
+                    if column == "author" && value.contains("alice")
+            ),
+            "got {err:?}"
+        );
+
+        // The first row is untouched and the collection still holds one row.
+        assert_eq!(
+            only_titles(&db),
+            vec!["first"],
+            "the refused insert left nothing behind"
+        );
+        // And the database is healthy: a DIFFERENT key still goes in.
+        insert(&db, "bob", "third", 3);
+        assert_eq!(remaining(&db), vec!["alice", "bob"]);
+        db.close().unwrap();
+    }
+
+    /// Retiring a row releases its key. Otherwise a collection would slowly
+    /// fill up with names that can never be used again.
+    #[test]
+    fn a_deleted_key_can_be_reused() {
+        let (_dir, db) = docs_db();
+        insert(&db, "alice", "first", 1);
+        delete(&db, "DELETE FROM docs WHERE author = 'alice';");
+        insert(&db, "alice", "second", 2);
+
+        assert_eq!(
+            only_titles(&db),
+            vec!["second"]
+        );
+        db.close().unwrap();
+    }
+
+    /// An UPDATE copies the row it edits, so the copy carries the same key as
+    /// the original — which is being retired in the very same record. The
+    /// uniqueness check must see those together, or every single UPDATE would
+    /// be refused as a duplicate of the row it replaces.
+    #[test]
+    fn an_update_is_not_a_duplicate_of_the_row_it_replaces() {
+        let (_dir, db) = docs_db();
+        insert(&db, "alice", "v1", 1);
+
+        update(&db, "UPDATE docs SET title = 'v2' WHERE author = 'alice';");
+        assert_eq!(
+            only_titles(&db),
+            vec!["v2"]
+        );
+        // Including the full-replacement form, which installs a fresh row.
+        update(
+            &db,
+            "UPDATE docs SET vector = [0.0, 0.0, 0.0, 1.0], title = 'v3' \
+             WHERE author = 'alice';",
+        );
+        assert_eq!(
+            only_titles(&db),
+            vec!["v3"]
+        );
+        db.close().unwrap();
+    }
+
     /// Drain a stream into rows, failing on the first `Err` item.
     fn collect(stream: RowStream) -> Vec<Vec<RegValue>> {
         stream
