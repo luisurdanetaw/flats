@@ -2171,4 +2171,75 @@ mod tests {
         );
         assert_eq!(rows_of(&db).len(), 1, "one row stays one row");
     }
+
+    /// TWO THREADS, ONE KEY. The pre-WAL check cannot settle this: both
+    /// callers can look, both see the key absent, and both append — so without
+    /// a second check on the commit thread the collection ends up holding the
+    /// key twice, and equality on it stops naming one row.
+    ///
+    /// Exactly one insert must win per round. The loser gets a refusal, not a
+    /// conflict (retrying would lose again, forever) and certainly not a
+    /// poisoned database.
+    #[test]
+    fn concurrent_inserts_cannot_duplicate_a_key() {
+        use std::sync::{Arc, Barrier};
+
+        const ROUNDS: usize = 12;
+        let (_dir, db) = docs_db();
+        let db = Arc::new(db);
+        let barrier = Arc::new(Barrier::new(2));
+
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let db = Arc::clone(&db);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    // Outcomes are COLLECTED, never panicked on: a thread that
+                    // dies before its barrier leaves its peer blocked forever,
+                    // so the suite would hang instead of failing.
+                    let mut wins = 0usize;
+                    let mut wrong = Vec::new();
+                    for round in 0..ROUNDS {
+                        barrier.wait();
+                        let sql = format!(
+                            "INSERT INTO docs (author, vector, title, published_at) \
+                             VALUES ('k{round}', [0.1, 0.2, 0.3, 0.4], 'doc', {});",
+                            round + 1
+                        );
+                        match db.execute(&sql) {
+                            Ok(_) => wins += 1,
+                            Err(Error::Engine(EngineError::DuplicateKey { .. })) => {}
+                            Err(other) => wrong.push(other.to_string()),
+                        }
+                    }
+                    (wins, wrong)
+                })
+            })
+            .collect();
+
+        let mut total_wins = 0usize;
+        let mut wrong = Vec::new();
+        for worker in workers {
+            let (wins, mut errs) = worker.join().expect("worker thread");
+            total_wins += wins;
+            wrong.append(&mut errs);
+        }
+        assert!(
+            wrong.is_empty(),
+            "a loser must be refused, not fail some other way: {wrong:?}"
+        );
+        assert_eq!(
+            total_wins, ROUNDS,
+            "exactly one insert per key may be accepted"
+        );
+        assert!(!db.is_poisoned(), "a duplicate key must never halt the db");
+
+        // And the collection really holds each key once.
+        let rows = rows_of(&db);
+        assert_eq!(rows.len(), ROUNDS, "one row per key");
+        let mut keys: Vec<String> = rows.into_iter().map(|(author, _)| author).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), ROUNDS, "no key appears twice");
+    }
 }
