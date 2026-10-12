@@ -767,7 +767,7 @@ fn commit_batch<A: Apply>(
         return;
     }
 
-    // --- one write + ONE fsync for the whole batch (group commit) ---
+    // --- one write + ONE fsyncclaude for the whole batch (group commit) ---
     let durable: io::Result<()> = (|| {
         file.write_all(frame_buf)?;
         // fdatasync: we need the data + the file-size growth, not mtime.
@@ -1112,6 +1112,11 @@ mod tests {
         /// When set, `apply` reports this one LSN as stale rather than
         /// applying it — the applier's verdict, not a failure.
         conflict_at: Option<u64>,
+        /// When set, `apply` REFUSES this one LSN: the record is well-formed
+        /// and durable, but folding it in would break an invariant (a
+        /// duplicate primary key). Like a conflict it is a verdict rather than
+        /// a failure — but unlike a conflict, retrying cannot help.
+        reject_at: Option<u64>,
         /// How many times `checkpoint` was called. A poisoned log must never
         /// call it: checkpoint advances the durable watermark and truncates.
         checkpoints: Arc<AtomicUsize>,
@@ -1123,6 +1128,7 @@ mod tests {
                 log: Arc::new(Mutex::new(Vec::new())),
                 fail_at: None,
                 conflict_at: None,
+                reject_at: None,
                 checkpoints: Arc::new(AtomicUsize::new(0)),
             }
         }
@@ -1143,6 +1149,14 @@ mod tests {
             }
         }
 
+        /// An applier that refuses exactly `lsn` as a duplicate key.
+        fn rejecting_at(lsn: u64) -> Self {
+            CollectingApplier {
+                reject_at: Some(lsn),
+                ..CollectingApplier::new()
+            }
+        }
+
         fn snapshot(&self) -> Vec<(u64, Record)> {
             self.log.lock().expect("lock not poisoned").clone()
         }
@@ -1159,6 +1173,9 @@ mod tests {
             }
             if self.conflict_at == Some(lsn.0) {
                 return Ok(Outcome::Conflicted);
+            }
+            if self.reject_at == Some(lsn.0) {
+                return Ok(Outcome::Rejected(RejectReason::DuplicateKey));
             }
             self.log
                 .lock()
@@ -1243,6 +1260,54 @@ mod tests {
             applier.snapshot().iter().map(|(l, _)| *l).collect::<Vec<_>>(),
             vec![1, 3],
             "the stale record was never folded in"
+        );
+
+        drop(handle);
+        wal.shutdown();
+    }
+
+    /// A REFUSED record is a third thing, and the difference from a conflict is
+    /// not cosmetic: a conflict means "someone got there first, read again and
+    /// retry", while a refusal means "this record can never be applied". The
+    /// waiter must be able to tell them apart, because retrying a refusal is a
+    /// guaranteed waste — and, like a conflict, a refusal is a healthy verdict
+    /// that must never halt the log.
+    #[test]
+    fn a_rejected_apply_is_reported_without_poisoning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+
+        let applier = CollectingApplier::rejecting_at(2);
+        let wal = Wal::start(&path, applier.clone(), 0).unwrap();
+        let handle = wal.handle();
+
+        handle.append(insert(0, 0, &[1.0])).unwrap();
+
+        let refused = handle
+            .append(insert(0, 1, &[2.0]))
+            .expect("a refusal is success, not an error");
+        assert_eq!(refused.lsn, Lsn(2));
+        assert_eq!(
+            refused.outcome,
+            Outcome::Rejected(RejectReason::DuplicateKey)
+        );
+        assert!(!refused.applied());
+        assert_ne!(
+            refused.outcome,
+            Outcome::Conflicted,
+            "a refusal must not read as a conflict — one is retryable, the other never is"
+        );
+
+        assert!(wal.poison().is_none(), "a refusal must never halt the log");
+
+        // The log carries on, exactly as it does after a conflict.
+        let next = handle.append(insert(0, 2, &[3.0])).unwrap();
+        assert_eq!(next.lsn, Lsn(3));
+        assert_eq!(next.outcome, Outcome::Applied);
+        assert_eq!(
+            applier.snapshot().iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            vec![1, 3],
+            "the refused record was never folded in"
         );
 
         drop(handle);
