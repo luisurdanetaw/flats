@@ -1772,44 +1772,44 @@ mod tests {
         assert_eq!(remaining(&db).len(), 4, "a refused DELETE removes nothing");
         db.close().unwrap();
     }
-    // -- WHERE id = <n> ------------------------------------------------------
+    // -- WHERE <key> = <value> -----------------------------------------------
 
     #[test]
-    fn a_row_can_be_named_by_its_id() {
+    fn a_row_can_be_named_by_its_key() {
         let (_dir, db) = docs_db();
-        seed_filterable(&db); // ordinals 0..3, authors alice/bob/carol/dave
+        seed_filterable(&db); // authors alice/bob/carol/dave — `author` is the key
 
-        assert_eq!(where_authors(&db, "id = 2"), vec!["carol"]);
-        assert_eq!(where_authors(&db, "id = 0"), vec!["alice"]);
-        // Past the high-water mark: no row, no error.
-        assert!(where_authors(&db, "id = 999").is_empty());
+        assert_eq!(where_authors(&db, "author = 'carol'"), vec!["carol"]);
+        assert_eq!(where_authors(&db, "author = 'alice'"), vec!["alice"]);
+        // No such key: no row, no error.
+        assert!(where_authors(&db, "author = 'nobody'").is_empty());
         db.close().unwrap();
     }
 
     /// An ordinal names a row, not a slot: once the row is retired, naming it
-    /// matches nothing. Otherwise `WHERE id = 2` would be a back door around
+    /// matches nothing. Otherwise naming the key would be a back door around
     /// the liveness snapshot every other predicate goes through.
     #[test]
-    fn a_retired_row_cannot_be_named_by_its_id() {
+    fn a_retired_row_cannot_be_named_by_its_key() {
         let (_dir, db) = docs_db();
         seed_filterable(&db);
 
-        delete(&db, "DELETE FROM docs WHERE id = 2;");
-        assert!(where_authors(&db, "id = 2").is_empty());
+        delete(&db, "DELETE FROM docs WHERE author = 'carol';");
+        assert!(where_authors(&db, "author = 'carol'").is_empty());
         assert_eq!(remaining(&db).len(), 3);
         db.close().unwrap();
     }
 
     #[test]
-    fn an_id_predicate_composes_with_a_column_one() {
+    fn a_key_predicate_composes_with_a_column_one() {
         let (_dir, db) = docs_db();
         seed_filterable(&db);
 
         assert_eq!(
-            where_authors(&db, "id = 1 AND published_at = 5"),
+            where_authors(&db, "author = 'bob' AND published_at = 5"),
             vec!["bob"]
         );
-        assert!(where_authors(&db, "id = 1 AND published_at = 9").is_empty());
+        assert!(where_authors(&db, "author = 'bob' AND published_at = 9").is_empty());
         db.close().unwrap();
     }
 
@@ -1942,7 +1942,7 @@ mod tests {
 
         update(
             &db,
-            "UPDATE docs SET vector = [0.0, 0.0, 0.0, 1.0], title = 'v2' WHERE id = 0;",
+            "UPDATE docs SET vector = [0.0, 0.0, 0.0, 1.0], title = 'v2' WHERE author = 'alice';",
         );
 
         // Found by the NEW embedding...
@@ -1965,13 +1965,55 @@ mod tests {
         db.close().unwrap();
     }
 
+    /// The embedding may only be assigned to a row named by its KEY. Any other
+    /// predicate could match many rows, and one statement carries one vector —
+    /// so handing it to all of them is never what was meant.
+    #[test]
+    fn setting_a_vector_needs_a_key_predicate() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        // `title` is an ordinary column: every seeded row has title 'doc', so
+        // this is exactly the "one vector, many rows" mistake.
+        assert!(matches!(
+            db.execute("UPDATE docs SET vector = [0.0, 0.0, 0.0, 1.0] WHERE title = 'doc';"),
+            Err(Error::Bind(BindError::CannotSetVector { column })) if column == "vector"
+        ));
+        // A range over the key is not an identity either.
+        assert!(matches!(
+            db.execute("UPDATE docs SET vector = [0.0, 0.0, 0.0, 1.0] WHERE published_at < 9;"),
+            Err(Error::Bind(BindError::CannotSetVector { .. }))
+        ));
+        db.close().unwrap();
+    }
+
+    /// The ordinal is no longer addressable, and that is the point of the key:
+    /// an ordinal moves when a row is rewritten and is renumbered wholesale by
+    /// compaction, so a statement that named one could silently hit a different
+    /// row later. `id` is now an ordinary name with nothing behind it.
+    #[test]
+    fn a_row_cannot_be_named_by_its_ordinal() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        assert!(matches!(
+            db.execute("SELECT author FROM docs WHERE id = 0;"),
+            Err(Error::Bind(BindError::ColumnNotFound(name))) if name == "id"
+        ));
+        assert!(matches!(
+            db.execute("DELETE FROM docs WHERE id = 0;"),
+            Err(Error::Bind(BindError::ColumnNotFound(name))) if name == "id"
+        ));
+        db.close().unwrap();
+    }
+
     #[test]
     fn a_replaced_embedding_survives_reopen() {
         let (dir, db) = docs_db();
         seed_filterable(&db);
         update(
             &db,
-            "UPDATE docs SET vector = [0.0, 0.0, 0.0, 1.0] WHERE id = 0;",
+            "UPDATE docs SET vector = [0.0, 0.0, 0.0, 1.0] WHERE author = 'alice';",
         );
         drop(db); // no closing checkpoint: the WAL must carry it
 
