@@ -1323,7 +1323,8 @@ impl std::error::Error for ExecError {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use super::{ExecError, OutputRow, RegValue, Vm};
+    use super::{ExecError, OutputRow, RegValue, Vm, mutation_outcome};
+    use crate::wal::wal::{Outcome, RejectReason};
     use crate::compiler::bytecode::{Addr, Cursor, Op, Program, Reg};
     use crate::compiler::constants::{Const, ConstPool};
     use crate::engine::{CollectionConfig, Db, DbOptions};
@@ -1331,6 +1332,24 @@ mod tests {
     use crate::metadata::common::{ColumnSpec, ColumnType, Row, Schema, Value};
     use crate::vm::record::SplitError;
     use std::num::NonZeroUsize;
+
+    /// The three apply outcomes map to three different fates, and the third is
+    /// the one worth a test of its own: a REFUSAL must not arrive as a
+    /// `Conflict`. If it did, the retry loop in `Db::execute` would spend its
+    /// whole budget re-running a statement whose verdict was final on the first
+    /// attempt, then report sustained contention that never happened.
+    #[test]
+    fn a_refusal_does_not_read_as_a_conflict() {
+        assert!(matches!(mutation_outcome(Outcome::Applied), Ok(())));
+        assert!(matches!(
+            mutation_outcome(Outcome::Conflicted),
+            Err(ExecError::Conflict)
+        ));
+        assert!(matches!(
+            mutation_outcome(Outcome::Rejected(RejectReason::DuplicateKey)),
+            Err(ExecError::Rejected(RejectReason::DuplicateKey))
+        ));
+    }
 
     /// A metadata row for `docs_schema` — keyed by storage `ColumnId`, which is
     /// NOT the declaration order: author #0, title #1, published_at #2 (the

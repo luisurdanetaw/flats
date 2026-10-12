@@ -431,13 +431,29 @@ fn reject_unsupported(program: &Program) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, RowStream};
+    use super::{Error, RowStream, is_retryable};
     use crate::compiler::bytecode::{Addr, Cursor, Op, Program, Reg};
     use crate::compiler::constants::ConstPool;
     use crate::engine::{Db, DbOptions};
     use crate::error::Error as EngineError;
     use crate::sql::BindError;
     use crate::vm::exec::{RegValue, Vm};
+
+    /// Only a CONFLICT earns another attempt. A refusal is final — the record
+    /// was durable, the applier looked at it and said never, and re-running the
+    /// statement would produce the identical verdict — so it must leave the
+    /// retry loop immediately and reach the caller as itself.
+    #[test]
+    fn only_a_conflict_is_retried() {
+        use crate::vm::exec::ExecError;
+        use crate::wal::wal::RejectReason;
+
+        assert!(is_retryable(&Error::Exec(ExecError::Conflict)));
+        assert!(!is_retryable(&Error::Exec(ExecError::Rejected(
+            RejectReason::DuplicateKey
+        ))));
+        assert!(!is_retryable(&Error::WriteConflict { attempts: 10 }));
+    }
 
     const CREATE: &str = "CREATE COLLECTION docs (
         author TEXT,
