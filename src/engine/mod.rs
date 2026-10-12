@@ -664,7 +664,7 @@ impl Flusher {
 // make the operator decide.
 
 const CATALOG_MAGIC: &[u8; 4] = b"CAT0";
-const CATALOG_VERSION: u32 = 2;
+const CATALOG_VERSION: u32 = 3;
 const CATALOG_FILE: &str = "catalog.snap";
 const CATALOG_TMP: &str = "catalog.snap.tmp";
 
@@ -1521,6 +1521,8 @@ pub(crate) fn bind_schema(schema: &Schema) -> crate::sql::bind::Schema {
         ty: AstType::Vector(v.dim.get()),
         ordinal: v.ordinal.get(),
         is_vector: true,
+        // The embedding can never be the key — `from_columns` refuses it.
+        primary_key: false,
     });
     for def in &schema.columns {
         columns.push(ColumnSchema {
@@ -1532,6 +1534,9 @@ pub(crate) fn bind_schema(schema: &Schema) -> crate::sql::bind::Schema {
             },
             ordinal: def.ordinal.get(),
             is_vector: false,
+            // Read off the PERSISTED schema, so a reopened collection keys on
+            // the column it was created with rather than on a name convention.
+            primary_key: schema.primary_key == Some(def.id),
         });
     }
     // Declaration order — the binder indexes projections by these ordinals.

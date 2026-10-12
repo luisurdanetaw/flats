@@ -91,6 +91,16 @@ impl Schema {
     pub fn column(&self, name: &str) -> Option<&ColumnSchema> {
         self.columns.iter().find(|c| c.name == name)
     }
+
+    /// The PRIMARY KEY column.
+    ///
+    /// Total for anything V-SQL produced: `bind_create` refuses a schema
+    /// without exactly one key, and a schema read back from the catalog
+    /// reconstructs it. `None` only for a collection declared programmatically
+    /// without a key, which keyed statements then cannot address.
+    pub fn primary_key(&self) -> Option<&ColumnSchema> {
+        self.columns.iter().find(|c| c.primary_key)
+    }
 }
 
 /// One resolved column: its name, type, ordinal (the VM's `Column` index), and
@@ -106,6 +116,13 @@ pub struct ColumnSchema {
     /// `true` for the single vector column (equivalently `matches!(ty,
     /// ColumnType::Vector(_))`, stored explicitly so consumers need not match).
     pub is_vector: bool,
+    /// `true` for the column declared `PRIMARY KEY` — the one that NAMES a row.
+    ///
+    /// Carried on the resolved schema (not re-derived from a column called
+    /// "id") because every later rule depends on it: which predicate may
+    /// address a single row, which column may not be assigned, and which value
+    /// the applier checks for uniqueness.
+    pub primary_key: bool,
 }
 
 /// A resolved reference to a column: the bound `ordinal` is the whole product
@@ -431,6 +448,23 @@ pub enum BindError {
         /// How many vector columns were declared (valid schemas have exactly 1).
         found: usize,
     },
+    /// A `CREATE COLLECTION` schema did not declare exactly one PRIMARY KEY.
+    ///
+    /// Required, not optional: the key is how `UPDATE` and `DELETE` name a row.
+    /// Without one the only handle left would be the ordinal, which moves when
+    /// a row is rewritten and is renumbered wholesale by compaction — an
+    /// identity that silently stops pointing at what the caller meant.
+    PrimaryKeyCount {
+        /// How many columns were marked `PRIMARY KEY`.
+        found: usize,
+    },
+    /// A column that cannot serve as an identity was marked `PRIMARY KEY`.
+    PrimaryKeyType {
+        /// The offending column's name.
+        column: String,
+        /// Its declared type.
+        ty: ColumnType,
+    },
     /// A `SEARCH`'s `TOP k` is not a positive count.
     InvalidTopK {
         /// The requested count.
@@ -492,6 +526,15 @@ impl fmt::Display for BindError {
             BindError::VectorColumnCount { found } => write!(
                 f,
                 "a collection must have exactly one VECTOR column, found {found}"
+            ),
+            BindError::PrimaryKeyCount { found } => write!(
+                f,
+                "a collection must declare exactly one PRIMARY KEY column, found {found}"
+            ),
+            BindError::PrimaryKeyType { column, ty } => write!(
+                f,
+                "column {column:?} cannot be a PRIMARY KEY: {ty:?} is not an identity \
+                 (use TEXT or INT)"
             ),
             BindError::InvalidTopK { k } => {
                 write!(f, "TOP must be at least 1, found {k}")
@@ -858,6 +901,7 @@ fn bind_create(stmt: CreateStmt, catalog: &impl Catalog) -> Result<BoundCreate, 
             ty: def.ty,
             ordinal,
             is_vector: matches!(def.ty, ColumnType::Vector(_)),
+            primary_key: def.primary_key,
         })
         .collect();
 
@@ -866,6 +910,21 @@ fn bind_create(stmt: CreateStmt, catalog: &impl Catalog) -> Result<BoundCreate, 
     if vector_count != 1 {
         return Err(BindError::VectorColumnCount {
             found: vector_count,
+        });
+    }
+
+    // 4. Rule (D): exactly one PRIMARY KEY, and of a type that can be an
+    //    identity. Checked AFTER the vector rule so a schema that is wrong in
+    //    both ways reports the more fundamental problem first.
+    let keys: Vec<&ColumnSchema> = columns.iter().filter(|c| c.primary_key).collect();
+    if keys.len() != 1 {
+        return Err(BindError::PrimaryKeyCount { found: keys.len() });
+    }
+    let key = keys[0];
+    if !matches!(key.ty, ColumnType::Text | ColumnType::Int) {
+        return Err(BindError::PrimaryKeyType {
+            column: key.name.clone(),
+            ty: key.ty,
         });
     }
 
@@ -1142,6 +1201,18 @@ mod tests {
             ty,
             ordinal,
             is_vector,
+            primary_key: false,
+        }
+    }
+
+    /// The same, for the column a fixture declares `PRIMARY KEY`.
+    fn col_key(name: &str, ty: ColumnType, ordinal: usize) -> ColumnSchema {
+        ColumnSchema {
+            name: name.to_string(),
+            ty,
+            ordinal,
+            is_vector: false,
+            primary_key: true,
         }
     }
 
@@ -1151,7 +1222,7 @@ mod tests {
         Schema {
             columns: vec![
                 col("vector", ColumnType::Vector(768), 0, true),
-                col("author", ColumnType::Text, 1, false),
+                col_key("author", ColumnType::Text, 1),
                 col("title", ColumnType::Text, 2, false),
                 col("published_at", ColumnType::Int, 3, false),
             ],
@@ -1890,7 +1961,7 @@ mod tests {
         let cat = TestCatalog::new();
         let src = "CREATE COLLECTION docs (
             vector VECTOR(768),
-            author TEXT,
+            author TEXT PRIMARY KEY,
             title TEXT,
             published_at INT
         ) WITH (capacity = 1000000);";
@@ -1997,7 +2068,10 @@ mod tests {
                 BoundStatement::CreateCollection(c) => c,
                 other => panic!("expected a CREATE, got {other:?}"),
             };
-            let key = bound.schema.primary_key();
+            let key = bound
+                .schema
+                .primary_key()
+                .expect("a V-SQL create always declares one");
             assert_eq!(key.ordinal, 0);
             assert_eq!(key.ty, ty);
             assert!(key.primary_key);
@@ -2011,7 +2085,7 @@ mod tests {
         let cat = docs_catalog();
         let src = "CREATE COLLECTION docs (
             vector VECTOR(768),
-            author TEXT,
+            author TEXT PRIMARY KEY,
             title TEXT,
             published_at INT
         ) WITH (capacity = 1000000);";

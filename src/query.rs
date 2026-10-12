@@ -469,7 +469,7 @@ mod tests {
     }
 
     const CREATE: &str = "CREATE COLLECTION docs (
-        author TEXT,
+        author TEXT PRIMARY KEY,
         vector VECTOR(4),
         title TEXT,
         published_at INT
@@ -629,7 +629,7 @@ mod tests {
         // COMPILE — binds cleanly, cannot lower. The binder counts vector
         // columns but never checks the dimension.
         assert!(matches!(
-            db.execute("CREATE COLLECTION broken (v VECTOR(0), a INT) WITH (capacity = 10);"),
+            db.execute("CREATE COLLECTION broken (v VECTOR(0), a INT PRIMARY KEY) WITH (capacity = 10);"),
             Err(Error::Compile(_))
         ));
 
@@ -647,14 +647,14 @@ mod tests {
         //   * `id` is the ordinal pseudo-column SEARCH returns, so a stored
         //     column may not shadow it. A storage rule, invisible to the binder.
         assert!(matches!(
-            db.execute("CREATE COLLECTION reserved (v VECTOR(2), id INT) WITH (capacity = 4);"),
+            db.execute("CREATE COLLECTION reserved (v VECTOR(2), id INT PRIMARY KEY) WITH (capacity = 4);"),
             Err(Error::Engine(EngineError::ReservedColumn(name))) if name == "id"
         ));
         //   * capacity is a RUNTIME property — how many rows are already there —
         //     so only the engine can know the collection is full. This one also
         //     shows why the eager/lazy split matters: the INSERT ran INSIDE
         //     `execute`, so its failure is an outer error, not a stream item.
-        db.execute("CREATE COLLECTION tiny (v VECTOR(2), a INT) WITH (capacity = 1);")
+        db.execute("CREATE COLLECTION tiny (v VECTOR(2), a INT PRIMARY KEY) WITH (capacity = 1);")
             .expect("creates");
         let fill = "INSERT INTO tiny (v, a) VALUES ([1.0, 0.0], 1);";
         db.execute(fill).expect("the first row fits");
@@ -914,7 +914,7 @@ mod tests {
         // so the clamp is doing all the work and a stray `k`-sized reservation
         // would still abort.
         db.execute(
-            "CREATE COLLECTION empty_docs (vector VECTOR(4), author TEXT) \
+            "CREATE COLLECTION empty_docs (vector VECTOR(4), author TEXT PRIMARY KEY) \
              WITH (capacity = 16);",
         )
         .expect("the collection is created");
@@ -1259,11 +1259,11 @@ mod tests {
         // therefore reads the wrong column — or, for alpha's ordinal 1 under
         // beta's schema, resolves to the VECTOR and emits nothing at all.
         db.execute(
-            "CREATE COLLECTION alpha (emb VECTOR(2), title TEXT, tag TEXT) WITH (capacity = 8);",
+            "CREATE COLLECTION alpha (emb VECTOR(2), title TEXT PRIMARY KEY, tag TEXT) WITH (capacity = 8);",
         )
         .expect("alpha is created");
         db.execute(
-            "CREATE COLLECTION beta (tag TEXT, emb VECTOR(2), title TEXT) WITH (capacity = 8);",
+            "CREATE COLLECTION beta (tag TEXT PRIMARY KEY, emb VECTOR(2), title TEXT) WITH (capacity = 8);",
         )
         .expect("beta is created");
 

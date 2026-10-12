@@ -156,6 +156,18 @@ mod tests {
             ty,
             ordinal,
             is_vector,
+            primary_key: false,
+        }
+    }
+
+    /// The same, for the column a fixture declares `PRIMARY KEY`.
+    fn col_key(name: &str, ty: ColumnType, ordinal: usize) -> ColumnSchema {
+        ColumnSchema {
+            name: name.to_string(),
+            ty,
+            ordinal,
+            is_vector: false,
+            primary_key: true,
         }
     }
 
@@ -165,7 +177,7 @@ mod tests {
         Schema {
             columns: vec![
                 col("vector", ColumnType::Vector(768), 0, true),
-                col("author", ColumnType::Text, 1, false),
+                col_key("author", ColumnType::Text, 1),
                 col("title", ColumnType::Text, 2, false),
                 col("published_at", ColumnType::Int, 3, false),
             ],
@@ -562,7 +574,7 @@ mod tests {
         let cat = TestCatalog::new();
         let src = "CREATE COLLECTION docs (
             vector VECTOR(768),
-            author TEXT,
+            author TEXT PRIMARY KEY,
             title TEXT,
             published_at INT
         ) WITH (capacity = 1000000);";

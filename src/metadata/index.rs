@@ -91,7 +91,9 @@ use crate::metadata::common::{
 };
 
 const MAGIC: &[u8; 4] = b"MET0";
-const VERSION: u32 = 1;
+/// 2 = the embedded `Schema` carries a PRIMARY KEY. The snapshot serializes
+/// the schema itself, so a field added to it re-shapes this file.
+const VERSION: u32 = 2;
 const SNAP_FILE: &str = "metadata.snap";
 const TMP_FILE: &str = "metadata.snap.tmp";
 

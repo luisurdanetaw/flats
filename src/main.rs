@@ -500,8 +500,8 @@ keys
   ctrl-c             abandon the line, or stop a running statement
 
 statements end with `;` and may span several lines
-  CREATE COLLECTION docs (vector VECTOR(3), author TEXT) WITH (capacity = 1000);
-  INSERT INTO docs (vector, author) VALUES ([0.1, 0.2, 0.3], 'alice');
+  CREATE COLLECTION docs (doc_id TEXT PRIMARY KEY, vector VECTOR(3), author TEXT) WITH (capacity = 1000);
+  INSERT INTO docs (doc_id, vector, author) VALUES ('d1', [0.1, 0.2, 0.3], 'alice');
   SELECT * FROM docs;
   SEARCH TOP 5 NEAREST TO [0.1, 0.2, 0.3] FROM docs RETURNING id, score, author;
 "

@@ -732,6 +732,18 @@ mod tests {
             ty,
             ordinal,
             is_vector,
+            primary_key: false,
+        }
+    }
+
+    /// The same, for the column a fixture declares `PRIMARY KEY`.
+    fn bcol_key(name: &str, ty: ColumnType, ordinal: usize) -> ColumnSchema {
+        ColumnSchema {
+            name: name.to_string(),
+            ty,
+            ordinal,
+            is_vector: false,
+            primary_key: true,
         }
     }
 
@@ -741,7 +753,7 @@ mod tests {
         BindSchema {
             columns: vec![
                 bcol("vector", ColumnType::Vector(768), 0, true),
-                bcol("author", ColumnType::Text, 1, false),
+                bcol_key("author", ColumnType::Text, 1),
                 bcol("title", ColumnType::Text, 2, false),
                 bcol("published_at", ColumnType::Int, 3, false),
             ],
@@ -756,7 +768,7 @@ mod tests {
                 name: "vector".to_string(),
                 dim: NonZeroUsize::new(768).unwrap(),
             },
-            ColumnSpec::Scalar {
+            ColumnSpec::Key {
                 name: "author".to_string(),
                 ty: MetaColumnType::Text,
             },

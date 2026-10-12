@@ -133,6 +133,29 @@ pub enum Error {
     #[error("schema must have exactly one vector column, found {found}")]
     VectorColumnCount { found: usize },
 
+    /// A schema declared more than one PRIMARY KEY. V-SQL has no composite
+    /// keys: one column names the row, or none does.
+    #[error("schema must declare at most one primary key, found {found}")]
+    PrimaryKeyCount { found: usize },
+
+    /// A column that cannot serve as an identity was declared PRIMARY KEY.
+    #[error("column {column:?} of type {ty} cannot be a primary key (TEXT or INT only)")]
+    PrimaryKeyType {
+        /// The offending column.
+        column: String,
+        /// Its declared type.
+        ty: String,
+    },
+
+    /// An insert or install carries a primary key some LIVE row already holds.
+    #[error("a live row already holds primary key {value} for column {column:?}")]
+    DuplicateKey {
+        /// The key column's name.
+        column: String,
+        /// The offending value, rendered for the message.
+        value: String,
+    },
+
     /// Snapshot file exists but failed magic/version/CRC checks.
     /// Phase 4a/4b policy: `open()` swallows this internally ("start empty at
     /// lsn 0, WAL replay rebuilds") — the variant exists for the cases that
