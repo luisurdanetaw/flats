@@ -74,7 +74,7 @@ use crate::metadata::common::{Ordinal, Schema, Value};
 use crate::metadata::index::{self as meta, LiveSet};
 use crate::vm::record::{Record, SplitError, split_record};
 use crate::vm::value;
-use crate::wal::wal::Outcome;
+use crate::wal::wal::{Outcome, RejectReason};
 
 /// A value in a register.
 ///
@@ -871,14 +871,7 @@ impl Vm {
                             .mutate(id, bitmap.as_ref().clone(), Vec::new())
                             .map_err(ExecError::Engine)?,
                     };
-                    // A conflicted statement did nothing: the rows it read
-                    // moved on while it was being built. The VM cannot fix
-                    // that — the predicate has to be resolved again from a
-                    // fresh snapshot — so it hands the decision up to
-                    // `Db::execute`, which re-runs the program.
-                    if outcome == Outcome::Conflicted {
-                        return Err(ExecError::Conflict);
-                    }
+                    mutation_outcome(outcome)?;
                 }
 
                 // -- DDL: one fat op, nothing about it varies at runtime -------
@@ -1066,6 +1059,27 @@ impl Vm {
     }
 }
 
+/// What the VM does with the verdict a durable mutation came back with.
+///
+/// Three outcomes, three fates, and keeping them apart is the whole point:
+///
+///   * APPLIED — the record is in the index; carry on.
+///   * CONFLICTED — the rows the statement was built from moved on while it was
+///     in flight. The VM cannot fix that (the predicate has to be resolved
+///     again from a fresh snapshot), so it hands the decision to
+///     [`crate::Db::execute`], which re-runs the whole program.
+///   * REJECTED — the applier refused the record outright. Re-running would
+///     reach the identical verdict, so this must NOT travel as a conflict:
+///     the retry loop would burn its budget and then report contention that
+///     never happened.
+fn mutation_outcome(outcome: Outcome) -> Result<(), ExecError> {
+    match outcome {
+        Outcome::Applied => Ok(()),
+        Outcome::Conflicted => Err(ExecError::Conflict),
+        Outcome::Rejected(reason) => Err(ExecError::Rejected(reason)),
+    }
+}
+
 /// Why execution could not proceed.
 ///
 /// A stage-local error type (CLAUDE.md §5). Every variant here is a
@@ -1116,6 +1130,11 @@ pub enum ExecError {
     /// catches it, re-resolves the predicate against a fresh snapshot, and runs
     /// the statement again.
     Conflict,
+    /// A durable mutation was REFUSED by the applier: folding it in would break
+    /// an invariant the index enforces. Unlike [`ExecError::Conflict`] this is
+    /// final — the same record would be refused on every attempt — so it leaves
+    /// the retry loop immediately and reaches the caller.
+    Rejected(RejectReason),
     /// A register a bitmap op read does not hold a bitmap.
     NotABitmap {
         /// The offending register.
@@ -1267,6 +1286,9 @@ impl fmt::Display for ExecError {
             }
             ExecError::Conflict => {
                 write!(f, "the rows this statement read were rewritten; retry it")
+            }
+            ExecError::Rejected(RejectReason::DuplicateKey) => {
+                write!(f, "a live row already holds this primary key")
             }
             ExecError::NotABitmap { reg } => {
                 write!(f, "register r{reg} does not hold a bitmap")

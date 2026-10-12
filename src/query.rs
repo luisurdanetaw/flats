@@ -328,17 +328,19 @@ impl Db {
                     Ok(())
                 })() {
                     Ok(()) => return Ok(RowStream::empty()),
-                    Err(Error::Exec(ExecError::Conflict)) if attempt < MAX_WRITE_ATTEMPTS => {
+                    Err(e) if is_retryable(&e) && attempt < MAX_WRITE_ATTEMPTS => {
                         vm = Vm::new(program.clone())?;
                     }
                     // Out of attempts. Sustained contention on one row is a
                     // real condition a caller has to hear about rather than
                     // have hidden behind an unbounded loop.
-                    Err(Error::Exec(ExecError::Conflict)) => {
+                    Err(e) if is_retryable(&e) => {
                         return Err(Error::WriteConflict {
                             attempts: MAX_WRITE_ATTEMPTS,
                         });
                     }
+                    // Everything else — including a REFUSED record, which is
+                    // final — travels as itself.
                     Err(e) => return Err(e),
                 }
             }
@@ -350,6 +352,17 @@ impl Db {
             Ok(RowStream::over(labels, vm))
         }
     }
+}
+
+/// Which failures earn another attempt.
+///
+/// Exactly one does. A CONFLICT means some other caller got to these rows
+/// first, so re-resolving the predicate against a fresh snapshot is likely to
+/// succeed. Every other failure — a refused record above all — would reach the
+/// identical outcome on every attempt, so retrying it only delays the error the
+/// caller is owed.
+fn is_retryable(e: &Error) -> bool {
+    matches!(e, Error::Exec(ExecError::Conflict))
 }
 
 /// Which collection a statement compiles against — and therefore where its
