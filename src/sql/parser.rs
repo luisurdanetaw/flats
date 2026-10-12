@@ -501,11 +501,27 @@ impl Parser {
         })
     }
 
-    /// `col_def := ident type`
+    /// `col_def := ident type [ PRIMARY KEY ]`
+    ///
+    /// The marker is column-level because V-SQL has no composite keys: one
+    /// column names the row, or nothing does. `PRIMARY` with no `KEY` is a
+    /// parse error rather than a shorthand — a half-typed constraint must not
+    /// silently decide a collection's identity.
     fn parse_col_def(&mut self) -> Result<ColumnDef, ParseError> {
         let name = self.expect_ident()?;
         let ty = self.parse_type()?;
-        Ok(ColumnDef { name, ty })
+        let primary_key = if *self.peek() == Token::Primary {
+            self.advance();
+            self.expect(Token::Key)?;
+            true
+        } else {
+            false
+        };
+        Ok(ColumnDef {
+            name,
+            ty,
+            primary_key,
+        })
     }
 
     /// `type := VECTOR '(' int_lit ')' | TEXT | INT | FLOAT`.
@@ -1221,19 +1237,23 @@ mod tests {
             vec![
                 ColumnDef {
                     name: "a".to_string(),
-                    ty: ColumnType::Vector(4)
+                    ty: ColumnType::Vector(4),
+                    primary_key: false,
                 },
                 ColumnDef {
                     name: "b".to_string(),
-                    ty: ColumnType::Text
+                    ty: ColumnType::Text,
+                    primary_key: false,
                 },
                 ColumnDef {
                     name: "d".to_string(),
-                    ty: ColumnType::Int
+                    ty: ColumnType::Int,
+                    primary_key: false,
                 },
                 ColumnDef {
                     name: "e".to_string(),
-                    ty: ColumnType::Float
+                    ty: ColumnType::Float,
+                    primary_key: false,
                 },
             ]
         );
@@ -1284,7 +1304,8 @@ mod tests {
             create_columns(&lower),
             vec![ColumnDef {
                 name: "author".to_string(),
-                ty: ColumnType::Text
+                ty: ColumnType::Text,
+                primary_key: false,
             }]
         );
     }
@@ -1297,7 +1318,8 @@ mod tests {
             create_columns(&stmt),
             vec![ColumnDef {
                 name: "vector".to_string(),
-                ty: ColumnType::Vector(768)
+                ty: ColumnType::Vector(768),
+                primary_key: false,
             }]
         );
     }
@@ -1457,19 +1479,23 @@ mod tests {
                 columns: vec![
                     ColumnDef {
                         name: "vector".to_string(),
-                        ty: ColumnType::Vector(768)
+                        ty: ColumnType::Vector(768),
+                        primary_key: false,
                     },
                     ColumnDef {
                         name: "author".to_string(),
-                        ty: ColumnType::Text
+                        ty: ColumnType::Text,
+                        primary_key: false,
                     },
                     ColumnDef {
                         name: "title".to_string(),
-                        ty: ColumnType::Text
+                        ty: ColumnType::Text,
+                        primary_key: false,
                     },
                     ColumnDef {
                         name: "published_at".to_string(),
-                        ty: ColumnType::Int
+                        ty: ColumnType::Int,
+                        primary_key: false,
                     },
                 ],
                 options: vec![CollectionOption {

@@ -83,6 +83,10 @@ pub enum Token {
     Update,
     /// `SET`
     Set,
+    /// `PRIMARY`
+    Primary,
+    /// `KEY`
+    Key,
     // EXTEND: future reserved keywords get a variant here AND an arm in
     // `keyword()` — nothing else changes.
 
@@ -248,6 +252,8 @@ fn keyword(word: &str) -> Option<Token> {
         "delete" => Some(Token::Delete),
         "update" => Some(Token::Update),
         "set" => Some(Token::Set),
+        "primary" => Some(Token::Primary),
+        "key" => Some(Token::Key),
         // EXTEND: future reserved keywords here.
         _ => None,
     }

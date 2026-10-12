@@ -238,6 +238,12 @@ pub struct ColumnDef {
     pub name: String,
     /// Its declared type.
     pub ty: ColumnType,
+    /// Whether the declaration carried `PRIMARY KEY`.
+    ///
+    /// Syntax only: that exactly one column claims it, and that its type can
+    /// serve as an identity, are the binder's to enforce — the parser's job
+    /// ends at recording what was typed.
+    pub primary_key: bool,
 }
 
 /// A column's declared type. Distinct from the storage engine's
