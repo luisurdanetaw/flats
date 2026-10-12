@@ -460,6 +460,19 @@ pub enum BindError {
         /// Its declared type.
         ty: ColumnType,
     },
+    /// An `UPDATE` tried to assign the PRIMARY KEY.
+    ///
+    /// The key IS the row's identity, so changing it is not an edit — it is
+    /// "remove this row and add a different one", which a caller should say in
+    /// those words. Allowing it would also break the one guarantee the rest of
+    /// the design leans on: a copy-on-write install carries the same key as
+    /// the row it retires, which is exactly why installs are exempt from the
+    /// uniqueness check. An install that changed the key would slip a
+    /// duplicate past that exemption.
+    CannotSetPrimaryKey {
+        /// The key column the statement tried to assign.
+        column: String,
+    },
     /// A `SEARCH`'s `TOP k` is not a positive count.
     InvalidTopK {
         /// The requested count.
@@ -530,6 +543,11 @@ impl fmt::Display for BindError {
                 f,
                 "column {column:?} cannot be a PRIMARY KEY: {ty:?} is not an identity \
                  (use TEXT or INT)"
+            ),
+            BindError::CannotSetPrimaryKey { column } => write!(
+                f,
+                "cannot SET the primary key {column:?}: it is the row's identity, so \
+                 changing it means deleting this row and inserting another"
             ),
             BindError::InvalidTopK { k } => {
                 write!(f, "TOP must be at least 1, found {k}")
@@ -817,6 +835,13 @@ fn bind_update(stmt: UpdateStmt, catalog: &impl Catalog) -> Result<BoundUpdate, 
             .column(&assignment.column)
             .ok_or_else(|| BindError::ColumnNotFound(assignment.column.clone()))?;
         let typed = typecheck(col, assignment.value)?;
+        // The key is the row's identity, not a field — see
+        // `BindError::CannotSetPrimaryKey`.
+        if col.primary_key {
+            return Err(BindError::CannotSetPrimaryKey {
+                column: col.name.clone(),
+            });
+        }
         if col.is_vector {
             // One statement carries one vector, so it has to name one row —
             // see `BindError::CannotSetVector`. Checked AFTER `typecheck`, so a
@@ -1424,12 +1449,12 @@ mod tests {
 
     #[test]
     fn update_binds_its_assignments_and_predicate() {
-        let bound = bound_update("UPDATE docs SET author = 'bob' WHERE published_at < 5;");
+        let bound = bound_update("UPDATE docs SET title = 'bob' WHERE published_at < 5;");
         assert_eq!(bound.collection, "docs");
         assert_eq!(
             bound.assignments,
             vec![(
-                colref("author", 1),
+                colref("title", 2),
                 TypedValue {
                     value: Literal::Str("bob".to_string()),
                     ty: ColumnType::Text,
@@ -1447,7 +1472,7 @@ mod tests {
         // Source order is application order: a column set twice takes the LAST
         // value, which only works if the order survives binding.
         let bound = bound_update(
-            "UPDATE docs SET title = 'a', author = 'b', title = 'c' WHERE published_at = 1;",
+            "UPDATE docs SET title = 'a', published_at = 2, title = 'c' WHERE published_at = 1;",
         );
         assert_eq!(
             bound
@@ -1455,7 +1480,7 @@ mod tests {
                 .iter()
                 .map(|(col, _)| col.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["title", "author", "title"]
+            vec!["title", "published_at", "title"]
         );
     }
 
@@ -1538,6 +1563,32 @@ mod tests {
                 "`{clause}` must not be allowed to set the embedding"
             );
         }
+    }
+
+    /// Assigning the key is refused. It is not an edit but a change of
+    /// identity — and, left open, it is a hole straight through uniqueness: a
+    /// copy-on-write install carries the key of the row it retires, which is
+    /// precisely why installs skip the duplicate check, so an install that
+    /// changed the key would smuggle a duplicate past it.
+    #[test]
+    fn the_primary_key_cannot_be_assigned() {
+        assert_eq!(
+            analyze_err(
+                "UPDATE docs SET author = 'bob' WHERE published_at = 1;",
+                &docs_catalog()
+            ),
+            BindError::CannotSetPrimaryKey {
+                column: "author".into()
+            }
+        );
+        // Including alongside an edit that would otherwise be fine.
+        assert!(matches!(
+            analyze_err(
+                "UPDATE docs SET title = 'v2', author = 'bob' WHERE published_at = 1;",
+                &docs_catalog()
+            ),
+            BindError::CannotSetPrimaryKey { .. }
+        ));
     }
 
     #[test]

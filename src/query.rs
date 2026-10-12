@@ -1933,6 +1933,23 @@ mod tests {
         out
     }
 
+    /// Every live row as `(title, published_at)` — the columns an UPDATE test
+    /// edits and filters on, now that `author` is the key and off limits.
+    fn titled_rows(db: &Db) -> Vec<(String, i64)> {
+        let stream = db
+            .execute("SELECT title, published_at FROM docs WHERE published_at > 0;")
+            .expect("the select runs");
+        let mut out: Vec<(String, i64)> = collect(stream)
+            .into_iter()
+            .map(|row| match (&row[0], &row[1]) {
+                (RegValue::Str(t), RegValue::Int(n)) => (t.clone(), *n),
+                other => panic!("unexpected row shape: {other:?}"),
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
     #[test]
     fn update_rewrites_the_rows_its_where_admits() {
         let (_dir, db) = docs_db();
@@ -1940,19 +1957,21 @@ mod tests {
 
         update(
             &db,
-            "UPDATE docs SET author = 'archived' WHERE published_at = 1;",
+            "UPDATE docs SET title = 'archived' WHERE published_at = 1;",
         );
 
         assert_eq!(
-            rows_of(&db),
+            titled_rows(&db),
             vec![
                 ("archived".to_string(), 1),
                 ("archived".to_string(), 1),
-                ("bob".to_string(), 5),
-                ("dave".to_string(), 9),
+                ("doc".to_string(), 5),
+                ("doc".to_string(), 9),
             ],
-            "alice and carol were rewritten; their other columns survived"
+            "alice's and carol's rows were rewritten; their other columns survived"
         );
+        // And their keys came across untouched — the copy is the same row.
+        assert_eq!(remaining(&db), vec!["alice", "bob", "carol", "dave"]);
         db.close().unwrap();
     }
 
@@ -1965,7 +1984,7 @@ mod tests {
 
         update(
             &db,
-            "UPDATE docs SET author = 'archived' WHERE published_at = 1;",
+            "UPDATE docs SET title = 'archived' WHERE published_at = 1;",
         );
 
         let found = authors(
@@ -1974,7 +1993,7 @@ mod tests {
         );
         assert_eq!(
             found,
-            vec!["archived"],
+            vec!["alice"],
             "the rewritten row is still reachable by its original embedding"
         );
         db.close().unwrap();
@@ -1989,11 +2008,11 @@ mod tests {
         let before = std::fs::metadata(&wal).expect("wal exists").len();
         update(
             &db,
-            "UPDATE docs SET author = 'x' WHERE published_at = 404;",
+            "UPDATE docs SET title = 'x' WHERE published_at = 404;",
         );
 
         assert_eq!(std::fs::metadata(&wal).expect("wal exists").len(), before);
-        assert_eq!(rows_of(&db).len(), 4);
+        assert_eq!(titled_rows(&db).len(), 4);
         db.close().unwrap();
     }
 
@@ -2003,18 +2022,18 @@ mod tests {
         seed_filterable(&db);
         update(
             &db,
-            "UPDATE docs SET author = 'archived' WHERE published_at = 9;",
+            "UPDATE docs SET title = 'archived' WHERE published_at = 9;",
         );
         drop(db); // no closing checkpoint: the WAL must carry it
 
         let db = Db::open(dir.path(), &[], DbOptions::default()).expect("reopen");
         assert_eq!(
-            rows_of(&db),
+            titled_rows(&db),
             vec![
-                ("alice".to_string(), 1),
                 ("archived".to_string(), 9),
-                ("bob".to_string(), 5),
-                ("carol".to_string(), 1),
+                ("doc".to_string(), 1),
+                ("doc".to_string(), 1),
+                ("doc".to_string(), 5),
             ]
         );
         db.close().unwrap();

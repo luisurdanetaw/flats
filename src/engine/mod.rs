@@ -375,6 +375,18 @@ impl Apply for IndexApplier {
                 // the winner's row is live by then — which is exactly the
                 // determinism replay needs.
                 if let Some(reason) = self.duplicate_key(*collection, metadata)? {
+                    // The watermarks still advance, for the same reason a
+                    // conflicted Mutate's do: a refused record IS fully
+                    // reflected (it changed nothing), and the verdict is
+                    // deterministic, so replay reaches it again and refuses it
+                    // again. Stalling them here would wedge truncation behind
+                    // a frame that will never do anything — one duplicate key
+                    // would stop the log from ever shedding bytes.
+                    let w = self.writers(*collection)?;
+                    w.flat.advance_applied_lsn(lsn.0);
+                    w.meta.advance_applied_lsn(lsn);
+                    w.tuple.advance_applied_lsn(lsn);
+                    self.last_applied = self.last_applied.max(lsn.0);
                     return Ok(Outcome::Rejected(reason));
                 }
                 let w = self.writers(*collection)?;
