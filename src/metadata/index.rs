@@ -505,6 +505,25 @@ impl Writer {
         !install.iter().any(|o| inner.live.contains(o.0))
     }
 
+    /// Whether any LIVE row already holds `value` in `col`.
+    ///
+    /// The authoritative uniqueness check for a primary key. It runs on the
+    /// commit thread, under a single lock hold, against the writer's own
+    /// `live` — so unlike a caller-side lookup the answer cannot change
+    /// between asking and acting. Two callers racing on the same key both
+    /// reach this, one at a time, and the second sees the first.
+    ///
+    /// Masked by `live` on purpose: a key retired by a DELETE is free again.
+    pub fn is_key_taken(&self, col: ColumnId, value: &Value) -> Result<bool> {
+        let inner = self.lock();
+        let store = inner
+            .columns
+            .get(col as usize)
+            .ok_or(Error::UnknownColumn { column: col })?;
+        let holders = store.lookup_eq(col, value)?;
+        Ok(!(holders & inner.live.clone()).is_empty())
+    }
+
     /// Apply ONE `Record::Mutate` — every retirement and every installation —
     /// under a SINGLE lock hold.
     ///

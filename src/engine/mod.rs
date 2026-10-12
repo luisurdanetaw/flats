@@ -63,7 +63,9 @@ use crate::metadata::common::{ColumnId, Row, Schema, Value};
 use crate::metadata::index::MetadataIndex;
 use crate::metadata::tuples::TupleStore;
 use crate::metadata::{crc32, index as meta, tuples, write_snapshot_atomic};
-use crate::wal::wal::{Apply, Bitmap, Install, Lsn, Outcome, Record, Wal, WalHandle};
+use crate::wal::wal::{
+    Apply, Bitmap, Install, Lsn, Outcome, Record, RejectReason, Wal, WalHandle,
+};
 
 /// Ceiling on the installed payload of one `Record::Mutate`, in bytes.
 ///
@@ -357,6 +359,24 @@ impl Apply for IndexApplier {
                 vector,
                 metadata,
             } => {
+                // THE UNIQUENESS DECISION, and it has to be made here.
+                //
+                // The caller already checked, but a check on a caller's thread
+                // settles nothing: two of them can read "absent" and both
+                // append. This thread is the only serialization point in the
+                // system, so this is the only place where "no live row holds
+                // this key" is still true by the time the row goes in.
+                //
+                // A refusal is NOT an error. Returning `Err` here would poison
+                // the log (an apply failure means the index could not absorb a
+                // committed record), and a repeated key is an ordinary caller
+                // mistake, not a broken database. It is also not a conflict:
+                // every replay of this frame reaches the same verdict, because
+                // the winner's row is live by then — which is exactly the
+                // determinism replay needs.
+                if let Some(reason) = self.duplicate_key(*collection, metadata)? {
+                    return Ok(Outcome::Rejected(reason));
+                }
                 let w = self.writers(*collection)?;
                 let ord32 = ordinal32(*ordinal)?;
                 // DATA FIRST, LIVENESS LAST. `meta.insert_row` is what makes
@@ -505,6 +525,34 @@ impl Apply for IndexApplier {
 }
 
 impl IndexApplier {
+    /// `Some(DuplicateKey)` when `row`'s primary key is already held by a live
+    /// row of `collection`; `None` when the collection declares no key, or the
+    /// key is free.
+    ///
+    /// Reads the key column off the REGISTERED schema rather than the record,
+    /// so a frame cannot nominate its own key column.
+    fn duplicate_key(&mut self, collection: u32, row: &Row) -> io::Result<Option<RejectReason>> {
+        let Some(key) = self
+            .registry
+            .iter()
+            .find(|c| c.id == collection)
+            .and_then(|c| c.schema.primary_key)
+        else {
+            return Ok(None);
+        };
+        let Some(value) = row.iter().find(|(id, _)| *id == key).map(|(_, v)| v.clone()) else {
+            // Every column is present by the time a record is logged
+            // (`validate_row`), so a missing key column would be a
+            // contradiction rather than a caller error.
+            return Ok(None);
+        };
+        let w = self.writers(collection)?;
+        if w.meta.is_key_taken(key, &value).map_err(to_io)? {
+            return Ok(Some(RejectReason::DuplicateKey));
+        }
+        Ok(None)
+    }
+
     fn writers(&mut self, id: u32) -> io::Result<&mut CollectionWriters> {
         self.writers.get_mut(&id).ok_or_else(|| {
             io::Error::new(
@@ -915,13 +963,42 @@ impl Db {
         // the file costs the collection a slot of its capacity for nothing.
         self.check_poison()?;
         let ordinal = coll.alloc_ordinal()?;
+        // The row is moved into the record below, so capture the two strings
+        // an error would need WHILE the row is still here. A collection with
+        // no key cannot be refused, hence the `Option`.
+        let key_described = coll.config.schema.primary_key.map(|key| {
+            let value = row
+                .iter()
+                .find(|(id, _)| *id == key)
+                .map(|(_, v)| render_key(v))
+                // `validate_row` above proved every column is present, so this
+                // is unreachable; described rather than unwrapped, because
+                // library code does not panic on an invariant it can state.
+                .unwrap_or_else(|| "<missing>".to_string());
+            (Self::key_name(&coll.config.schema, key), value)
+        });
         match self.wal_handle()?.append(Record::Insert {
             collection,
             ordinal,
             vector: vector.to_vec(),
             metadata: row,
         }) {
-            Ok(_lsn) => Ok(Ordinal(ordinal as u32)),
+            // REFUSED on the commit thread: the frame is durable but the row
+            // was not folded in, because a live row already holds this key.
+            // The pre-WAL check above missed it, which is exactly the race it
+            // cannot see — so the error is reported from here instead.
+            //
+            // An insert has exactly one way to be refused, so the reason needs
+            // no inspection; a keyless collection has no way at all, which is
+            // why the `None` arm cannot be reached from a rejection.
+            Ok(committed) if !committed.applied() => match key_described {
+                Some((column, value)) => Err(Error::DuplicateKey { column, value }),
+                None => Err(Error::DuplicateKey {
+                    column: "<none>".to_string(),
+                    value: "<none>".to_string(),
+                }),
+            },
+            Ok(_committed) => Ok(Ordinal(ordinal as u32)),
             Err(e) => {
                 // Two different failures arrive here and the caller must not
                 // conflate them:
