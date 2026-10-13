@@ -1323,16 +1323,16 @@ impl std::error::Error for ExecError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use super::{ExecError, OutputRow, RegValue, Vm, mutation_outcome};
-    use crate::wal::wal::{Outcome, RejectReason};
     use crate::compiler::bytecode::{Addr, Cursor, Op, Program, Reg};
     use crate::compiler::constants::{Const, ConstPool};
     use crate::engine::{CollectionConfig, Db, DbOptions};
     use crate::error::Error;
     use crate::metadata::common::{ColumnSpec, ColumnType, Row, Schema, Value};
     use crate::vm::record::SplitError;
+    use crate::wal::wal::{Outcome, RejectReason};
     use std::num::NonZeroUsize;
+    use std::sync::Arc;
 
     /// The three apply outcomes map to three different fates, and the third is
     /// the one worth a test of its own: a REFUSAL must not arrive as a

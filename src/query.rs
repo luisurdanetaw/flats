@@ -492,17 +492,63 @@ mod tests {
         db.execute(&sql).expect("the row is inserted");
     }
 
+    /// `SELECT id` used to be impossible twice over: `id` was reserved
+    /// engine-wide, and the binder resolved it to a pseudo-column that only a
+    /// `SEARCH`'s `RETURNING` could project. Declaring the key `id` settles
+    /// both — it is an ordinary column, so it projects, filters, and appears in
+    /// `SELECT *` with no special case anywhere.
+    #[test]
+    fn a_key_named_id_projects_like_any_column() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(dir.path(), &[], DbOptions::default()).expect("open");
+        db.execute(
+            "CREATE COLLECTION things (id INT PRIMARY KEY, vector VECTOR(2), label TEXT) \
+             WITH (capacity = 8);",
+        )
+        .expect("`id` is an ordinary column name");
+        for (id, label) in [(7, "seven"), (9, "nine")] {
+            db.execute(&format!(
+                "INSERT INTO things (id, vector, label) VALUES ({id}, [1.0, 0.0], '{label}');"
+            ))
+            .expect("inserts");
+        }
+
+        // Projected by name...
+        let stream = db
+            .execute("SELECT id, label FROM things WHERE id = 7;")
+            .expect("the select runs");
+        assert_eq!(stream.labels(), ["id", "label"]);
+        assert_eq!(
+            collect(stream),
+            vec![vec![RegValue::Int(7), RegValue::Str("seven".into())]]
+        );
+        // ...included in `SELECT *`, which still omits the embedding...
+        let stream = db
+            .execute("SELECT * FROM things;")
+            .expect("the select runs");
+        assert_eq!(stream.labels(), ["id", "label"]);
+        // ...and returnable from a ranked read.
+        let stream = db
+            .execute("SEARCH TOP 1 NEAREST TO [1.0, 0.0] FROM things RETURNING id, score;")
+            .expect("the search runs");
+        assert_eq!(stream.labels(), ["id", "score"]);
+        db.close().unwrap();
+    }
+
     // -- the key is unique ---------------------------------------------------
 
     /// Every live row's `title`, from a projection of that column alone.
     fn only_titles(db: &Db) -> Vec<String> {
-        collect(db.execute("SELECT title FROM docs;").expect("the select runs"))
-            .into_iter()
-            .map(|row| match &row[0] {
-                RegValue::Str(s) => s.clone(),
-                other => panic!("expected a title string, got {other:?}"),
-            })
-            .collect()
+        collect(
+            db.execute("SELECT title FROM docs;")
+                .expect("the select runs"),
+        )
+        .into_iter()
+        .map(|row| match &row[0] {
+            RegValue::Str(s) => s.clone(),
+            other => panic!("expected a title string, got {other:?}"),
+        })
+        .collect()
     }
 
     /// The promise the whole design rests on: two live rows can never hold the
@@ -555,10 +601,7 @@ mod tests {
         delete(&db, "DELETE FROM docs WHERE author = 'alice';");
         insert(&db, "alice", "second", 2);
 
-        assert_eq!(
-            only_titles(&db),
-            vec!["second"]
-        );
+        assert_eq!(only_titles(&db), vec!["second"]);
         db.close().unwrap();
     }
 
@@ -572,20 +615,14 @@ mod tests {
         insert(&db, "alice", "v1", 1);
 
         update(&db, "UPDATE docs SET title = 'v2' WHERE author = 'alice';");
-        assert_eq!(
-            only_titles(&db),
-            vec!["v2"]
-        );
+        assert_eq!(only_titles(&db), vec!["v2"]);
         // Including the full-replacement form, which installs a fresh row.
         update(
             &db,
             "UPDATE docs SET vector = [0.0, 0.0, 0.0, 1.0], title = 'v3' \
              WHERE author = 'alice';",
         );
-        assert_eq!(
-            only_titles(&db),
-            vec!["v3"]
-        );
+        assert_eq!(only_titles(&db), vec!["v3"]);
         db.close().unwrap();
     }
 
@@ -726,7 +763,9 @@ mod tests {
         // COMPILE — binds cleanly, cannot lower. The binder counts vector
         // columns but never checks the dimension.
         assert!(matches!(
-            db.execute("CREATE COLLECTION broken (v VECTOR(0), a INT PRIMARY KEY) WITH (capacity = 10);"),
+            db.execute(
+                "CREATE COLLECTION broken (v VECTOR(0), a INT PRIMARY KEY) WITH (capacity = 10);"
+            ),
             Err(Error::Compile(_))
         ));
 
@@ -2006,10 +2045,7 @@ mod tests {
 
         let wal = dir.path().join("wal.log");
         let before = std::fs::metadata(&wal).expect("wal exists").len();
-        update(
-            &db,
-            "UPDATE docs SET title = 'x' WHERE published_at = 404;",
-        );
+        update(&db, "UPDATE docs SET title = 'x' WHERE published_at = 404;");
 
         assert_eq!(std::fs::metadata(&wal).expect("wal exists").len(), before);
         assert_eq!(titled_rows(&db).len(), 4);

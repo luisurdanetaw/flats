@@ -1332,7 +1332,11 @@ mod tests {
         assert_eq!(next.lsn, Lsn(3));
         assert_eq!(next.outcome, Outcome::Applied);
         assert_eq!(
-            applier.snapshot().iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            applier
+                .snapshot()
+                .iter()
+                .map(|(l, _)| *l)
+                .collect::<Vec<_>>(),
             vec![1, 3],
             "the refused record was never folded in"
         );

@@ -503,7 +503,13 @@ statements end with `;` and may span several lines
   CREATE COLLECTION docs (doc_id TEXT PRIMARY KEY, vector VECTOR(3), author TEXT) WITH (capacity = 1000);
   INSERT INTO docs (doc_id, vector, author) VALUES ('d1', [0.1, 0.2, 0.3], 'alice');
   SELECT * FROM docs;
-  SEARCH TOP 5 NEAREST TO [0.1, 0.2, 0.3] FROM docs RETURNING id, score, author;
+  SEARCH TOP 5 NEAREST TO [0.1, 0.2, 0.3] FROM docs RETURNING doc_id, score, author;
+  UPDATE docs SET author = 'bob' WHERE doc_id = 'd1';
+  UPDATE docs SET vector = [0.4, 0.5, 0.6] WHERE doc_id = 'd1';
+  DELETE FROM docs WHERE doc_id = 'd1';
+
+every collection declares one PRIMARY KEY column (TEXT or INT); it is how
+UPDATE and DELETE name a row, and SET vector requires it
 "
     )
 }
@@ -528,7 +534,15 @@ fn print_schema(out: &mut impl Write, c: &CollectionConfig) -> io::Result<()> {
                 ColumnType::Float => "FLOAT",
                 ColumnType::Text => "TEXT",
             };
-            (col.ordinal.get(), col.name.clone(), ty.to_string())
+            // The key is marked, because it is the one column `UPDATE` and
+            // `DELETE` can name a single row by — the first thing someone
+            // reading a schema needs to know.
+            let ty = if c.schema.primary_key == Some(col.id) {
+                format!("{ty} PRIMARY KEY")
+            } else {
+                ty.to_string()
+            };
+            (col.ordinal.get(), col.name.clone(), ty)
         })
         .collect();
     let vector = &c.schema.vector;

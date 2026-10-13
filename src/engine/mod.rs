@@ -63,9 +63,7 @@ use crate::metadata::common::{ColumnId, Row, Schema, Value};
 use crate::metadata::index::MetadataIndex;
 use crate::metadata::tuples::TupleStore;
 use crate::metadata::{crc32, index as meta, tuples, write_snapshot_atomic};
-use crate::wal::wal::{
-    Apply, Bitmap, Install, Lsn, Outcome, Record, RejectReason, Wal, WalHandle,
-};
+use crate::wal::wal::{Apply, Bitmap, Install, Lsn, Outcome, Record, RejectReason, Wal, WalHandle};
 
 /// Ceiling on the installed payload of one `Record::Mutate`, in bytes.
 ///
@@ -552,7 +550,11 @@ impl IndexApplier {
         else {
             return Ok(None);
         };
-        let Some(value) = row.iter().find(|(id, _)| *id == key).map(|(_, v)| v.clone()) else {
+        let Some(value) = row
+            .iter()
+            .find(|(id, _)| *id == key)
+            .map(|(_, v)| v.clone())
+        else {
             // Every column is present by the time a record is logged
             // (`validate_row`), so a missing key column would be a
             // contradiction rather than a caller error.
@@ -2122,7 +2124,10 @@ mod tests {
         }
 
         let db = Db::open(dir.path(), &[cfg_keyed(0, 2, 64)], manual_opts()).unwrap();
-        assert!(!db.is_poisoned(), "replaying a refusal must not halt the db");
+        assert!(
+            !db.is_poisoned(),
+            "replaying a refusal must not halt the db"
+        );
         let live = db.live_snapshot(0).expect("collection open");
         assert_eq!(
             live.bitmap().len(),

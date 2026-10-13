@@ -268,7 +268,6 @@ impl<'a> Compiler<'a> {
     /// the WHERE section of the `bytecode` module header.
     fn emit_predicate(&mut self, pred: &BoundPredicate, collection: &str) -> Reg {
         match pred {
-
             BoundPredicate::And(l, r) => {
                 let a = self.emit_predicate(l, collection);
                 let b = self.emit_predicate(r, collection);
@@ -1108,7 +1107,8 @@ mod tests {
             Box::new(cmp_pred("published_at", 3, CompareOp::Lt, 2)),
         ));
         assert!(
-            ops.iter().any(|op| matches!(op, Op::BitmapEq { col: 0, .. })),
+            ops.iter()
+                .any(|op| matches!(op, Op::BitmapEq { col: 0, .. })),
             "the key half is an equality lookup on its column"
         );
         assert!(

@@ -1265,9 +1265,8 @@ mod tests {
     /// only one.
     #[test]
     fn a_column_can_be_marked_primary_key() {
-        let stmt = ok(
-            "CREATE COLLECTION c (doc_id TEXT PRIMARY KEY, v VECTOR(2)) WITH (capacity = 1);",
-        );
+        let stmt =
+            ok("CREATE COLLECTION c (doc_id TEXT PRIMARY KEY, v VECTOR(2)) WITH (capacity = 1);");
         assert_eq!(
             create_columns(&stmt),
             vec![

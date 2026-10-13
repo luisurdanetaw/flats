@@ -1595,7 +1595,10 @@ mod tests {
     fn a_replacement_embedding_is_dimension_checked() {
         assert!(matches!(
             analyze_err(
-                &format!("UPDATE docs SET vector = {} WHERE author = 'a';", vec_lit(3)),
+                &format!(
+                    "UPDATE docs SET vector = {} WHERE author = 'a';",
+                    vec_lit(3)
+                ),
                 &docs_catalog()
             ),
             BindError::DimensionMismatch { .. }
@@ -1703,7 +1706,10 @@ mod tests {
 
     #[test]
     fn an_unknown_column_in_where_is_the_same_error_as_in_a_projection() {
-        assert_eq!(pred_err("nope < 2"), BindError::ColumnNotFound("nope".into()));
+        assert_eq!(
+            pred_err("nope < 2"),
+            BindError::ColumnNotFound("nope".into())
+        );
     }
 
     #[test]
@@ -1721,7 +1727,10 @@ mod tests {
             pred("author = 'alice'"),
             compare("author", 1, CompareOp::Eq, Literal::Str("alice".into()))
         );
-        assert!(matches!(pred("author != 'alice'"), BoundPredicate::Compare { .. }));
+        assert!(matches!(
+            pred("author != 'alice'"),
+            BoundPredicate::Compare { .. }
+        ));
     }
 
     #[test]
@@ -2113,7 +2122,10 @@ mod tests {
     #[test]
     fn a_text_or_int_column_can_be_the_primary_key() {
         let cat = TestCatalog::new();
-        for (decl, ty) in [("doc_id TEXT", ColumnType::Text), ("n INT", ColumnType::Int)] {
+        for (decl, ty) in [
+            ("doc_id TEXT", ColumnType::Text),
+            ("n INT", ColumnType::Int),
+        ] {
             let src = format!(
                 "CREATE COLLECTION c ({decl} PRIMARY KEY, v VECTOR(4)) WITH (capacity = 1);"
             );
