@@ -214,7 +214,29 @@ pub enum Outcome {
     Applied,
     /// The record was skipped as stale — the rows it was built from moved on
     /// between the moment its writer read them and the moment it was applied.
+    ///
+    /// RETRYABLE: the caller re-reads and re-runs, and the second attempt
+    /// usually lands.
     Conflicted,
+    /// The record was refused: applying it would break an invariant the index
+    /// enforces, and no amount of retrying changes that.
+    ///
+    /// NOT RETRYABLE, and that is the whole reason this is a separate variant
+    /// rather than another flavour of `Conflicted` — a retry loop that cannot
+    /// tell them apart would spin its full budget on a verdict that is final
+    /// from the first attempt, then report the wrong error.
+    Rejected(RejectReason),
+}
+
+/// Why the applier refused a durable record.
+///
+/// Fieldless on purpose: `Outcome` is `Copy`, and the human-readable detail
+/// (which column, which value) belongs to the error the caller finally sees,
+/// not to the verdict the WAL thread hands back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectReason {
+    /// The row carries a primary key some live row already holds.
+    DuplicateKey,
 }
 
 /// A durable record plus what became of it.
