@@ -532,6 +532,31 @@ mod tests {
         db.close().unwrap();
     }
 
+    /// The error a user actually hits when they write SQL out of habit. It must
+    /// name the columns they forgot — not describe the record splitter.
+    #[test]
+    fn a_partial_insert_names_the_missing_columns() {
+        let (_dir, db) = docs_db();
+
+        let err = match db.execute(
+            "INSERT INTO docs (author, vector) VALUES ('alice', [0.1, 0.2, 0.3, 0.4]);",
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a partial row must be refused"),
+        };
+        // The message names the columns, in declaration order.
+        let text = err.to_string();
+        assert!(
+            text.contains("title") && text.contains("published_at"),
+            "the error must name what is missing, got: {text}"
+        );
+        assert!(
+            !text.contains("record has"),
+            "and must not leak the record splitter's phrasing: {text}"
+        );
+        db.close().unwrap();
+    }
+
     // -- reading the embedding back ------------------------------------------
 
     /// The embedding can be read back out. Until now it could be written and

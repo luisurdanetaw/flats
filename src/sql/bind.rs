@@ -1997,6 +1997,57 @@ mod tests {
         ));
     }
 
+    /// An `INSERT` must give a value for EVERY column, and the error names the
+    /// ones it is missing.
+    ///
+    /// Requiring all of them is the language's own rule rather than a
+    /// limitation: V-SQL has no NULLs and no defaults, so there is nothing an
+    /// omitted column could hold. What was wrong was the altitude — this
+    /// reached the record splitter in the VM and came back as "record has 2
+    /// values, schema declares 4", which describes the implementation instead
+    /// of the statement.
+    #[test]
+    fn insert_must_name_every_column() {
+        let cat = docs_catalog();
+
+        // One missing.
+        let src = format!(
+            "INSERT INTO docs (vector, author, title) VALUES ({}, 'alice', 'My doc');",
+            vec_lit(768)
+        );
+        assert_eq!(
+            analyze_err(&src, &cat),
+            BindError::MissingColumns {
+                columns: vec!["published_at".to_string()]
+            },
+        );
+
+        // Several, reported in DECLARATION order rather than the order the
+        // statement happened to leave them out.
+        let src = format!("INSERT INTO docs (title, vector) VALUES ('My doc', {});", vec_lit(768));
+        assert_eq!(
+            analyze_err(&src, &cat),
+            BindError::MissingColumns {
+                columns: vec!["author".to_string(), "published_at".to_string()]
+            },
+        );
+    }
+
+    /// The embedding counts too: a row with no vector has nothing to search.
+    #[test]
+    fn insert_omitting_the_embedding_is_refused() {
+        let cat = docs_catalog();
+        assert_eq!(
+            analyze_err(
+                "INSERT INTO docs (author, title, published_at) VALUES ('alice', 'My doc', 1);",
+                &cat
+            ),
+            BindError::MissingColumns {
+                columns: vec!["vector".to_string()]
+            },
+        );
+    }
+
     #[test]
     fn insert_arity_mismatch_is_caught_here_not_in_the_parser() {
         // 4 columns, 3 values — PARSES fine (7d), fails HERE.
