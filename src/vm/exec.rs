@@ -2395,6 +2395,72 @@ mod tests {
         db.close().unwrap();
     }
 
+    /// `VectorFetch` puts the current row's embedding in a register — and the
+    /// program it belongs to MUST STILL DETACH.
+    ///
+    /// That second half is the load-bearing part. A read stream hands rows out
+    /// after `open_cursors` has let go of the `Db`, so if fetching an embedding
+    /// needed the `Db` at row time, `SELECT vector` could not stream at all —
+    /// it would die with `CannotDetach` before yielding anything. The op is
+    /// absent from `needs_db` precisely to promise that, and this pins the
+    /// promise down.
+    #[test]
+    fn vector_fetch_reads_the_embedding_and_still_detaches() {
+        let (_dir, db) = docs_db();
+        db.insert(0, &embedding(7), row("alice", "the title", 42))
+            .expect("inserts");
+
+        let program = Program {
+            ops: vec![
+                Op::OpenRead {
+                    cur: Cursor(0),
+                    collection: "docs".into(),
+                    filter: None,
+                },
+                Op::SeekFirst {
+                    cur: Cursor(0),
+                    end: Addr(5),
+                },
+                Op::VectorFetch {
+                    cur: Cursor(0),
+                    dst: Reg(0),
+                },
+                Op::ResultRow {
+                    start: Reg(0),
+                    count: 1,
+                },
+                Op::Next {
+                    cur: Cursor(0),
+                    body: Addr(2),
+                },
+                Op::Halt,
+            ],
+            consts: ConstPool::new(),
+            n_regs: 1,
+            n_cursors: 1,
+        };
+
+        // Attached: the whole embedding comes back, not a handle or a prefix.
+        let mut vm = Vm::new(program.clone()).expect("well-formed");
+        let row = vm.step(&db).expect("reads").expect("one row");
+        match &row.0[0] {
+            RegValue::Vector(v) => assert_eq!(&v[..], embedding(7).as_slice()),
+            other => panic!("expected an embedding, got {other:?}"),
+        }
+
+        // DETACHED: open the cursors, drop the `Db` reference, keep pulling.
+        let mut vm = Vm::new(program).expect("well-formed");
+        vm.open_cursors(&db)
+            .expect("a vector fetch must not force a program to stay attached");
+        let row = vm.resume().expect("reads detached").expect("one row");
+        match &row.0[0] {
+            RegValue::Vector(v) => assert_eq!(&v[..], embedding(7).as_slice()),
+            other => panic!("expected an embedding, got {other:?}"),
+        }
+
+        db.close().unwrap();
+    }
+
     #[test]
     fn column_outside_the_projection_is_an_error() {
         let (_dir, db) = docs_db();
