@@ -28,18 +28,16 @@
 //!
 //! # What is here
 //!
-//! Fifteen of the sixteen opcodes: the chassis (loop, register file, loads),
-//! `CREATE COLLECTION`, the `INSERT` path (`OpenWrite` → `MakeRecord` →
-//! `Insert`), and the read loop (`OpenRead` → `SeekFirst` → `Column` →
-//! `ResultRow` → `Next`).
+//! Every opcode: the chassis (loop, register file, loads), `CREATE
+//! COLLECTION`, the `INSERT` path (`OpenWrite` → `MakeRecord` → `Insert`), the
+//! read loop (`OpenRead` → `SeekFirst` → `Column` → `ResultRow` → `Next`), and
+//! the mutation path (`Mutate`).
 //!
-//! [`Op::VectorFetch`] is the one still unbuilt, so `SELECT vector FROM …`
-//! reaches a `todo!`. It needs the flat index's `Reader`, which the cursor
-//! does not carry, plus a decision about copying an embedding out of the mmap
-//! into a `'static` register — see [`RegValue::Vector`]. It is a `todo!` rather
-//! than a no-op on purpose: an arm that silently did nothing would make a
-//! `SELECT` return zero rows and read as an empty collection, which is the most
-//! expensive way to be wrong.
+//! [`Op::VectorFetch`] was the last one unbuilt. It needed the flat index's
+//! `Reader`, which the cursor now carries for exactly this reason, plus a
+//! decision about getting an embedding out of the mmap and into a `'static`
+//! register — resolved by copying it once into an `Arc<[f32]>`, see
+//! [`RegValue::Vector`].
 //!
 //! # Three vocabularies meet here
 //!
@@ -196,8 +194,11 @@ enum Flow {
 /// other op works off state the [`Vm`] already owns — which is exactly why a
 /// read can detach after its cursor is open (see [`Vm::open_cursors`]).
 ///
-/// `VectorFetch` is deliberately absent: its arm is still a `todo!`, so listing
-/// it here would turn "not implemented" into the misleading "cannot detach".
+/// `VectorFetch` is deliberately absent, and that is a REQUIREMENT rather than
+/// an oversight: a `SELECT vector` stream has to go on producing rows after
+/// `open_cursors` has let the `Db` go, so the embedding is fetched through the
+/// flat reader the cursor owns. Listing it here would make every such query
+/// fail to detach.
 fn needs_db(op: &Op) -> bool {
     matches!(
         op,
@@ -729,9 +730,27 @@ impl Vm {
                     self.store(dst, value)?;
                 }
 
-                // -- not built yet ---------------------------------------------
-                // `todo!`, never a no-op. Each names the cycle that fills it.
-                Op::VectorFetch { .. } => todo!("5b: embedding fetch"),
+                Op::VectorFetch { cur, dst } => {
+                    let (cur, dst) = (*cur, *dst);
+                    let cursor = self
+                        .read_cursor(cur)
+                        .ok_or(ExecError::NotAReadCursor { cur: cur.0 })?;
+                    // Borrowed out of the mmap'd flat index, so it is COPIED
+                    // once into an `Arc<[f32]>`: a borrow of the mapping cannot
+                    // live in the register file, which outlives any one row.
+                    // One copy per row (3 KB at dim 768) is the price of
+                    // handing the embedding to a caller at all.
+                    //
+                    // No `Db` is touched — the cursor carries its own flat
+                    // reader — which is what keeps a `SELECT vector` stream
+                    // detachable. See `Cursor::vector`.
+                    let vector: Arc<[f32]> = Arc::from(
+                        cursor
+                            .vector()
+                            .ok_or(ExecError::CursorNotOnARow { cur: cur.0 })?,
+                    );
+                    self.store(dst, RegValue::Vector(vector))?;
+                }
 
                 // -- DML: pack a record, then write it through a write cursor --
                 Op::OpenWrite { cur, collection } => {
@@ -2612,13 +2631,18 @@ mod tests {
         db.close().unwrap();
     }
 
+    /// `VectorFetch` on a cursor that was never opened is a TYPED ERROR, not a
+    /// panic and above all not a silent no-op.
+    ///
+    /// This test used to assert the opposite — that the arm was still a `todo!`
+    /// — because an unbuilt cursor op that quietly did nothing would make
+    /// `SELECT` return zero rows and read as an empty collection, the single
+    /// most expensive way to be wrong here. The arm is built now, so the same
+    /// concern is expressed as the machine fault it should be. No `todo!`
+    /// remains in this module.
     #[test]
-    #[should_panic(expected = "5b")]
-    fn an_unbuilt_opcode_panics_loudly() {
+    fn vector_fetch_on_an_unopened_cursor_is_an_error() {
         let (_dir, db) = scratch();
-        // The out-of-scope arms are `todo!`, NOT silent no-ops. A cursor op that
-        // quietly did nothing would make `SELECT` return zero rows and look like
-        // an empty collection — the single most expensive way to be wrong here.
         let mut vm = Vm::new(Program {
             ops: vec![
                 Op::VectorFetch {
@@ -2632,6 +2656,10 @@ mod tests {
             n_cursors: 1,
         })
         .expect("well-formed");
-        let _ = vm.step(&db);
+        assert!(
+            matches!(vm.step(&db), Err(ExecError::NotAReadCursor { cur: 0 })),
+            "an unopened cursor must fault, never yield a phantom row"
+        );
+        db.close().unwrap();
     }
 }
