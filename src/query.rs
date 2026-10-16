@@ -535,6 +535,98 @@ mod tests {
         db.close().unwrap();
     }
 
+    // -- reading the embedding back ------------------------------------------
+
+    /// The embedding can be read back out. Until now it could be written and
+    /// never retrieved, which made the collection a one-way door: no export, no
+    /// backup, no migration to a different embedding model, and no way to see
+    /// what a row actually holds.
+    ///
+    /// Every other vector database offers this, and every one makes it opt-in
+    /// rather than part of `SELECT *` — a few hundred floats per row is a lot
+    /// of payload to hand over unasked. Naming the column IS the opt-in.
+    #[test]
+    fn the_embedding_can_be_selected_by_name() {
+        let (_dir, db) = docs_db();
+        insert(&db, "alice", "doc", 1); // vector [0.1, 0.2, 0.3, 0.4]
+
+        let stream = db
+            .execute("SELECT vector FROM docs;")
+            .expect("selecting the embedding is supported");
+        assert_eq!(stream.labels(), ["vector"]);
+        let rows = collect(stream);
+        assert_eq!(rows.len(), 1);
+        match &rows[0][0] {
+            RegValue::Vector(v) => assert_eq!(&v[..], &[0.1f32, 0.2, 0.3, 0.4]),
+            other => panic!("expected an embedding, got {other:?}"),
+        }
+        db.close().unwrap();
+    }
+
+    /// Mixed with ordinary columns, in source order — the embedding is just
+    /// another projected item once it is in a register.
+    #[test]
+    fn the_embedding_mixes_with_stored_columns() {
+        let (_dir, db) = docs_db();
+        insert(&db, "alice", "doc", 1);
+
+        let stream = db
+            .execute("SELECT author, vector, published_at FROM docs;")
+            .expect("the select runs");
+        assert_eq!(stream.labels(), ["author", "vector", "published_at"]);
+        let rows = collect(stream);
+        // Arity matches the labels, so a header can never promise a column the
+        // stream does not deliver.
+        assert_eq!(rows[0].len(), 3, "one register per projected item");
+        assert!(matches!(&rows[0][0], RegValue::Str(s) if s == "alice"));
+        assert!(matches!(&rows[0][1], RegValue::Vector(_)));
+        assert!(matches!(&rows[0][2], RegValue::Int(1)));
+        db.close().unwrap();
+    }
+
+    /// `SELECT *` still leaves it out. That is the spec, and it is what every
+    /// other vector database does too: the embedding is opt-in, never implicit.
+    #[test]
+    fn select_star_still_omits_the_embedding() {
+        let (_dir, db) = docs_db();
+        insert(&db, "alice", "doc", 1);
+
+        let stream = db.execute("SELECT * FROM docs;").expect("the select runs");
+        assert_eq!(stream.labels(), ["author", "title", "published_at"]);
+        assert!(
+            collect(stream)[0]
+                .iter()
+                .all(|v| !matches!(v, RegValue::Vector(_))),
+            "`*` must not hand over embeddings nobody asked for"
+        );
+        db.close().unwrap();
+    }
+
+    /// And it streams LAZILY, like any other read: the rows arrive after
+    /// `execute` has returned, which is only possible because the embedding is
+    /// fetched through the cursor rather than the `Db`.
+    #[test]
+    fn selecting_the_embedding_still_streams() {
+        let (_dir, db) = docs_db();
+        for n in 1..=3 {
+            insert(&db, &format!("a{n}"), "doc", n);
+        }
+
+        let stream = db
+            .execute("SELECT vector FROM docs;")
+            .expect("the select runs");
+        // Pulled one at a time from a stream the `Db` is no longer lent to.
+        let count = stream
+            .map(|row| match &row.expect("no runtime error").0[0] {
+                RegValue::Vector(v) => v.len(),
+                other => panic!("expected an embedding, got {other:?}"),
+            })
+            .filter(|&dim| dim == 4)
+            .count();
+        assert_eq!(count, 3);
+        db.close().unwrap();
+    }
+
     // -- the key is unique ---------------------------------------------------
 
     /// Every live row's `title`, from a projection of that column alone.
@@ -795,13 +887,6 @@ mod tests {
             Err(Error::Engine(EngineError::CapacityExceeded { .. }))
         ));
 
-        // UNSUPPORTED — the one built-out gap. It must be an ERROR, not the
-        // `todo!` panic the arm holds: a public API may not panic on input a
-        // user can type.
-        assert!(matches!(
-            db.execute("SELECT vector FROM docs;"),
-            Err(Error::Unsupported { .. })
-        ));
 
         db.close().unwrap();
     }
