@@ -505,6 +505,33 @@ mod tests {
         db.close().unwrap();
     }
 
+    // -- INSERT names every column, exactly once -----------------------------
+
+    /// A column named twice used to WRITE THE WRONG ROW rather than fail: the
+    /// duplicate shifted the values after it, the count still matched, and a
+    /// column the statement never mentioned received the displaced value. So
+    /// this asserts two things — the error, and that nothing was written.
+    #[test]
+    fn a_duplicated_column_writes_nothing() {
+        let (_dir, db) = docs_db();
+
+        let sql = "INSERT INTO docs (author, vector, title, title) \
+                   VALUES ('alice', [0.1, 0.2, 0.3, 0.4], 'first', 'second');";
+        assert!(matches!(
+            db.execute(sql),
+            Err(Error::Bind(BindError::DuplicateInsertColumn { column })) if column == "title"
+        ));
+        assert!(
+            collect(
+                db.execute("SELECT author, title FROM docs;")
+                    .expect("the select runs")
+            )
+            .is_empty(),
+            "a refused insert must leave the collection untouched"
+        );
+        db.close().unwrap();
+    }
+
     // -- reading the embedding back ------------------------------------------
 
     /// The embedding can be read back out. Until now it could be written and

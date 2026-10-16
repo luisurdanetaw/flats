@@ -1930,6 +1930,50 @@ mod tests {
         );
     }
 
+    /// Naming a column TWICE is refused.
+    ///
+    /// Not a style rule — it was silent data corruption. Values are placed by
+    /// the ordinal their column resolves to and then sorted, so a duplicate
+    /// shifts every value after it by one. The row still has the right COUNT,
+    /// so the record split downstream sees nothing wrong, and a column the
+    /// statement never mentioned ends up holding the displaced value. It
+    /// surfaced as an error only when the displaced types happened to
+    /// disagree, which is luck rather than a guard.
+    #[test]
+    fn insert_naming_a_column_twice_is_refused() {
+        let cat = docs_catalog();
+        // `title` twice, `published_at` never — the arity still matches, which
+        // is exactly why nothing downstream caught it.
+        let src = format!(
+            "INSERT INTO docs (vector, author, title, title) \
+             VALUES ({}, 'alice', 'first', 'second');",
+            vec_lit(768)
+        );
+        assert_eq!(
+            analyze_err(&src, &cat),
+            BindError::DuplicateInsertColumn {
+                column: "title".to_string()
+            },
+        );
+    }
+
+    /// And the duplicate is reported ahead of the columns it displaced: a
+    /// statement that names one column twice is almost always missing another,
+    /// and the duplicate is the typo actually worth naming.
+    #[test]
+    fn a_duplicate_is_reported_before_the_missing_column() {
+        let cat = docs_catalog();
+        let src = format!(
+            "INSERT INTO docs (vector, vector) VALUES ({}, {});",
+            vec_lit(768),
+            vec_lit(768)
+        );
+        assert!(matches!(
+            analyze_err(&src, &cat),
+            BindError::DuplicateInsertColumn { .. }
+        ));
+    }
+
     #[test]
     fn insert_arity_mismatch_is_caught_here_not_in_the_parser() {
         // 4 columns, 3 values — PARSES fine (7d), fails HERE.
