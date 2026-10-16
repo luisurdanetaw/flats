@@ -97,9 +97,9 @@ fn plan_select(bound: BoundSelect) -> LogicalPlan {
 /// and a full read differ only in their row source, so the compiler emits one
 /// loop for both and only the prologue that opens the cursor differs.
 ///
-/// `include_vector` is `false`: bare `SEARCH` returns the matched rows' stored
-/// columns, never the embedding — the same rule as `SELECT *`. `RETURNING` is
-/// what will let a caller ask for more.
+/// `include_vector` comes straight from the binder, which sets it only when
+/// `RETURNING` named the embedding: a bare `SEARCH` returns the matched rows'
+/// stored columns and nothing else, the same rule as `SELECT *`.
 fn plan_search(bound: BoundSearch) -> LogicalPlan {
     LogicalPlan::Project(Project {
         input: Box::new(LogicalPlan::Knn(Knn {
@@ -110,7 +110,7 @@ fn plan_search(bound: BoundSearch) -> LogicalPlan {
             predicate: bound.filter,
         })),
         columns: bound.projection,
-        include_vector: false,
+        include_vector: bound.include_vector,
     })
 }
 
@@ -397,6 +397,7 @@ mod tests {
             k: 5,
             query: vec![0.5; 768],
             projection: stored(vec![colref("author", 1), colref("title", 2)]),
+            include_vector: false,
             filter: None,
         });
         assert_eq!(
@@ -434,6 +435,7 @@ mod tests {
                 k,
                 query: query.clone(),
                 projection: stored(vec![colref("author", 1)]),
+                include_vector: false,
                 filter: None,
             });
             match plan(bound) {

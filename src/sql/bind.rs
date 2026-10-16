@@ -366,6 +366,14 @@ pub struct BoundSearch {
     /// compiler now emits from exactly this list; the split that existed while
     /// `RETURNING` was recorded-but-not-executed is gone.
     pub projection: Vec<Projected>,
+    /// Split-storage flag: `true` iff `RETURNING` named the embedding, which
+    /// lives in the flat vector index rather than the tuple store.
+    ///
+    /// The same field a `SELECT`'s bound form carries, for the same reason —
+    /// one emission path serves both statements. `false` for a bare `SEARCH`,
+    /// whose default projection excludes the embedding exactly as `SELECT *`
+    /// does.
+    pub include_vector: bool,
     /// The resolved `WHERE` predicate, or `None` for an unfiltered search.
     ///
     /// This is a PREFILTER: the ranking runs over the rows the predicate
@@ -668,6 +676,7 @@ fn bind_search(stmt: SearchStmt, catalog: &impl Catalog) -> Result<BoundSearch, 
     //    pseudo-column or an ordinary schema lookup — the SAME lookup and the
     //    SAME error a `SELECT` column gets, so an unknown name reads
     //    identically whichever statement it appears in.
+    let mut include_vector = false;
     let returning = match stmt.projection {
         None => projection.iter().cloned().map(Projected::Column).collect(),
         Some(names) => {
@@ -682,13 +691,12 @@ fn bind_search(stmt: SearchStmt, catalog: &impl Catalog) -> Result<BoundSearch, 
                 let col = schema
                     .column(&name)
                     .ok_or_else(|| BindError::ColumnNotFound(name.clone()))?;
-                // The embedding is not projectable: it lives in the flat index,
-                // and `RETURNING vector` would need a `VectorFetch` the ranked
-                // read does not emit. Rejected as "no such column" rather than
-                // silently dropped.
-                if col.is_vector {
-                    return Err(BindError::ColumnNotFound(name));
-                }
+                // The embedding IS projectable, and naming it is the opt-in:
+                // it lives in the flat index rather than the tuple store, so
+                // the flag below tells the compiler to emit a `VectorFetch`
+                // for this item instead of a `Column`. A bare `SEARCH` leaves
+                // it out, the same rule `SELECT *` follows.
+                include_vector |= col.is_vector;
                 items.push(Projected::Column(ColumnRef {
                     name: col.name.clone(),
                     ordinal: col.ordinal,
@@ -711,6 +719,7 @@ fn bind_search(stmt: SearchStmt, catalog: &impl Catalog) -> Result<BoundSearch, 
         k,
         query,
         projection: returning,
+        include_vector,
         filter,
     })
 }
@@ -2226,16 +2235,38 @@ mod tests {
             Err(BindError::ColumnNotFound(name)) if name == "nope"
         ));
 
-        // The embedding is not projectable either: it lives in the flat index,
-        // and bare SEARCH returns stored columns.
-        let src = format!(
-            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING vector;",
+    }
+
+    /// Naming the embedding in `RETURNING` is the opt-in that fetches it, and
+    /// it sets the split-storage flag rather than becoming an ordinary
+    /// `Column` read — the embedding is in the flat index, not the tuple store.
+    #[test]
+    fn returning_the_embedding_sets_the_split_storage_flag() {
+        let bound = bound_search(&format!(
+            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING vector, score;",
             vec_lit(768)
-        );
-        assert!(matches!(
-            analyze(parse(&src).expect("parse"), &docs_catalog()),
-            Err(BindError::ColumnNotFound(name)) if name == "vector"
         ));
+        assert!(bound.include_vector);
+        assert_eq!(
+            bound.projection,
+            vec![
+                Projected::Column(colref("vector", 0)),
+                Projected::Pseudo(Pseudo::Score),
+            ]
+        );
+
+        // Not named, not fetched — including the bare form, whose default
+        // projection is every SCALAR column.
+        let bound = bound_search(&format!(
+            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING author;",
+            vec_lit(768)
+        ));
+        assert!(!bound.include_vector);
+        let bound = bound_search(&format!(
+            "SEARCH TOP 5 NEAREST TO {} FROM docs;",
+            vec_lit(768)
+        ));
+        assert!(!bound.include_vector);
     }
 
     #[test]
