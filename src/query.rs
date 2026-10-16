@@ -908,7 +908,6 @@ mod tests {
             Err(Error::Engine(EngineError::CapacityExceeded { .. }))
         ));
 
-
         db.close().unwrap();
     }
 

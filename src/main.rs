@@ -503,13 +503,18 @@ statements end with `;` and may span several lines
   CREATE COLLECTION docs (doc_id TEXT PRIMARY KEY, vector VECTOR(3), author TEXT) WITH (capacity = 1000);
   INSERT INTO docs (doc_id, vector, author) VALUES ('d1', [0.1, 0.2, 0.3], 'alice');
   SELECT * FROM docs;
+  SELECT doc_id, vector FROM docs;
   SEARCH TOP 5 NEAREST TO [0.1, 0.2, 0.3] FROM docs RETURNING doc_id, score, author;
+  SEARCH TOP 5 NEAREST TO [0.1, 0.2, 0.3] FROM docs RETURNING doc_id, vector;
   UPDATE docs SET author = 'bob' WHERE doc_id = 'd1';
   UPDATE docs SET vector = [0.4, 0.5, 0.6] WHERE doc_id = 'd1';
   DELETE FROM docs WHERE doc_id = 'd1';
 
 every collection declares one PRIMARY KEY column (TEXT or INT); it is how
 UPDATE and DELETE name a row, and SET vector requires it
+
+`*` never includes the embedding — name the vector column to get it, and the
+shell shows a preview of it rather than every dimension
 "
     )
 }
@@ -664,11 +669,23 @@ fn render(value: &RegValue) -> String {
             }
         }
         RegValue::Str(s) => s.clone(),
-        // Printed as a summary, not 768 floats across the terminal. Unreachable
-        // today — projecting an embedding is refused at the boundary — but a
-        // cell renderer that panicked on a variant would be a landmine for
-        // whoever lands `VectorFetch`.
-        RegValue::Vector(v) => format!("<vector dim={}>", v.len()),
+        // A PREVIEW, never the whole embedding: 768 floats would run off the
+        // screen and wreck every other column's width, and the one query that
+        // asks for an embedding is usually asking "roughly what is in here?".
+        // A caller that wants all of it reads the values through the library,
+        // where `SELECT vector` hands over the full `Arc<[f32]>`.
+        //
+        // Short vectors print in full — at four dimensions a preview would be
+        // longer than the value it summarizes.
+        RegValue::Vector(v) => {
+            const SHOWN: usize = 4;
+            let head: Vec<String> = v.iter().take(SHOWN).map(|f| format!("{f}")).collect();
+            if v.len() <= SHOWN {
+                format!("[{}]", head.join(", "))
+            } else {
+                format!("[{}, … ×{}]", head.join(", "), v.len())
+            }
+        }
         RegValue::Record(_) => "<record>".to_string(),
         // A WHERE intermediate. Never projected — it exists between the
         // predicate's ops and the cursor that opens over it.
@@ -1049,6 +1066,22 @@ mod tests {
 
     // -- cell rendering ------------------------------------------------------
 
+    /// An embedding prints as a PREVIEW. The full thing would be 768 numbers
+    /// wide, which destroys the table and tells the reader nothing a preview
+    /// does not; the library still hands over every float.
+    #[test]
+    fn an_embedding_renders_as_a_preview() {
+        use std::sync::Arc;
+
+        // Short enough to show whole — a preview would be longer than the value.
+        let short: Arc<[f32]> = Arc::from([0.5f32, -0.25, 1.0, 2.0].as_slice());
+        assert_eq!(render(&RegValue::Vector(short)), "[0.5, -0.25, 1, 2]");
+
+        // Long: the head, then how many there are in total.
+        let long: Arc<[f32]> = Arc::from((0..768).map(|i| i as f32).collect::<Vec<_>>().as_slice());
+        assert_eq!(render(&RegValue::Vector(long)), "[0, 1, 2, 3, … ×768]");
+    }
+
     #[test]
     fn a_whole_numbered_float_is_distinguishable_from_an_int() {
         // `SEARCH … RETURNING id, score` puts an INT and a FLOAT side by side;
@@ -1060,9 +1093,9 @@ mod tests {
 
     #[test]
     fn no_register_variant_panics_when_rendered() {
-        // Including the ones no query can emit today. A cell renderer that
-        // panicked on a variant would be a landmine for whoever lands
-        // `VectorFetch`.
+        // Including the ones no query can emit today (`Record`, `Bitmap`,
+        // `Unset`). A cell renderer that panicked on a variant would turn an
+        // unusual value into a dead shell.
         let values = [
             RegValue::Unset,
             RegValue::Int(-7),
@@ -1077,7 +1110,8 @@ mod tests {
         }
         assert_eq!(
             render(&RegValue::Vector(Arc::from(vec![0.0f32; 768].as_slice()))),
-            "<vector dim=768>"
+            "[0, 0, 0, 0, … ×768]",
+            "an embedding is previewed, never printed whole"
         );
     }
 

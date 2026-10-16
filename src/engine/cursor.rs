@@ -558,12 +558,7 @@ mod tests {
         let tuples = db.tuple_reader(0).unwrap();
         let live = db.metadata_reader(0).unwrap().live();
         let vectors = db.reader(0).unwrap();
-        let mut cursor = Cursor::over(
-            live.into_iter().map(Ordinal),
-            tuples,
-            vectors,
-            vec![2, 0],
-        );
+        let mut cursor = Cursor::over(live.into_iter().map(Ordinal), tuples, vectors, vec![2, 0]);
 
         let mut has_row = cursor.seek_first().unwrap();
         let mut seen = 0;
@@ -610,8 +605,12 @@ mod tests {
         // …and the source is an ITERATOR, not a bitmap: a plain Vec drives the
         // same cursor. That is the shape a ranked KNN result arrives in.
         let knn = vec![Ordinal(6), Ordinal(1), Ordinal(4)];
-        let mut cursor =
-            Cursor::over(knn.into_iter(), tuples.clone(), vectors.clone(), ALL.to_vec());
+        let mut cursor = Cursor::over(
+            knn.into_iter(),
+            tuples.clone(),
+            vectors.clone(),
+            ALL.to_vec(),
+        );
         assert_eq!(
             ordinals(&mut cursor),
             vec![6, 1, 4],

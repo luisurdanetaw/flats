@@ -2234,7 +2234,6 @@ mod tests {
             analyze(parse(&src).expect("parse"), &docs_catalog()),
             Err(BindError::ColumnNotFound(name)) if name == "nope"
         ));
-
     }
 
     /// Naming the embedding in `RETURNING` is the opt-in that fetches it, and

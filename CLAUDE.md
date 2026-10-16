@@ -91,9 +91,15 @@ SEARCH TOP 5 NEAREST TO [...] FROM docs;
 SEARCH TOP 5 NEAREST TO [...] FROM docs WHERE z < 2;                  
 SEARCH TOP 5 NEAREST TO [...] FROM docs RETURNING id, score; 
 SEARCH TOP 5 NEAREST TO [...] FROM docs WHERE z < 2 RETURNING id, score;    
+SEARCH TOP 5 NEAREST TO [...] FROM docs RETURNING id, vector; -- embeddings too
 
 -- Create collection
+-- Every collection declares EXACTLY ONE PRIMARY KEY column (TEXT or INT). It
+-- is the row's identity: UPDATE and DELETE name a row by it, it is unique
+-- across live rows, and it cannot be assigned. `id` is the conventional name
+-- but any column may carry the marker.
 CREATE COLLECTION docs (
+    id TEXT PRIMARY KEY,
     vector VECTOR(768),
     author TEXT,
     title TEXT,
@@ -103,17 +109,24 @@ CREATE COLLECTION docs (
 -- Regular metadata queries:
 SELECT x, y FROM docs; 
 SELECT * FROM docs; -- NOTE: DOES NOT RETURN EMBEDDING BY DEFAULT!
+SELECT vector FROM docs; -- NAME the vector column to get the embedding back.
+                         -- Opt-in, never part of `*` — same as Pinecone's
+                         -- include_values / Qdrant's with_vector.
 SELECT x, y FROM docs WHERE a < 4 AND a = 2; -- NOTE: we will support < > <= >= != =  AND OR and thats it... maybe IN with range/set stuff if easy...
 
 
--- INSERT
-INSERT INTO docs (vector, author, title, published_at) VALUES ([0.1, ...], 'alice', 'My doc', 1700000000);
+-- INSERT (every column, including the key — V-SQL has no NULLs and no defaults)
+INSERT INTO docs (id, vector, author, title, published_at) VALUES ('d1', [0.1, ...], 'alice', 'My doc', 1700000000);
 
 -- DELETE
 DELETE FROM <collection> WHERE <predicate>;
 
--- UPDATE
+-- UPDATE (WHERE is mandatory; the PRIMARY KEY itself cannot be assigned)
 UPDATE <collection> SET <col> = <expr>, <col> = <expr>, ... WHERE <predicate>;
+
+-- UPDATE replacing the embedding: needs the key, because one statement carries
+-- one vector and so must name one row.
+UPDATE docs SET vector = [...], title = 'v2' WHERE id = 'd1';
 
 
 ```
