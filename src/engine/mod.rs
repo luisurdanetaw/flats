@@ -1465,6 +1465,9 @@ impl Db {
             collection,
             ordinals,
             coll.tuple.clone(),
+            // The flat reader rides along so the row's embedding is reachable
+            // without the `Db` — see `Cursor::vector`.
+            coll.reader.clone(),
             columns,
         ))
     }
