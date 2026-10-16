@@ -1730,18 +1730,35 @@ mod tests {
     #[test]
     fn snapshot_version_never_leads_its_contents() {
         const WRITES: u32 = 20_000;
+        const READERS: usize = 4;
+        /// How many times each reader must evaluate the assertion before the
+        /// test is allowed to finish. A run where the readers never got
+        /// scheduled would pass vacuously, so this is a floor on coverage.
+        ///
+        /// Enforced by the loop CONDITION, never asserted afterwards. Whether a
+        /// thread gets CPU is a property of the machine — under a full suite
+        /// four readers compete with every other test — and asserting on it
+        /// makes the test fail for reasons that have nothing to do with the code
+        /// it covers. The condition instead makes a starved run SLOWER rather
+        /// than red: once the writer stops bumping, `resolve` takes its fast
+        /// path (an atomic load and an `Arc` clone, no lock, no bitmap copy), so
+        /// the remaining checks cost nanoseconds apiece.
+        const MIN_CHECKS: u64 = 1_000;
 
         let (handle, inner) = live_handle_with_state();
         let handle = Arc::new(handle);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let mut readers = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..READERS {
             let handle = Arc::clone(&handle);
             let stop = Arc::clone(&stop);
             readers.push(std::thread::spawn(move || {
                 let mut seen = 0u64;
-                while !stop.load(Ordering::Relaxed) {
+                // Run for as long as the writer does — that is where the
+                // interleaving worth testing lives — and then keep going until
+                // this reader has met the floor.
+                while !stop.load(Ordering::Relaxed) || seen < MIN_CHECKS {
                     let set = handle.resolve();
                     assert!(
                         set.version() <= set.len(),
@@ -1773,7 +1790,13 @@ mod tests {
             .sum();
 
         assert_eq!(handle.version(), WRITES as u64);
-        assert!(total > 1_000, "readers barely ran ({total}); proves nothing");
+        // STRUCTURAL, not statistical: the loop condition already guarantees
+        // it. Kept so a future edit that weakens the condition fails here
+        // instead of quietly making the test vacuous.
+        assert!(
+            total >= READERS as u64 * MIN_CHECKS,
+            "each reader must meet the coverage floor; got {total} across {READERS}"
+        );
     }
 
     /// Two readers racing a stale cache must not both build. At-most-once is
