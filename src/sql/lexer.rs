@@ -568,6 +568,18 @@ mod tests {
         assert_eq!(lex("SET"), vec![Token::Set]);
     }
 
+    /// Reserved so they can be REFUSED BY NAME. Both lex as keywords even
+    /// though the grammar accepts neither: left as identifiers, `WHERE NOT x =
+    /// 1` parsed `NOT` as a column and then complained about the token after
+    /// it, which tells the reader nothing about what is actually unsupported.
+    #[test]
+    fn not_and_in_are_reserved_keywords() {
+        assert_eq!(lex("not"), vec![Token::Not]);
+        assert_eq!(lex("NOT"), vec![Token::Not]);
+        assert_eq!(lex("in"), vec![Token::In]);
+        assert_eq!(lex("IN"), vec![Token::In]);
+    }
+
     #[test]
     fn primary_key_is_two_keywords() {
         assert_eq!(lex("primary"), vec![Token::Primary]);

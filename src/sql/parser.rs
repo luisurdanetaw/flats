@@ -1294,6 +1294,31 @@ mod tests {
         );
     }
 
+    /// `NOT` and `IN` are refused BY NAME, and the message says what to use
+    /// instead. Neither is in V-SQL: `!=` covers negated equality, `AND`/`OR`
+    /// cover the rest, and `IN` is an OR chain — so the cost of leaving them
+    /// out is a few more characters, while the cost of a bad error is a user
+    /// guessing at the grammar.
+    #[test]
+    fn not_and_in_are_refused_by_name() {
+        for (src, needle) in [
+            ("SELECT a FROM docs WHERE NOT n = 1;", "NOT"),
+            ("SELECT a FROM docs WHERE n IN (1, 2);", "IN"),
+        ] {
+            let err = parse(src).expect_err("must be refused");
+            let text = err.to_string();
+            assert!(
+                text.contains(needle) && text.contains("not supported"),
+                "`{src}` must be refused by name, got: {text}"
+            );
+            // And NOT as the puzzle it used to be.
+            assert!(
+                !text.contains("expected Semicolon"),
+                "the old message leaked: {text}"
+            );
+        }
+    }
+
     #[test]
     fn type_keywords_are_case_insensitive() {
         let lower = ok("CREATE COLLECTION c (author text) WITH (capacity = 1);");

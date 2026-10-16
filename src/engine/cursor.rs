@@ -683,10 +683,23 @@ mod tests {
         let written_at_drain_start = written.load(Ordering::Acquire);
         let mut seen = Vec::new();
         let mut has_row = cursor.seek_first().unwrap();
+        let mut waited_for_a_write = false;
         while has_row {
             let o = cursor.ordinal().expect("parked on a row").0 as u64;
             assert_eq!(cursor.row().unwrap(), values_for(o).as_slice());
             seen.push(o);
+            // Once, mid-scan: WAIT for the writer to land a row rather than
+            // trusting the sleep below to be long enough. The property this
+            // test rests on is that rows arrive while the cursor walks, and a
+            // loaded host can starve the writer for longer than any sleep we
+            // would be willing to spend. Waiting makes it certain; the
+            // assertion after the loop then holds structurally.
+            if !waited_for_a_write {
+                while written.load(Ordering::Acquire) <= written_at_drain_start {
+                    std::thread::yield_now();
+                }
+                waited_for_a_write = true;
+            }
             std::thread::sleep(Duration::from_micros(200));
             has_row = cursor.next().unwrap();
         }
@@ -697,7 +710,8 @@ mod tests {
 
         // Without this the test could pass vacuously: a cursor that re-read
         // liveness mid-scan only picks up rows that land WHILE it walks, so
-        // there must have been some.
+        // there must have been some. Guaranteed by the wait inside the loop
+        // rather than by the sleep, so a busy host cannot turn it red.
         assert!(
             written_at_drain_end > written_at_drain_start,
             "no rows landed during the drain ({written_at_drain_start} -> \
