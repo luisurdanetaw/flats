@@ -54,7 +54,7 @@
 
 use std::fmt;
 
-use crate::compiler::bytecode::{Op, Program, ValidateError};
+use crate::compiler::bytecode::ValidateError;
 use crate::compiler::compile;
 use crate::engine::Db;
 use crate::sql::bind::{BoundStatement, Projected};
@@ -181,13 +181,6 @@ pub enum Error {
     /// The machine could not run the program. Machine faults only — the engine
     /// and validation cases are normalized into their own variants above.
     Exec(ExecError),
-    /// The statement is valid V-SQL, but this build does not implement it yet.
-    /// An ERROR rather than the `todo!` the opcode arm holds: a public API must
-    /// not panic on input a user can type.
-    Unsupported {
-        /// What is missing.
-        feature: &'static str,
-    },
 }
 
 impl From<ExecError> for Error {
@@ -216,7 +209,6 @@ impl fmt::Display for Error {
             Error::Validate(e) => write!(f, "malformed program: {e}"),
             Error::Engine(e) => write!(f, "engine error: {e}"),
             Error::Exec(e) => write!(f, "execution error: {e}"),
-            Error::Unsupported { feature } => write!(f, "not supported yet: {feature}"),
         }
     }
 }
@@ -230,7 +222,7 @@ impl std::error::Error for Error {
             Error::Validate(e) => Some(e),
             Error::Engine(e) => Some(e),
             Error::Exec(e) => Some(e),
-            Error::Unsupported { .. } | Error::WriteConflict { .. } => None,
+            Error::WriteConflict { .. } => None,
         }
     }
 }
@@ -303,11 +295,7 @@ impl Db {
         };
         let program = compile(logical, schema.as_ref()).map_err(Error::Compile)?;
 
-        // 5. Refuse what this build cannot run, so the unbuilt opcode arms are
-        //    unreachable from public input.
-        reject_unsupported(&program)?;
-
-        // 6. BUILD — `Vm::new` runs `Program::validate`. The program is kept
+        // 5. BUILD — `Vm::new` runs `Program::validate`. The program is kept
         //    so a conflicted write can be run again from the top.
         let mut vm = Vm::new(program.clone())?;
 
@@ -422,24 +410,6 @@ fn labels_of(bound: &BoundStatement) -> Vec<String> {
         | BoundStatement::Delete(_)
         | BoundStatement::Update(_) => Vec::new(),
     }
-}
-
-/// Reject a program containing an opcode this build does not implement.
-///
-/// The alternative is reaching the arm's `todo!` — a panic in library code, on
-/// input a user can type. The check is here rather than in the VM because only
-/// the boundary knows to phrase it as a feature, not a machine fault.
-fn reject_unsupported(program: &Program) -> Result<(), Error> {
-    if program
-        .ops
-        .iter()
-        .any(|op| matches!(op, Op::VectorFetch { .. }))
-    {
-        return Err(Error::Unsupported {
-            feature: "selecting a vector column (the embedding is stored separately)",
-        });
-    }
-    Ok(())
 }
 
 #[cfg(test)]
