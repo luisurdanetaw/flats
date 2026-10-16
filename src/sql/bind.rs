@@ -40,8 +40,8 @@
 use std::fmt;
 
 use crate::sql::ast::{
-    ColumnType, CompareOp, CreateStmt, Expr, InsertStmt, Literal, Projection, SearchStmt,
-    SelectStmt, Statement,
+    ColumnType, CompareOp, CreateStmt, DeleteStmt, Expr, InsertStmt, Literal, Projection,
+    SearchStmt, SelectStmt, Statement, UpdateStmt,
 };
 
 // ---------------------------------------------------------------------------
@@ -91,6 +91,16 @@ impl Schema {
     pub fn column(&self, name: &str) -> Option<&ColumnSchema> {
         self.columns.iter().find(|c| c.name == name)
     }
+
+    /// The PRIMARY KEY column.
+    ///
+    /// Total for anything V-SQL produced: `bind_create` refuses a schema
+    /// without exactly one key, and a schema read back from the catalog
+    /// reconstructs it. `None` only for a collection declared programmatically
+    /// without a key, which keyed statements then cannot address.
+    pub fn primary_key(&self) -> Option<&ColumnSchema> {
+        self.columns.iter().find(|c| c.primary_key)
+    }
 }
 
 /// One resolved column: its name, type, ordinal (the VM's `Column` index), and
@@ -106,6 +116,13 @@ pub struct ColumnSchema {
     /// `true` for the single vector column (equivalently `matches!(ty,
     /// ColumnType::Vector(_))`, stored explicitly so consumers need not match).
     pub is_vector: bool,
+    /// `true` for the column declared `PRIMARY KEY` — the one that NAMES a row.
+    ///
+    /// Carried on the resolved schema (not re-derived from a column called
+    /// "id") because every later rule depends on it: which predicate may
+    /// address a single row, which column may not be assigned, and which value
+    /// the applier checks for uniqueness.
+    pub primary_key: bool,
 }
 
 /// A resolved reference to a column: the bound `ordinal` is the whole product
@@ -157,6 +174,7 @@ pub enum BoundPredicate {
         /// The comparand, type-checked against the column.
         value: TypedValue,
     },
+
     /// Both sides must hold — bitmap intersection.
     And(Box<BoundPredicate>, Box<BoundPredicate>),
     /// Either side may hold — bitmap union.
@@ -179,7 +197,51 @@ pub enum BoundStatement {
     CreateCollection(BoundCreate),
     /// A resolved `SEARCH`.
     Search(BoundSearch),
-    // EXTEND: Delete(BoundDelete), Update(BoundUpdate).
+    /// A resolved `DELETE`.
+    Delete(BoundDelete),
+    /// A resolved `UPDATE`.
+    Update(BoundUpdate),
+}
+
+/// A resolved `UPDATE collection SET assignments WHERE filter`.
+///
+/// Both halves go through the SAME routines a SELECT's do — `typecheck` for the
+/// values, `bind_predicate` for the WHERE — so an UPDATE accepts exactly the
+/// values an INSERT would and matches exactly the rows a SELECT would.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundUpdate {
+    /// The collection rewritten (confirmed to exist).
+    pub collection: String,
+    /// Its resolved schema.
+    pub schema: Schema,
+    /// The SCALAR SET list, each column bound to its ordinal and its value
+    /// type-checked. Source order, which is also application order — a column
+    /// named twice is applied twice, last one winning.
+    pub assignments: Vec<(ColumnRef, TypedValue)>,
+    /// A replacement embedding, when the statement assigns the vector column.
+    /// `None` copies the old row's vector across unchanged.
+    ///
+    /// Separate from `assignments` because the two go to different stores and
+    /// because only this one carries the `id = <n>` restriction — see
+    /// `BindError::CannotSetVector`.
+    pub vector: Option<Vec<f32>>,
+    /// Which rows to rewrite. Required.
+    pub filter: BoundPredicate,
+}
+
+/// A resolved `DELETE FROM from WHERE filter`.
+///
+/// The predicate is bound by the same routine a `SELECT`'s is, against the same
+/// schema, so a DELETE can only name the rows the matching SELECT would return
+/// — a user can preview exactly what a DELETE will remove.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundDelete {
+    /// The collection deleted from (confirmed to exist).
+    pub from: String,
+    /// Its resolved schema.
+    pub schema: Schema,
+    /// Which rows go. Required — the parser refuses a DELETE without one.
+    pub filter: BoundPredicate,
 }
 
 /// A resolved `SELECT projection FROM from`.
@@ -229,22 +291,27 @@ pub enum Projected {
 
 /// A value a `SEARCH` computes rather than stores.
 ///
-/// # These names are reserved inside a `RETURNING`
+/// # `score` is reserved inside a `RETURNING`
 ///
-/// `id` and `score` are matched case-insensitively and win over any stored
-/// column of the same name, so the meaning of `RETURNING score` does not depend
-/// on which collection it is aimed at.
+/// Matched case-insensitively, and it wins over a stored column of the same
+/// name, so the meaning of `RETURNING score` does not depend on which
+/// collection it is aimed at. A collection may still declare a `score` column;
+/// that column is then unreachable through `RETURNING`. Closing that means
+/// adding `score` to the engine's reserved list, a storage-layer change
+/// deliberately not made here.
 ///
-/// `id` is already reserved engine-wide (`create_collection` rejects a column
-/// called `id`, since it would collide with the ordinal SEARCH returns).
-/// **`score` is NOT** — a collection may currently declare a `score` column, and
-/// that column then becomes unreachable through `RETURNING`. Closing that means
-/// adding `score` to the engine's reserved list, which is a storage-layer change
-/// and deliberately not made here.
+/// # Why `id` is NOT here any more
+///
+/// It used to be: `id` meant the row's ORDINAL, the slot its vector occupies.
+/// That is not an identity. Copy-on-write moves a row to a fresh ordinal when
+/// it is updated, and compaction renumbers every ordinal in the collection — so
+/// a caller who read an `id` and later used it could address a different row,
+/// or none. Identity is now a DECLARED PRIMARY KEY column, which means `id` is
+/// an ordinary column name: it resolves against the schema like any other, and
+/// `RETURNING id` works precisely when the collection declares a column called
+/// `id` (the conventional name for its key).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pseudo {
-    /// The row's ordinal — its stable id within the collection.
-    Id,
     /// The similarity the kernel computed for this row against the query.
     Score,
 }
@@ -253,7 +320,6 @@ impl Pseudo {
     /// The canonical label, for a result header.
     pub fn name(self) -> &'static str {
         match self {
-            Pseudo::Id => "id",
             Pseudo::Score => "score",
         }
     }
@@ -261,9 +327,7 @@ impl Pseudo {
     /// Recognize a pseudo-column by name, case-insensitively. `None` means the
     /// name must resolve against the schema like an ordinary column.
     fn from_name(name: &str) -> Option<Pseudo> {
-        if name.eq_ignore_ascii_case("id") {
-            Some(Pseudo::Id)
-        } else if name.eq_ignore_ascii_case("score") {
+        if name.eq_ignore_ascii_case("score") {
             Some(Pseudo::Score)
         } else {
             None
@@ -302,6 +366,14 @@ pub struct BoundSearch {
     /// compiler now emits from exactly this list; the split that existed while
     /// `RETURNING` was recorded-but-not-executed is gone.
     pub projection: Vec<Projected>,
+    /// Split-storage flag: `true` iff `RETURNING` named the embedding, which
+    /// lives in the flat vector index rather than the tuple store.
+    ///
+    /// The same field a `SELECT`'s bound form carries, for the same reason —
+    /// one emission path serves both statements. `false` for a bare `SEARCH`,
+    /// whose default projection excludes the embedding exactly as `SELECT *`
+    /// does.
+    pub include_vector: bool,
     /// The resolved `WHERE` predicate, or `None` for an unfiltered search.
     ///
     /// This is a PREFILTER: the ranking runs over the rows the predicate
@@ -335,6 +407,18 @@ pub enum BindError {
     CollectionNotFound(String),
     /// A `CREATE COLLECTION` names a collection that already exists.
     CollectionExists(String),
+    /// An `UPDATE` assigned the embedding without naming exactly one row.
+    ///
+    /// One statement supplies ONE vector, so assigning it to whatever a
+    /// predicate happens to match would give every matched row the same
+    /// embedding — always a mistake, and a silent one. `SET vector = [...]`
+    /// therefore requires the predicate to be exactly `id = <n>`: not a column
+    /// predicate, and not `id = 7 AND ...`, which would still read as a filter
+    /// rather than a row name.
+    CannotSetVector {
+        /// The vector column's name.
+        column: String,
+    },
     /// A projected/inserted column name is not in the collection's schema.
     ColumnNotFound(String),
     /// An inserted value's type does not match its target column.
@@ -362,10 +446,62 @@ pub enum BindError {
         /// The supplied literal's length.
         found: usize,
     },
+    /// An `INSERT` did not give a value for every column.
+    ///
+    /// Required, not a limitation to lift later: V-SQL has no NULLs and no
+    /// defaults (see [`ColumnType`]), so an omitted column has nothing it
+    /// could hold. The columns are named so the caller can see what they
+    /// forgot — this used to reach the VM's record splitter and come back
+    /// describing value counts instead of the statement.
+    MissingColumns {
+        /// The unnamed columns, in schema declaration order.
+        columns: Vec<String>,
+    },
+    /// An `INSERT` named the same column more than once.
+    ///
+    /// Refused rather than resolved to "last one wins", because the statement
+    /// cannot mean what it says: a row has one value per column, so a second
+    /// value for one column means a column somewhere else has none. Accepting
+    /// it silently shifted every later value by one and wrote the displaced
+    /// one into a column the statement never mentioned.
+    DuplicateInsertColumn {
+        /// The column named more than once.
+        column: String,
+    },
     /// A `CREATE COLLECTION` schema did not have exactly one vector column.
     VectorColumnCount {
         /// How many vector columns were declared (valid schemas have exactly 1).
         found: usize,
+    },
+    /// A `CREATE COLLECTION` schema did not declare exactly one PRIMARY KEY.
+    ///
+    /// Required, not optional: the key is how `UPDATE` and `DELETE` name a row.
+    /// Without one the only handle left would be the ordinal, which moves when
+    /// a row is rewritten and is renumbered wholesale by compaction — an
+    /// identity that silently stops pointing at what the caller meant.
+    PrimaryKeyCount {
+        /// How many columns were marked `PRIMARY KEY`.
+        found: usize,
+    },
+    /// A column that cannot serve as an identity was marked `PRIMARY KEY`.
+    PrimaryKeyType {
+        /// The offending column's name.
+        column: String,
+        /// Its declared type.
+        ty: ColumnType,
+    },
+    /// An `UPDATE` tried to assign the PRIMARY KEY.
+    ///
+    /// The key IS the row's identity, so changing it is not an edit — it is
+    /// "remove this row and add a different one", which a caller should say in
+    /// those words. Allowing it would also break the one guarantee the rest of
+    /// the design leans on: a copy-on-write install carries the same key as
+    /// the row it retires, which is exactly why installs are exempt from the
+    /// uniqueness check. An install that changed the key would slip a
+    /// duplicate past that exemption.
+    CannotSetPrimaryKey {
+        /// The key column the statement tried to assign.
+        column: String,
     },
     /// A `SEARCH`'s `TOP k` is not a positive count.
     InvalidTopK {
@@ -425,9 +561,33 @@ impl fmt::Display for BindError {
                 f,
                 "vector dimension mismatch for column {column:?}: expected {expected}, found {found}"
             ),
+            BindError::MissingColumns { columns } => write!(
+                f,
+                "INSERT must give a value for every column; missing {} \
+                 (V-SQL has no NULLs and no defaults)",
+                columns.join(", ")
+            ),
+            BindError::DuplicateInsertColumn { column } => write!(
+                f,
+                "column {column:?} is named twice; a row has one value per column"
+            ),
             BindError::VectorColumnCount { found } => write!(
                 f,
                 "a collection must have exactly one VECTOR column, found {found}"
+            ),
+            BindError::PrimaryKeyCount { found } => write!(
+                f,
+                "a collection must declare exactly one PRIMARY KEY column, found {found}"
+            ),
+            BindError::PrimaryKeyType { column, ty } => write!(
+                f,
+                "column {column:?} cannot be a PRIMARY KEY: {ty:?} is not an identity \
+                 (use TEXT or INT)"
+            ),
+            BindError::CannotSetPrimaryKey { column } => write!(
+                f,
+                "cannot SET the primary key {column:?}: it is the row's identity, so \
+                 changing it means deleting this row and inserting another"
             ),
             BindError::InvalidTopK { k } => {
                 write!(f, "TOP must be at least 1, found {k}")
@@ -441,6 +601,11 @@ impl fmt::Display for BindError {
             BindError::Unbound { statement } => {
                 write!(f, "{statement} is parsed but not implemented yet")
             }
+            BindError::CannotSetVector { column } => write!(
+                f,
+                "cannot SET the embedding column {column} without naming one row by its \
+                 primary key: one statement carries one vector, so it must name one row"
+            ),
         }
     }
 }
@@ -461,7 +626,8 @@ pub fn analyze(stmt: Statement, catalog: &impl Catalog) -> Result<BoundStatement
             bind_create(c, catalog).map(BoundStatement::CreateCollection)
         }
         Statement::Search(s) => bind_search(s, catalog).map(BoundStatement::Search),
-        // EXTEND: Delete/Update dispatch here as those statements land.
+        Statement::Delete(d) => bind_delete(d, catalog).map(BoundStatement::Delete),
+        Statement::Update(u) => bind_update(u, catalog).map(BoundStatement::Update),
     }
 }
 
@@ -542,6 +708,7 @@ fn bind_search(stmt: SearchStmt, catalog: &impl Catalog) -> Result<BoundSearch, 
     //    pseudo-column or an ordinary schema lookup — the SAME lookup and the
     //    SAME error a `SELECT` column gets, so an unknown name reads
     //    identically whichever statement it appears in.
+    let mut include_vector = false;
     let returning = match stmt.projection {
         None => projection.iter().cloned().map(Projected::Column).collect(),
         Some(names) => {
@@ -556,13 +723,12 @@ fn bind_search(stmt: SearchStmt, catalog: &impl Catalog) -> Result<BoundSearch, 
                 let col = schema
                     .column(&name)
                     .ok_or_else(|| BindError::ColumnNotFound(name.clone()))?;
-                // The embedding is not projectable: it lives in the flat index,
-                // and `RETURNING vector` would need a `VectorFetch` the ranked
-                // read does not emit. Rejected as "no such column" rather than
-                // silently dropped.
-                if col.is_vector {
-                    return Err(BindError::ColumnNotFound(name));
-                }
+                // The embedding IS projectable, and naming it is the opt-in:
+                // it lives in the flat index rather than the tuple store, so
+                // the flag below tells the compiler to emit a `VectorFetch`
+                // for this item instead of a `Column`. A bare `SEARCH` leaves
+                // it out, the same rule `SELECT *` follows.
+                include_vector |= col.is_vector;
                 items.push(Projected::Column(ColumnRef {
                     name: col.name.clone(),
                     ordinal: col.ordinal,
@@ -585,6 +751,7 @@ fn bind_search(stmt: SearchStmt, catalog: &impl Catalog) -> Result<BoundSearch, 
         k,
         query,
         projection: returning,
+        include_vector,
         filter,
     })
 }
@@ -643,6 +810,115 @@ fn bind_select(stmt: SelectStmt, catalog: &impl Catalog) -> Result<BoundSelect, 
     })
 }
 
+/// `DELETE FROM from WHERE filter`.
+///
+/// Two checks, in the order `bind_select` makes them: the collection exists,
+/// then the predicate binds against its schema. The predicate goes through the
+/// SAME `bind_predicate` a SELECT's does — not a copy of it — so a DELETE
+/// refuses exactly what a SELECT refuses and a user can preview a DELETE by
+/// running the SELECT with the same WHERE.
+fn bind_delete(stmt: DeleteStmt, catalog: &impl Catalog) -> Result<BoundDelete, BindError> {
+    let schema = catalog
+        .get_collection(&stmt.from)
+        .ok_or_else(|| BindError::CollectionNotFound(stmt.from.clone()))?;
+    let filter = bind_predicate(stmt.filter, &schema)?;
+    Ok(BoundDelete {
+        from: stmt.from,
+        schema,
+        filter,
+    })
+}
+
+/// `UPDATE collection SET assignments WHERE filter`.
+///
+/// Three checks, in the usual order of how fundamental the failure is: the
+/// collection exists, then each assignment resolves and type-checks, then the
+/// predicate binds. Both halves reuse the routines the other statements use —
+/// `typecheck`, the same one an INSERT's values go through, and
+/// `bind_predicate`, the same one a SELECT's WHERE goes through — so an UPDATE
+/// cannot drift into accepting values an INSERT would reject or matching rows a
+/// SELECT would not.
+///
+/// Assignments keep SOURCE order rather than being sorted into schema order the
+/// way an INSERT's row is. An UPDATE is a sequence of overrides applied to a
+/// copy of an existing row, so `SET a = 1, a = 2` must mean 2; sorting would
+/// make that order arbitrary.
+fn bind_update(stmt: UpdateStmt, catalog: &impl Catalog) -> Result<BoundUpdate, BindError> {
+    let schema = catalog
+        .get_collection(&stmt.collection)
+        .ok_or_else(|| BindError::CollectionNotFound(stmt.collection.clone()))?;
+
+    // The predicate binds FIRST, because whether the embedding may be
+    // assigned depends on it: only a statement that names ONE row can carry a
+    // replacement vector, and the only predicate that does so is equality on
+    // the primary key.
+    //
+    // Equality on an ordinary column will not do, however unique its values
+    // happen to be today: nothing stops a second row from arriving with the
+    // same value tomorrow, and the statement would then hand one embedding to
+    // both. The key is the one column the applier guarantees is unique.
+    let filter = bind_predicate(stmt.filter, &schema)?;
+    let names_one_row = match &filter {
+        BoundPredicate::Compare {
+            column,
+            op: CompareOp::Eq,
+            ..
+        } => schema
+            .primary_key()
+            .is_some_and(|key| key.ordinal == column.ordinal),
+        _ => false,
+    };
+
+    let mut assignments = Vec::with_capacity(stmt.assignments.len());
+    let mut vector = None;
+    for assignment in stmt.assignments {
+        let col = schema
+            .column(&assignment.column)
+            .ok_or_else(|| BindError::ColumnNotFound(assignment.column.clone()))?;
+        let typed = typecheck(col, assignment.value)?;
+        // The key is the row's identity, not a field — see
+        // `BindError::CannotSetPrimaryKey`.
+        if col.primary_key {
+            return Err(BindError::CannotSetPrimaryKey {
+                column: col.name.clone(),
+            });
+        }
+        if col.is_vector {
+            // One statement carries one vector, so it has to name one row —
+            // see `BindError::CannotSetVector`. Checked AFTER `typecheck`, so a
+            // wrong-dimension literal is reported as the dimension error it is
+            // rather than as a predicate complaint.
+            if !names_one_row {
+                return Err(BindError::CannotSetVector {
+                    column: col.name.clone(),
+                });
+            }
+            // Last assignment wins here too, matching the scalar rule.
+            vector = match typed.value {
+                Literal::Vector(v) => Some(v),
+                // `typecheck` against a vector column accepts nothing else.
+                other => unreachable!("a vector column type-checked to {other:?}"),
+            };
+            continue;
+        }
+        assignments.push((
+            ColumnRef {
+                name: col.name.clone(),
+                ordinal: col.ordinal,
+            },
+            typed,
+        ));
+    }
+
+    Ok(BoundUpdate {
+        collection: stmt.collection,
+        schema,
+        assignments,
+        vector,
+        filter,
+    })
+}
+
 /// `INSERT INTO collection (cols) VALUES (vals)`. Checks arity, resolves each
 /// column, type-checks (and dimension-checks) each value, then reorders the row
 /// to schema order.
@@ -668,11 +944,34 @@ fn bind_insert(stmt: InsertStmt, catalog: &impl Catalog) -> Result<BoundInsert, 
         let col = schema
             .column(&name)
             .ok_or_else(|| BindError::ColumnNotFound(name.clone()))?;
+        // One value per column, checked BEFORE the value is placed. A repeat
+        // used to shift every later value by one ordinal while leaving the
+        // count intact, so the record split downstream saw a well-formed row
+        // and wrote the displaced value into a column nobody named — see
+        // `BindError::DuplicateInsertColumn`.
+        if placed.iter().any(|(ordinal, _)| *ordinal == col.ordinal) {
+            return Err(BindError::DuplicateInsertColumn { column: name });
+        }
         let typed = typecheck(col, literal)?;
         placed.push((col.ordinal, typed));
     }
 
-    // 5. Reorder into schema (canonical) order.
+    // 5. COVERAGE: every column must have been named. Checked after the loop,
+    //    so an unknown or repeated name is reported as the mistake it is
+    //    rather than as the hole it leaves behind.
+    if placed.len() != schema.columns.len() {
+        let named: Vec<usize> = placed.iter().map(|(ordinal, _)| *ordinal).collect();
+        return Err(BindError::MissingColumns {
+            columns: schema
+                .columns
+                .iter()
+                .filter(|c| !named.contains(&c.ordinal))
+                .map(|c| c.name.clone())
+                .collect(),
+        });
+    }
+
+    // 6. Reorder into schema (canonical) order.
     placed.sort_by_key(|(ordinal, _)| *ordinal);
     let row = placed.into_iter().map(|(_, tv)| tv).collect();
 
@@ -701,6 +1000,7 @@ fn bind_create(stmt: CreateStmt, catalog: &impl Catalog) -> Result<BoundCreate, 
             ty: def.ty,
             ordinal,
             is_vector: matches!(def.ty, ColumnType::Vector(_)),
+            primary_key: def.primary_key,
         })
         .collect();
 
@@ -709,6 +1009,21 @@ fn bind_create(stmt: CreateStmt, catalog: &impl Catalog) -> Result<BoundCreate, 
     if vector_count != 1 {
         return Err(BindError::VectorColumnCount {
             found: vector_count,
+        });
+    }
+
+    // 4. Rule (D): exactly one PRIMARY KEY, and of a type that can be an
+    //    identity. Checked AFTER the vector rule so a schema that is wrong in
+    //    both ways reports the more fundamental problem first.
+    let keys: Vec<&ColumnSchema> = columns.iter().filter(|c| c.primary_key).collect();
+    if keys.len() != 1 {
+        return Err(BindError::PrimaryKeyCount { found: keys.len() });
+    }
+    let key = keys[0];
+    if !matches!(key.ty, ColumnType::Text | ColumnType::Int) {
+        return Err(BindError::PrimaryKeyType {
+            column: key.name.clone(),
+            ty: key.ty,
         });
     }
 
@@ -725,6 +1040,23 @@ fn bind_create(stmt: CreateStmt, catalog: &impl Catalog) -> Result<BoundCreate, 
         schema: Schema { columns },
         capacity,
     })
+}
+
+/// No pseudo-column is filterable.
+///
+/// `score` is the only one left, and it exists only once a ranked read has
+/// computed it — so there is nothing for a `WHERE` to resolve to a bitmap
+/// before the scan even begins.
+fn bind_pseudo_comparison(
+    pseudo: Pseudo,
+    _op: CompareOp,
+    _literal: Literal,
+) -> Result<BoundPredicate, BindError> {
+    match pseudo {
+        Pseudo::Score => Err(BindError::UnsupportedPredicate {
+            what: "filtering on score (it is computed by the ranking, not stored)".to_string(),
+        }),
+    }
 }
 
 /// Type-check `value` against `column`, producing a [`TypedValue`]. `INT`→
@@ -855,6 +1187,13 @@ fn bind_comparison(
         }
     };
 
+    // Pseudo-columns are checked FIRST, exactly as in a projection, so `id`
+    // means the same thing everywhere regardless of what a collection calls its
+    // own columns.
+    if let Some(pseudo) = Pseudo::from_name(&name) {
+        return bind_pseudo_comparison(pseudo, op, literal);
+    }
+
     let column = schema
         .column(&name)
         .ok_or_else(|| BindError::ColumnNotFound(name.clone()))?;
@@ -943,6 +1282,18 @@ mod tests {
             ty,
             ordinal,
             is_vector,
+            primary_key: false,
+        }
+    }
+
+    /// The same, for the column a fixture declares `PRIMARY KEY`.
+    fn col_key(name: &str, ty: ColumnType, ordinal: usize) -> ColumnSchema {
+        ColumnSchema {
+            name: name.to_string(),
+            ty,
+            ordinal,
+            is_vector: false,
+            primary_key: true,
         }
     }
 
@@ -952,7 +1303,7 @@ mod tests {
         Schema {
             columns: vec![
                 col("vector", ColumnType::Vector(768), 0, true),
-                col("author", ColumnType::Text, 1, false),
+                col_key("author", ColumnType::Text, 1),
                 col("title", ColumnType::Text, 2, false),
                 col("published_at", ColumnType::Int, 3, false),
             ],
@@ -986,6 +1337,26 @@ mod tests {
             BoundStatement::Search(s) => s,
             other => panic!("expected Search, got {other:?}"),
         }
+    }
+
+    /// The same, expecting the bind to fail.
+    fn bound_search_err(src: &str) -> BindError {
+        analyze_err(src, &docs_catalog())
+    }
+
+    /// A collection whose key really is called `id` — the conventional shape,
+    /// and the one that used to be impossible because `id` was reserved.
+    fn keyed_catalog() -> TestCatalog {
+        TestCatalog::new().with(
+            "things",
+            Schema {
+                columns: vec![
+                    col("vector", ColumnType::Vector(4), 0, true),
+                    col_key("id", ColumnType::Int, 1),
+                    col("label", ColumnType::Text, 2, false),
+                ],
+            },
+        )
     }
 
     /// A vector literal of `n` `0.1` elements, as SQL source.
@@ -1084,6 +1455,290 @@ mod tests {
         ));
     }
 
+    // -- the key in predicates ---------------------------------------------
+
+    /// The key is an ORDINARY column in a predicate — same `Compare` node, same
+    /// index lookup, same normalization of a flipped comparison. Nothing about
+    /// naming a row is special any more; what makes it name exactly one row is
+    /// the uniqueness the applier enforces, not the shape of the predicate.
+    #[test]
+    fn the_key_binds_like_any_other_column() {
+        assert_eq!(
+            pred("author = 'alice'"),
+            compare("author", 1, CompareOp::Eq, Literal::Str("alice".into()))
+        );
+        assert_eq!(
+            pred("'alice' = author"),
+            compare("author", 1, CompareOp::Eq, Literal::Str("alice".into()))
+        );
+    }
+
+    /// `id` is no longer a pseudo-column, so against a collection that declares
+    /// no such column it is simply an unknown name. This is the ordinal back
+    /// door closing: there is nothing left to resolve an ordinal from.
+    #[test]
+    fn id_is_not_a_pseudo_column_any_more() {
+        assert_eq!(pred_err("id = 7"), BindError::ColumnNotFound("id".into()));
+        let bound = bound_search_err(&format!(
+            "SEARCH TOP 1 NEAREST TO {} FROM docs RETURNING id;",
+            vec_lit(768)
+        ));
+        assert_eq!(bound, BindError::ColumnNotFound("id".into()));
+    }
+
+    /// And when a collection DOES declare `id`, it is an ordinary column that
+    /// binds and projects like any other — the name is no longer reserved.
+    #[test]
+    fn a_column_named_id_is_ordinary() {
+        let cat = keyed_catalog();
+        let bound = match analyze_ok("SELECT id FROM things WHERE id = 7;", &cat) {
+            BoundStatement::Select(s) => s,
+            other => panic!("expected a SELECT, got {other:?}"),
+        };
+        assert_eq!(bound.projection[0].name, "id");
+        assert_eq!(
+            bound.filter,
+            Some(compare("id", 1, CompareOp::Eq, Literal::Int(7)))
+        );
+    }
+
+    // -- UPDATE ------------------------------------------------------------
+
+    fn bound_update(src: &str) -> BoundUpdate {
+        match analyze_ok(src, &docs_catalog()) {
+            BoundStatement::Update(u) => u,
+            other => panic!("expected an UPDATE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_binds_its_assignments_and_predicate() {
+        let bound = bound_update("UPDATE docs SET title = 'bob' WHERE published_at < 5;");
+        assert_eq!(bound.collection, "docs");
+        assert_eq!(
+            bound.assignments,
+            vec![(
+                colref("title", 2),
+                TypedValue {
+                    value: Literal::Str("bob".to_string()),
+                    ty: ColumnType::Text,
+                },
+            )]
+        );
+        assert_eq!(
+            bound.filter,
+            compare("published_at", 3, CompareOp::Lt, Literal::Int(5))
+        );
+    }
+
+    #[test]
+    fn update_keeps_assignments_in_source_order() {
+        // Source order is application order: a column set twice takes the LAST
+        // value, which only works if the order survives binding.
+        let bound = bound_update(
+            "UPDATE docs SET title = 'a', published_at = 2, title = 'c' WHERE published_at = 1;",
+        );
+        assert_eq!(
+            bound
+                .assignments
+                .iter()
+                .map(|(col, _)| col.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["title", "published_at", "title"]
+        );
+    }
+
+    #[test]
+    fn update_values_are_type_checked_like_an_insert() {
+        assert!(matches!(
+            analyze_err(
+                "UPDATE docs SET published_at = 'soon' WHERE published_at = 1;",
+                &docs_catalog()
+            ),
+            BindError::TypeMismatch { .. }
+        ));
+        assert_eq!(
+            analyze_err(
+                "UPDATE docs SET nope = 1 WHERE published_at = 1;",
+                &docs_catalog()
+            ),
+            BindError::ColumnNotFound("nope".into())
+        );
+    }
+
+    #[test]
+    fn setting_the_embedding_needs_an_id_predicate() {
+        let bound = bound_update(&format!(
+            "UPDATE docs SET vector = {} WHERE author = 'alice';",
+            vec_lit(768)
+        ));
+        assert_eq!(bound.vector, Some(vec![0.1f32; 768]));
+        assert!(
+            bound.assignments.is_empty(),
+            "the embedding is not a scalar assignment"
+        );
+        assert_eq!(
+            bound.filter,
+            compare("author", 1, CompareOp::Eq, Literal::Str("alice".into()))
+        );
+    }
+
+    #[test]
+    fn the_embedding_and_scalars_can_change_together() {
+        let bound = bound_update(&format!(
+            "UPDATE docs SET vector = {}, title = 'v2' WHERE author = 'alice';",
+            vec_lit(768)
+        ));
+        assert_eq!(bound.vector, Some(vec![0.1f32; 768]));
+        assert_eq!(
+            bound.assignments,
+            vec![(
+                colref("title", 2),
+                TypedValue {
+                    value: Literal::Str("v2".to_string()),
+                    ty: ColumnType::Text,
+                },
+            )]
+        );
+    }
+
+    /// One statement carries one vector, so it must name one row. A column
+    /// predicate would hand the same embedding to everything it matched.
+    #[test]
+    fn setting_the_embedding_without_naming_one_row_is_refused() {
+        for clause in [
+            // Not the key at all.
+            "published_at = 1",
+            // The key, but not alone: the conjunction could still be written
+            // to match nothing, and more importantly a compound predicate is
+            // no longer the single-row shape the rule asks for.
+            "author = 'alice' AND published_at = 1",
+            // Two keys is two rows.
+            "author = 'alice' OR author = 'bob'",
+            // Not equality.
+            "author != 'alice'",
+        ] {
+            let sql = format!("UPDATE docs SET vector = {} WHERE {clause};", vec_lit(768));
+            assert!(
+                matches!(
+                    analyze_err(&sql, &docs_catalog()),
+                    BindError::CannotSetVector { .. }
+                ),
+                "`{clause}` must not be allowed to set the embedding"
+            );
+        }
+    }
+
+    /// Assigning the key is refused. It is not an edit but a change of
+    /// identity — and, left open, it is a hole straight through uniqueness: a
+    /// copy-on-write install carries the key of the row it retires, which is
+    /// precisely why installs skip the duplicate check, so an install that
+    /// changed the key would smuggle a duplicate past it.
+    #[test]
+    fn the_primary_key_cannot_be_assigned() {
+        assert_eq!(
+            analyze_err(
+                "UPDATE docs SET author = 'bob' WHERE published_at = 1;",
+                &docs_catalog()
+            ),
+            BindError::CannotSetPrimaryKey {
+                column: "author".into()
+            }
+        );
+        // Including alongside an edit that would otherwise be fine.
+        assert!(matches!(
+            analyze_err(
+                "UPDATE docs SET title = 'v2', author = 'bob' WHERE published_at = 1;",
+                &docs_catalog()
+            ),
+            BindError::CannotSetPrimaryKey { .. }
+        ));
+    }
+
+    #[test]
+    fn a_replacement_embedding_is_dimension_checked() {
+        assert!(matches!(
+            analyze_err(
+                &format!(
+                    "UPDATE docs SET vector = {} WHERE author = 'a';",
+                    vec_lit(3)
+                ),
+                &docs_catalog()
+            ),
+            BindError::DimensionMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn update_on_a_missing_collection_is_not_found() {
+        assert_eq!(
+            analyze_err(
+                "UPDATE nope SET author = 'x' WHERE published_at = 1;",
+                &docs_catalog()
+            ),
+            BindError::CollectionNotFound("nope".into())
+        );
+    }
+
+    /// The same rule DELETE follows: an UPDATE's predicate must accept and
+    /// refuse exactly what the previewing SELECT's does.
+    #[test]
+    fn update_predicates_fail_exactly_like_select_predicates() {
+        for clause in ["nope < 2", "vector = 'x'", "author < 'm'"] {
+            let sql = format!("UPDATE docs SET title = 'x' WHERE {clause};");
+            assert_eq!(
+                analyze_err(&sql, &docs_catalog()),
+                pred_err(clause),
+                "UPDATE and SELECT disagree on `{clause}`"
+            );
+        }
+    }
+
+    // -- DELETE ------------------------------------------------------------
+
+    #[test]
+    fn delete_binds_its_predicate_against_the_collection() {
+        match analyze_ok("DELETE FROM docs WHERE author = 'alice';", &docs_catalog()) {
+            BoundStatement::Delete(d) => assert_eq!(
+                d,
+                BoundDelete {
+                    from: "docs".into(),
+                    schema: docs_schema(),
+                    filter: compare("author", 1, CompareOp::Eq, Literal::Str("alice".into())),
+                }
+            ),
+            other => panic!("expected a DELETE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_from_a_missing_collection_is_not_found() {
+        assert_eq!(
+            analyze_err("DELETE FROM nope WHERE author = 'alice';", &docs_catalog()),
+            BindError::CollectionNotFound("nope".into())
+        );
+    }
+
+    /// A DELETE predicate must be refused for exactly the reasons a SELECT
+    /// predicate is — otherwise the SELECT a user runs to preview a DELETE
+    /// could disagree with what the DELETE does.
+    #[test]
+    fn delete_predicates_fail_exactly_like_select_predicates() {
+        for clause in [
+            "nope < 2",              // unknown column
+            "vector = 'x'",          // the embedding has no postings
+            "author < 'm'",          // ordered compare on TEXT
+            "published_at = 'soon'", // type mismatch
+        ] {
+            let sql = format!("DELETE FROM docs WHERE {clause};");
+            assert_eq!(
+                analyze_err(&sql, &docs_catalog()),
+                pred_err(clause),
+                "DELETE and SELECT disagree on `{clause}`"
+            );
+        }
+    }
+
     #[test]
     fn a_predicate_literal_is_type_checked_against_its_column() {
         // The same check an INSERT gets, so one rule governs both.
@@ -1115,7 +1770,10 @@ mod tests {
 
     #[test]
     fn an_unknown_column_in_where_is_the_same_error_as_in_a_projection() {
-        assert_eq!(pred_err("nope < 2"), BindError::ColumnNotFound("nope".into()));
+        assert_eq!(
+            pred_err("nope < 2"),
+            BindError::ColumnNotFound("nope".into())
+        );
     }
 
     #[test]
@@ -1133,7 +1791,10 @@ mod tests {
             pred("author = 'alice'"),
             compare("author", 1, CompareOp::Eq, Literal::Str("alice".into()))
         );
-        assert!(matches!(pred("author != 'alice'"), BoundPredicate::Compare { .. }));
+        assert!(matches!(
+            pred("author != 'alice'"),
+            BoundPredicate::Compare { .. }
+        ));
     }
 
     #[test]
@@ -1169,7 +1830,7 @@ mod tests {
     #[test]
     fn search_binds_its_filter_as_a_prefilter() {
         let search = bound_search(&format!(
-            "SEARCH TOP 5 NEAREST TO {} FROM docs WHERE published_at < 2 RETURNING id, score;",
+            "SEARCH TOP 5 NEAREST TO {} FROM docs WHERE published_at < 2 RETURNING author, score;",
             vec_lit(768)
         ));
         assert_eq!(
@@ -1324,6 +1985,104 @@ mod tests {
         );
     }
 
+    /// Naming a column TWICE is refused.
+    ///
+    /// Not a style rule — it was silent data corruption. Values are placed by
+    /// the ordinal their column resolves to and then sorted, so a duplicate
+    /// shifts every value after it by one. The row still has the right COUNT,
+    /// so the record split downstream sees nothing wrong, and a column the
+    /// statement never mentioned ends up holding the displaced value. It
+    /// surfaced as an error only when the displaced types happened to
+    /// disagree, which is luck rather than a guard.
+    #[test]
+    fn insert_naming_a_column_twice_is_refused() {
+        let cat = docs_catalog();
+        // `title` twice, `published_at` never — the arity still matches, which
+        // is exactly why nothing downstream caught it.
+        let src = format!(
+            "INSERT INTO docs (vector, author, title, title) \
+             VALUES ({}, 'alice', 'first', 'second');",
+            vec_lit(768)
+        );
+        assert_eq!(
+            analyze_err(&src, &cat),
+            BindError::DuplicateInsertColumn {
+                column: "title".to_string()
+            },
+        );
+    }
+
+    /// And the duplicate is reported ahead of the columns it displaced: a
+    /// statement that names one column twice is almost always missing another,
+    /// and the duplicate is the typo actually worth naming.
+    #[test]
+    fn a_duplicate_is_reported_before_the_missing_column() {
+        let cat = docs_catalog();
+        let src = format!(
+            "INSERT INTO docs (vector, vector) VALUES ({}, {});",
+            vec_lit(768),
+            vec_lit(768)
+        );
+        assert!(matches!(
+            analyze_err(&src, &cat),
+            BindError::DuplicateInsertColumn { .. }
+        ));
+    }
+
+    /// An `INSERT` must give a value for EVERY column, and the error names the
+    /// ones it is missing.
+    ///
+    /// Requiring all of them is the language's own rule rather than a
+    /// limitation: V-SQL has no NULLs and no defaults, so there is nothing an
+    /// omitted column could hold. What was wrong was the altitude — this
+    /// reached the record splitter in the VM and came back as "record has 2
+    /// values, schema declares 4", which describes the implementation instead
+    /// of the statement.
+    #[test]
+    fn insert_must_name_every_column() {
+        let cat = docs_catalog();
+
+        // One missing.
+        let src = format!(
+            "INSERT INTO docs (vector, author, title) VALUES ({}, 'alice', 'My doc');",
+            vec_lit(768)
+        );
+        assert_eq!(
+            analyze_err(&src, &cat),
+            BindError::MissingColumns {
+                columns: vec!["published_at".to_string()]
+            },
+        );
+
+        // Several, reported in DECLARATION order rather than the order the
+        // statement happened to leave them out.
+        let src = format!(
+            "INSERT INTO docs (title, vector) VALUES ('My doc', {});",
+            vec_lit(768)
+        );
+        assert_eq!(
+            analyze_err(&src, &cat),
+            BindError::MissingColumns {
+                columns: vec!["author".to_string(), "published_at".to_string()]
+            },
+        );
+    }
+
+    /// The embedding counts too: a row with no vector has nothing to search.
+    #[test]
+    fn insert_omitting_the_embedding_is_refused() {
+        let cat = docs_catalog();
+        assert_eq!(
+            analyze_err(
+                "INSERT INTO docs (author, title, published_at) VALUES ('alice', 'My doc', 1);",
+                &cat
+            ),
+            BindError::MissingColumns {
+                columns: vec!["vector".to_string()]
+            },
+        );
+    }
+
     #[test]
     fn insert_arity_mismatch_is_caught_here_not_in_the_parser() {
         // 4 columns, 3 values — PARSES fine (7d), fails HERE.
@@ -1426,7 +2185,7 @@ mod tests {
         let cat = TestCatalog::new();
         let src = "CREATE COLLECTION docs (
             vector VECTOR(768),
-            author TEXT,
+            author TEXT PRIMARY KEY,
             title TEXT,
             published_at INT
         ) WITH (capacity = 1000000);";
@@ -1461,13 +2220,99 @@ mod tests {
         );
     }
 
+    /// Rule: EXACTLY ONE primary key, always. Making it optional would mean
+    /// carrying two row-targeting paths forever — by key and by ordinal — and
+    /// the ordinal one is the footgun the key exists to remove.
+    #[test]
+    fn create_without_a_primary_key_is_rejected() {
+        let cat = TestCatalog::new();
+        let src = "CREATE COLLECTION c (v VECTOR(4), author TEXT) WITH (capacity = 1);";
+        assert_eq!(
+            analyze_err(src, &cat),
+            BindError::PrimaryKeyCount { found: 0 },
+        );
+    }
+
+    #[test]
+    fn create_with_two_primary_keys_is_rejected() {
+        let cat = TestCatalog::new();
+        let src = "CREATE COLLECTION c (
+            a TEXT PRIMARY KEY,
+            b INT PRIMARY KEY,
+            v VECTOR(4)
+        ) WITH (capacity = 1);";
+        assert_eq!(
+            analyze_err(src, &cat),
+            BindError::PrimaryKeyCount { found: 2 },
+        );
+    }
+
+    /// The embedding cannot be the identity: it has no equality path (that is
+    /// what SEARCH is for), and two rows may legitimately share a vector.
+    #[test]
+    fn the_vector_cannot_be_the_primary_key() {
+        let cat = TestCatalog::new();
+        let src = "CREATE COLLECTION c (v VECTOR(4) PRIMARY KEY, a TEXT) WITH (capacity = 1);";
+        assert_eq!(
+            analyze_err(src, &cat),
+            BindError::PrimaryKeyType {
+                column: "v".to_string(),
+                ty: ColumnType::Vector(4),
+            },
+        );
+    }
+
+    /// FLOAT is refused for the same reason no sane schema keys on one: equality
+    /// over floats is not identity, so `0.1 + 0.2` would address a different row
+    /// than `0.3`.
+    #[test]
+    fn a_float_cannot_be_the_primary_key() {
+        let cat = TestCatalog::new();
+        let src = "CREATE COLLECTION c (f FLOAT PRIMARY KEY, v VECTOR(4)) WITH (capacity = 1);";
+        assert_eq!(
+            analyze_err(src, &cat),
+            BindError::PrimaryKeyType {
+                column: "f".to_string(),
+                ty: ColumnType::Float,
+            },
+        );
+    }
+
+    /// TEXT and INT both work, and the bound schema remembers WHICH column it
+    /// was — every later stage reads the key off the schema rather than
+    /// re-deriving it from the word "id".
+    #[test]
+    fn a_text_or_int_column_can_be_the_primary_key() {
+        let cat = TestCatalog::new();
+        for (decl, ty) in [
+            ("doc_id TEXT", ColumnType::Text),
+            ("n INT", ColumnType::Int),
+        ] {
+            let src = format!(
+                "CREATE COLLECTION c ({decl} PRIMARY KEY, v VECTOR(4)) WITH (capacity = 1);"
+            );
+            let bound = match analyze_ok(&src, &cat) {
+                BoundStatement::CreateCollection(c) => c,
+                other => panic!("expected a CREATE, got {other:?}"),
+            };
+            let key = bound
+                .schema
+                .primary_key()
+                .expect("a V-SQL create always declares one");
+            assert_eq!(key.ordinal, 0);
+            assert_eq!(key.ty, ty);
+            assert!(key.primary_key);
+            assert!(!bound.schema.columns[1].primary_key, "the vector is not it");
+        }
+    }
+
     #[test]
     fn create_existing_collection_is_collection_exists() {
         // `docs` already lives in the fixture.
         let cat = docs_catalog();
         let src = "CREATE COLLECTION docs (
             vector VECTOR(768),
-            author TEXT,
+            author TEXT PRIMARY KEY,
             title TEXT,
             published_at INT
         ) WITH (capacity = 1000000);";
@@ -1482,32 +2327,26 @@ mod tests {
     #[test]
     fn id_and_score_bind_as_pseudocolumns() {
         // Both are COMPUTED, not stored: `id` is the row's ordinal and `score`
-        // is what the kernel produced. Neither is looked up in the schema —
-        // `docs` has no column by either name, so a binder that resolved them
-        // like ordinary columns would reject the statement outright.
+        // is what the kernel produced, and it is NOT looked up in the schema —
+        // `docs` has no column by that name, so a binder that resolved it like
+        // an ordinary column would reject the statement outright.
         let bound = bound_search(&format!(
-            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING id, score;",
+            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING author, score;",
             vec_lit(768)
         ));
         assert_eq!(
             bound.projection,
             vec![
-                Projected::Pseudo(Pseudo::Id),
+                Projected::Column(colref("author", 1)),
                 Projected::Pseudo(Pseudo::Score),
             ]
         );
-        // Recognized case-insensitively, like the engine's reserved `id` rule.
+        // Recognized case-insensitively.
         let bound = bound_search(&format!(
-            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING ID, Score;",
+            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING Score;",
             vec_lit(768)
         ));
-        assert_eq!(
-            bound.projection,
-            vec![
-                Projected::Pseudo(Pseudo::Id),
-                Projected::Pseudo(Pseudo::Score),
-            ]
-        );
+        assert_eq!(bound.projection, vec![Projected::Pseudo(Pseudo::Score)]);
     }
 
     #[test]
@@ -1525,7 +2364,7 @@ mod tests {
 
         // Stored and computed items mix freely, in source order.
         let bound = bound_search(&format!(
-            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING score, title, id, author;",
+            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING score, title, author;",
             vec_lit(768)
         ));
         assert_eq!(
@@ -1533,7 +2372,6 @@ mod tests {
             vec![
                 Projected::Pseudo(Pseudo::Score),
                 Projected::Column(colref("title", 2)),
-                Projected::Pseudo(Pseudo::Id),
                 Projected::Column(colref("author", 1)),
             ]
         );
@@ -1549,17 +2387,38 @@ mod tests {
             analyze(parse(&src).expect("parse"), &docs_catalog()),
             Err(BindError::ColumnNotFound(name)) if name == "nope"
         ));
+    }
 
-        // The embedding is not projectable either: it lives in the flat index,
-        // and bare SEARCH returns stored columns.
-        let src = format!(
-            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING vector;",
+    /// Naming the embedding in `RETURNING` is the opt-in that fetches it, and
+    /// it sets the split-storage flag rather than becoming an ordinary
+    /// `Column` read — the embedding is in the flat index, not the tuple store.
+    #[test]
+    fn returning_the_embedding_sets_the_split_storage_flag() {
+        let bound = bound_search(&format!(
+            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING vector, score;",
             vec_lit(768)
-        );
-        assert!(matches!(
-            analyze(parse(&src).expect("parse"), &docs_catalog()),
-            Err(BindError::ColumnNotFound(name)) if name == "vector"
         ));
+        assert!(bound.include_vector);
+        assert_eq!(
+            bound.projection,
+            vec![
+                Projected::Column(colref("vector", 0)),
+                Projected::Pseudo(Pseudo::Score),
+            ]
+        );
+
+        // Not named, not fetched — including the bare form, whose default
+        // projection is every SCALAR column.
+        let bound = bound_search(&format!(
+            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING author;",
+            vec_lit(768)
+        ));
+        assert!(!bound.include_vector);
+        let bound = bound_search(&format!(
+            "SEARCH TOP 5 NEAREST TO {} FROM docs;",
+            vec_lit(768)
+        ));
+        assert!(!bound.include_vector);
     }
 
     #[test]
@@ -1587,15 +2446,15 @@ mod tests {
     #[test]
     fn returning_replaces_the_default_projection() {
         // A `RETURNING` clause REPLACES the default outright — it does not add
-        // to it. `id, score` means two columns, not five.
+        // to it. `author, score` means two columns, not five.
         let bound = bound_search(&format!(
-            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING id, score;",
+            "SEARCH TOP 5 NEAREST TO {} FROM docs RETURNING author, score;",
             vec_lit(768)
         ));
         assert_eq!(
             bound.projection,
             vec![
-                Projected::Pseudo(Pseudo::Id),
+                Projected::Column(colref("author", 1)),
                 Projected::Pseudo(Pseudo::Score),
             ]
         );

@@ -70,7 +70,9 @@ use crate::error::{Error, Result};
 use crate::metadata::common::{ColumnId, Lsn, Ordinal, Row, Schema, Value};
 
 const MAGIC: &[u8; 4] = b"TUP0";
-const VERSION: u32 = 2;
+/// 3 = the embedded `Schema` carries a PRIMARY KEY. The body is
+/// `(schema, slots)`, so a field added to the schema re-shapes this file.
+const VERSION: u32 = 3;
 const SNAP_FILE: &str = "tuples.snap";
 const TMP_FILE: &str = "tuples.snap.tmp";
 

@@ -54,12 +54,20 @@
 
 use std::fmt;
 
-use crate::compiler::bytecode::{Op, Program, ValidateError};
+use crate::compiler::bytecode::ValidateError;
 use crate::compiler::compile;
 use crate::engine::Db;
 use crate::sql::bind::{BoundStatement, Projected};
 use crate::sql::{BindError, ParseError, Statement, analyze, parse, plan};
 use crate::vm::exec::{ExecError, OutputRow, Vm};
+
+/// How many times a conflicted write is run again before giving up.
+///
+/// A copy-on-write UPDATE that loses a race did nothing and is simply re-run
+/// against a fresh snapshot, so retrying is cheap and almost always settles on
+/// the first one. The cap exists so pathological contention surfaces as
+/// `Error::WriteConflict` instead of spinning forever.
+const MAX_WRITE_ATTEMPTS: usize = 10;
 
 /// A lazy stream of result rows.
 ///
@@ -147,6 +155,17 @@ impl Iterator for RowStream {
 /// `ParseError`, so one can never surface here on its own.
 #[derive(Debug)]
 pub enum Error {
+    /// A write kept losing to other writers and ran out of attempts.
+    ///
+    /// A copy-on-write UPDATE that finds its rows already rewritten is retried
+    /// from the top against a fresh snapshot. This is what a caller hears when
+    /// that keeps happening — sustained contention on the same rows, which is
+    /// a real condition rather than something to hide behind an unbounded
+    /// loop. Retrying the statement is a reasonable response.
+    WriteConflict {
+        /// How many times it was run before giving up.
+        attempts: usize,
+    },
     /// Bad syntax (lexing included).
     Parse(ParseError),
     /// Names, types, or arity: the statement parsed but does not mean anything.
@@ -162,13 +181,6 @@ pub enum Error {
     /// The machine could not run the program. Machine faults only — the engine
     /// and validation cases are normalized into their own variants above.
     Exec(ExecError),
-    /// The statement is valid V-SQL, but this build does not implement it yet.
-    /// An ERROR rather than the `todo!` the opcode arm holds: a public API must
-    /// not panic on input a user can type.
-    Unsupported {
-        /// What is missing.
-        feature: &'static str,
-    },
 }
 
 impl From<ExecError> for Error {
@@ -187,13 +199,16 @@ impl From<ExecError> for Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Error::WriteConflict { attempts } => write!(
+                f,
+                "write conflict: the statement lost to concurrent writers {attempts} times"
+            ),
             Error::Parse(e) => write!(f, "parse error: {e}"),
             Error::Bind(e) => write!(f, "bind error: {e}"),
             Error::Compile(e) => write!(f, "compile error: {e}"),
             Error::Validate(e) => write!(f, "malformed program: {e}"),
             Error::Engine(e) => write!(f, "engine error: {e}"),
             Error::Exec(e) => write!(f, "execution error: {e}"),
-            Error::Unsupported { feature } => write!(f, "not supported yet: {feature}"),
         }
     }
 }
@@ -207,7 +222,7 @@ impl std::error::Error for Error {
             Error::Validate(e) => Some(e),
             Error::Engine(e) => Some(e),
             Error::Exec(e) => Some(e),
-            Error::Unsupported { .. } => None,
+            Error::WriteConflict { .. } => None,
         }
     }
 }
@@ -238,9 +253,17 @@ impl Db {
         // Labels come from the BOUND projection, so they exist long before the
         // first row is fetched.
         let labels = labels_of(&bound);
+        // A DELETE would also finish inside `open_cursors` — its `Mutate` needs
+        // the database, so it runs before the machine detaches — but that is
+        // the read path's detach rule doing a write by coincidence. Mutations
+        // are drained on the write path, where "durable before `execute`
+        // returns" is the stated contract rather than a consequence.
         let mutates = matches!(
             bound,
-            BoundStatement::Insert(_) | BoundStatement::CreateCollection(_)
+            BoundStatement::Insert(_)
+                | BoundStatement::CreateCollection(_)
+                | BoundStatement::Delete(_)
+                | BoundStatement::Update(_)
         );
 
         // 3. PLAN — infallible: binding already validated everything, so this
@@ -272,18 +295,44 @@ impl Db {
         };
         let program = compile(logical, schema.as_ref()).map_err(Error::Compile)?;
 
-        // 5. Refuse what this build cannot run, so the unbuilt opcode arms are
-        //    unreachable from public input.
-        reject_unsupported(&program)?;
-
-        // 6. BUILD — `Vm::new` runs `Program::validate`.
-        let mut vm = Vm::new(program)?;
+        // 5. BUILD — `Vm::new` runs `Program::validate`. The program is kept
+        //    so a conflicted write can be run again from the top.
+        let mut vm = Vm::new(program.clone())?;
 
         if mutates {
             // EAGER: drain inside `execute`. A mutation yields no rows, and its
             // side effect must be durable before this returns.
-            while vm.step(self)?.is_some() {}
-            Ok(RowStream::empty())
+            //
+            // A copy-on-write UPDATE can come back conflicted: the rows it read
+            // were rewritten or retired by another writer between the read and
+            // the commit, so it did nothing. Retrying means running the WHOLE
+            // program again — the predicate must be resolved against a fresh
+            // snapshot, since which rows match may have changed — so a fresh
+            // `Vm` runs the same compiled program. Callers never see the
+            // conflict, only the applied result.
+            for attempt in 1..=MAX_WRITE_ATTEMPTS {
+                match (|| -> Result<(), Error> {
+                    while vm.step(self)?.is_some() {}
+                    Ok(())
+                })() {
+                    Ok(()) => return Ok(RowStream::empty()),
+                    Err(e) if is_retryable(&e) && attempt < MAX_WRITE_ATTEMPTS => {
+                        vm = Vm::new(program.clone())?;
+                    }
+                    // Out of attempts. Sustained contention on one row is a
+                    // real condition a caller has to hear about rather than
+                    // have hidden behind an unbounded loop.
+                    Err(e) if is_retryable(&e) => {
+                        return Err(Error::WriteConflict {
+                            attempts: MAX_WRITE_ATTEMPTS,
+                        });
+                    }
+                    // Everything else — including a REFUSED record, which is
+                    // final — travels as itself.
+                    Err(e) => return Err(e),
+                }
+            }
+            unreachable!("the loop returns on its last attempt")
         } else {
             // LAZY: open the cursors, then detach. Everything after this pulls
             // without a `Db`.
@@ -291,6 +340,17 @@ impl Db {
             Ok(RowStream::over(labels, vm))
         }
     }
+}
+
+/// Which failures earn another attempt.
+///
+/// Exactly one does. A CONFLICT means some other caller got to these rows
+/// first, so re-resolving the predicate against a fresh snapshot is likely to
+/// succeed. Every other failure — a refused record above all — would reach the
+/// identical outcome on every attempt, so retrying it only delays the error the
+/// caller is owed.
+fn is_retryable(e: &Error) -> bool {
+    matches!(e, Error::Exec(ExecError::Conflict))
 }
 
 /// Which collection a statement compiles against — and therefore where its
@@ -312,6 +372,10 @@ impl Target {
             // rejects it for now — see `BindError::Unbound` — but this is the
             // right answer, so the arm is real rather than a placeholder.)
             Statement::Search(s) => Target::Existing(s.collection.clone()),
+            // A DELETE's predicate is resolved against the collection it names.
+            Statement::Delete(d) => Target::Existing(d.from.clone()),
+            // An UPDATE reads and rewrites rows of the collection it names.
+            Statement::Update(u) => Target::Existing(u.collection.clone()),
         }
     }
 }
@@ -341,31 +405,16 @@ fn labels_of(bound: &BoundStatement) -> Vec<String> {
                 Projected::Pseudo(pseudo) => pseudo.name().to_string(),
             })
             .collect(),
-        BoundStatement::Insert(_) | BoundStatement::CreateCollection(_) => Vec::new(),
+        BoundStatement::Insert(_)
+        | BoundStatement::CreateCollection(_)
+        | BoundStatement::Delete(_)
+        | BoundStatement::Update(_) => Vec::new(),
     }
-}
-
-/// Reject a program containing an opcode this build does not implement.
-///
-/// The alternative is reaching the arm's `todo!` — a panic in library code, on
-/// input a user can type. The check is here rather than in the VM because only
-/// the boundary knows to phrase it as a feature, not a machine fault.
-fn reject_unsupported(program: &Program) -> Result<(), Error> {
-    if program
-        .ops
-        .iter()
-        .any(|op| matches!(op, Op::VectorFetch { .. }))
-    {
-        return Err(Error::Unsupported {
-            feature: "selecting a vector column (the embedding is stored separately)",
-        });
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, RowStream};
+    use super::{Error, RowStream, is_retryable};
     use crate::compiler::bytecode::{Addr, Cursor, Op, Program, Reg};
     use crate::compiler::constants::ConstPool;
     use crate::engine::{Db, DbOptions};
@@ -373,8 +422,24 @@ mod tests {
     use crate::sql::BindError;
     use crate::vm::exec::{RegValue, Vm};
 
+    /// Only a CONFLICT earns another attempt. A refusal is final — the record
+    /// was durable, the applier looked at it and said never, and re-running the
+    /// statement would produce the identical verdict — so it must leave the
+    /// retry loop immediately and reach the caller as itself.
+    #[test]
+    fn only_a_conflict_is_retried() {
+        use crate::vm::exec::ExecError;
+        use crate::wal::wal::RejectReason;
+
+        assert!(is_retryable(&Error::Exec(ExecError::Conflict)));
+        assert!(!is_retryable(&Error::Exec(ExecError::Rejected(
+            RejectReason::DuplicateKey
+        ))));
+        assert!(!is_retryable(&Error::WriteConflict { attempts: 10 }));
+    }
+
     const CREATE: &str = "CREATE COLLECTION docs (
-        author TEXT,
+        author TEXT PRIMARY KEY,
         vector VECTOR(4),
         title TEXT,
         published_at INT
@@ -395,6 +460,335 @@ mod tests {
              VALUES ('{author}', [0.1, 0.2, 0.3, 0.4], '{title}', {n});"
         );
         db.execute(&sql).expect("the row is inserted");
+    }
+
+    /// `SELECT id` used to be impossible twice over: `id` was reserved
+    /// engine-wide, and the binder resolved it to a pseudo-column that only a
+    /// `SEARCH`'s `RETURNING` could project. Declaring the key `id` settles
+    /// both — it is an ordinary column, so it projects, filters, and appears in
+    /// `SELECT *` with no special case anywhere.
+    #[test]
+    fn a_key_named_id_projects_like_any_column() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(dir.path(), &[], DbOptions::default()).expect("open");
+        db.execute(
+            "CREATE COLLECTION things (id INT PRIMARY KEY, vector VECTOR(2), label TEXT) \
+             WITH (capacity = 8);",
+        )
+        .expect("`id` is an ordinary column name");
+        for (id, label) in [(7, "seven"), (9, "nine")] {
+            db.execute(&format!(
+                "INSERT INTO things (id, vector, label) VALUES ({id}, [1.0, 0.0], '{label}');"
+            ))
+            .expect("inserts");
+        }
+
+        // Projected by name...
+        let stream = db
+            .execute("SELECT id, label FROM things WHERE id = 7;")
+            .expect("the select runs");
+        assert_eq!(stream.labels(), ["id", "label"]);
+        assert_eq!(
+            collect(stream),
+            vec![vec![RegValue::Int(7), RegValue::Str("seven".into())]]
+        );
+        // ...included in `SELECT *`, which still omits the embedding...
+        let stream = db
+            .execute("SELECT * FROM things;")
+            .expect("the select runs");
+        assert_eq!(stream.labels(), ["id", "label"]);
+        // ...and returnable from a ranked read.
+        let stream = db
+            .execute("SEARCH TOP 1 NEAREST TO [1.0, 0.0] FROM things RETURNING id, score;")
+            .expect("the search runs");
+        assert_eq!(stream.labels(), ["id", "score"]);
+        db.close().unwrap();
+    }
+
+    // -- INSERT names every column, exactly once -----------------------------
+
+    /// A column named twice used to WRITE THE WRONG ROW rather than fail: the
+    /// duplicate shifted the values after it, the count still matched, and a
+    /// column the statement never mentioned received the displaced value. So
+    /// this asserts two things — the error, and that nothing was written.
+    #[test]
+    fn a_duplicated_column_writes_nothing() {
+        let (_dir, db) = docs_db();
+
+        let sql = "INSERT INTO docs (author, vector, title, title) \
+                   VALUES ('alice', [0.1, 0.2, 0.3, 0.4], 'first', 'second');";
+        assert!(matches!(
+            db.execute(sql),
+            Err(Error::Bind(BindError::DuplicateInsertColumn { column })) if column == "title"
+        ));
+        assert!(
+            collect(
+                db.execute("SELECT author, title FROM docs;")
+                    .expect("the select runs")
+            )
+            .is_empty(),
+            "a refused insert must leave the collection untouched"
+        );
+        db.close().unwrap();
+    }
+
+    /// The error a user actually hits when they write SQL out of habit. It must
+    /// name the columns they forgot — not describe the record splitter.
+    #[test]
+    fn a_partial_insert_names_the_missing_columns() {
+        let (_dir, db) = docs_db();
+
+        let err = match db
+            .execute("INSERT INTO docs (author, vector) VALUES ('alice', [0.1, 0.2, 0.3, 0.4]);")
+        {
+            Err(e) => e,
+            Ok(_) => panic!("a partial row must be refused"),
+        };
+        // The message names the columns, in declaration order.
+        let text = err.to_string();
+        assert!(
+            text.contains("title") && text.contains("published_at"),
+            "the error must name what is missing, got: {text}"
+        );
+        assert!(
+            !text.contains("record has"),
+            "and must not leak the record splitter's phrasing: {text}"
+        );
+        db.close().unwrap();
+    }
+
+    // -- reading the embedding back ------------------------------------------
+
+    /// The embedding can be read back out. Until now it could be written and
+    /// never retrieved, which made the collection a one-way door: no export, no
+    /// backup, no migration to a different embedding model, and no way to see
+    /// what a row actually holds.
+    ///
+    /// Every other vector database offers this, and every one makes it opt-in
+    /// rather than part of `SELECT *` — a few hundred floats per row is a lot
+    /// of payload to hand over unasked. Naming the column IS the opt-in.
+    #[test]
+    fn the_embedding_can_be_selected_by_name() {
+        let (_dir, db) = docs_db();
+        insert(&db, "alice", "doc", 1); // vector [0.1, 0.2, 0.3, 0.4]
+
+        let stream = db
+            .execute("SELECT vector FROM docs;")
+            .expect("selecting the embedding is supported");
+        assert_eq!(stream.labels(), ["vector"]);
+        let rows = collect(stream);
+        assert_eq!(rows.len(), 1);
+        match &rows[0][0] {
+            RegValue::Vector(v) => assert_eq!(&v[..], &[0.1f32, 0.2, 0.3, 0.4]),
+            other => panic!("expected an embedding, got {other:?}"),
+        }
+        db.close().unwrap();
+    }
+
+    /// Mixed with ordinary columns, in source order — the embedding is just
+    /// another projected item once it is in a register.
+    #[test]
+    fn the_embedding_mixes_with_stored_columns() {
+        let (_dir, db) = docs_db();
+        insert(&db, "alice", "doc", 1);
+
+        let stream = db
+            .execute("SELECT author, vector, published_at FROM docs;")
+            .expect("the select runs");
+        assert_eq!(stream.labels(), ["author", "vector", "published_at"]);
+        let rows = collect(stream);
+        // Arity matches the labels, so a header can never promise a column the
+        // stream does not deliver.
+        assert_eq!(rows[0].len(), 3, "one register per projected item");
+        assert!(matches!(&rows[0][0], RegValue::Str(s) if s == "alice"));
+        assert!(matches!(&rows[0][1], RegValue::Vector(_)));
+        assert!(matches!(&rows[0][2], RegValue::Int(1)));
+        db.close().unwrap();
+    }
+
+    /// `SELECT *` still leaves it out. That is the spec, and it is what every
+    /// other vector database does too: the embedding is opt-in, never implicit.
+    #[test]
+    fn select_star_still_omits_the_embedding() {
+        let (_dir, db) = docs_db();
+        insert(&db, "alice", "doc", 1);
+
+        let stream = db.execute("SELECT * FROM docs;").expect("the select runs");
+        assert_eq!(stream.labels(), ["author", "title", "published_at"]);
+        assert!(
+            collect(stream)[0]
+                .iter()
+                .all(|v| !matches!(v, RegValue::Vector(_))),
+            "`*` must not hand over embeddings nobody asked for"
+        );
+        db.close().unwrap();
+    }
+
+    /// And it streams LAZILY, like any other read: the rows arrive after
+    /// `execute` has returned, which is only possible because the embedding is
+    /// fetched through the cursor rather than the `Db`.
+    #[test]
+    fn selecting_the_embedding_still_streams() {
+        let (_dir, db) = docs_db();
+        for n in 1..=3 {
+            insert(&db, &format!("a{n}"), "doc", n);
+        }
+
+        let stream = db
+            .execute("SELECT vector FROM docs;")
+            .expect("the select runs");
+        // Pulled one at a time from a stream the `Db` is no longer lent to.
+        let count = stream
+            .map(|row| match &row.expect("no runtime error").0[0] {
+                RegValue::Vector(v) => v.len(),
+                other => panic!("expected an embedding, got {other:?}"),
+            })
+            .filter(|&dim| dim == 4)
+            .count();
+        assert_eq!(count, 3);
+        db.close().unwrap();
+    }
+
+    /// A ranked read can return the embeddings too — which is the form that
+    /// actually matters. Fetching by key is the rare case; the common one is
+    /// "find me the nearest rows AND give me their vectors", which is exactly
+    /// what Pinecone's `include_values` and Qdrant's `with_vector` are for.
+    #[test]
+    fn search_can_return_the_embedding() {
+        let (_dir, db) = docs_db();
+        seed_ranked(&db); // far=[1,0,0,0], near=[3,0,0,0], mid=[2,0,0,0]
+
+        let stream = db
+            .execute("SEARCH TOP 2 NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM docs RETURNING title, vector, score;")
+            .expect("a ranked read can project the embedding");
+        assert_eq!(stream.labels(), ["title", "vector", "score"]);
+
+        let rows = collect(stream);
+        assert_eq!(rows.len(), 2);
+        // Nearest first, and each row carries ITS OWN embedding — paired with
+        // its own score, so a fetch one row out of step would show up here.
+        for (row, (title, x)) in rows.iter().zip([("near", 3.0f32), ("mid", 2.0)]) {
+            assert!(matches!(&row[0], RegValue::Str(t) if t == title), "{row:?}");
+            match &row[1] {
+                RegValue::Vector(v) => assert_eq!(&v[..], &[x, 0.0, 0.0, 0.0]),
+                other => panic!("expected an embedding, got {other:?}"),
+            }
+            assert!(
+                matches!(&row[2], RegValue::Real(s) if *s == x as f64),
+                "score must belong to the same row as the embedding: {row:?}"
+            );
+        }
+        db.close().unwrap();
+    }
+
+    /// A bare `SEARCH` still returns only the stored scalars — the embedding is
+    /// opt-in on a ranked read exactly as it is on a `SELECT`.
+    #[test]
+    fn bare_search_still_omits_the_embedding() {
+        let (_dir, db) = docs_db();
+        seed_ranked(&db);
+
+        let stream = db
+            .execute("SEARCH TOP 1 NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM docs;")
+            .expect("the search runs");
+        assert_eq!(stream.labels(), ["author", "title", "published_at"]);
+        assert!(
+            collect(stream)[0]
+                .iter()
+                .all(|v| !matches!(v, RegValue::Vector(_)))
+        );
+        db.close().unwrap();
+    }
+
+    // -- the key is unique ---------------------------------------------------
+
+    /// Every live row's `title`, from a projection of that column alone.
+    fn only_titles(db: &Db) -> Vec<String> {
+        collect(
+            db.execute("SELECT title FROM docs;")
+                .expect("the select runs"),
+        )
+        .into_iter()
+        .map(|row| match &row[0] {
+            RegValue::Str(s) => s.clone(),
+            other => panic!("expected a title string, got {other:?}"),
+        })
+        .collect()
+    }
+
+    /// The promise the whole design rests on: two live rows can never hold the
+    /// same key. Without it, equality on the key would not name one row, and
+    /// `SET vector` — which is only allowed because it does — could hand one
+    /// embedding to several rows.
+    ///
+    /// A duplicate is a REFUSAL, not a failure: the first row stays exactly as
+    /// it was, the database keeps working, and the caller gets an error naming
+    /// the column and the value.
+    #[test]
+    fn a_duplicate_key_is_refused() {
+        let (_dir, db) = docs_db();
+        insert(&db, "alice", "first", 1);
+
+        let err = match db.execute(
+            "INSERT INTO docs (author, vector, title, published_at) \
+             VALUES ('alice', [0.9, 0.0, 0.0, 0.0], 'second', 2);",
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("the second 'alice' must be refused"),
+        };
+        assert!(
+            matches!(
+                &err,
+                Error::Engine(EngineError::DuplicateKey { column, value })
+                    if column == "author" && value == "'alice'"
+            ),
+            "got {err:?}"
+        );
+
+        // The first row is untouched and the collection still holds one row.
+        assert_eq!(
+            only_titles(&db),
+            vec!["first"],
+            "the refused insert left nothing behind"
+        );
+        // And the database is healthy: a DIFFERENT key still goes in.
+        insert(&db, "bob", "third", 3);
+        assert_eq!(remaining(&db), vec!["alice", "bob"]);
+        db.close().unwrap();
+    }
+
+    /// Retiring a row releases its key. Otherwise a collection would slowly
+    /// fill up with names that can never be used again.
+    #[test]
+    fn a_deleted_key_can_be_reused() {
+        let (_dir, db) = docs_db();
+        insert(&db, "alice", "first", 1);
+        delete(&db, "DELETE FROM docs WHERE author = 'alice';");
+        insert(&db, "alice", "second", 2);
+
+        assert_eq!(only_titles(&db), vec!["second"]);
+        db.close().unwrap();
+    }
+
+    /// An UPDATE copies the row it edits, so the copy carries the same key as
+    /// the original — which is being retired in the very same record. The
+    /// uniqueness check must see those together, or every single UPDATE would
+    /// be refused as a duplicate of the row it replaces.
+    #[test]
+    fn an_update_is_not_a_duplicate_of_the_row_it_replaces() {
+        let (_dir, db) = docs_db();
+        insert(&db, "alice", "v1", 1);
+
+        update(&db, "UPDATE docs SET title = 'v2' WHERE author = 'alice';");
+        assert_eq!(only_titles(&db), vec!["v2"]);
+        // Including the full-replacement form, which installs a fresh row.
+        update(
+            &db,
+            "UPDATE docs SET vector = [0.0, 0.0, 0.0, 1.0], title = 'v3' \
+             WHERE author = 'alice';",
+        );
+        assert_eq!(only_titles(&db), vec!["v3"]);
+        db.close().unwrap();
     }
 
     /// Drain a stream into rows, failing on the first `Err` item.
@@ -534,7 +928,9 @@ mod tests {
         // COMPILE — binds cleanly, cannot lower. The binder counts vector
         // columns but never checks the dimension.
         assert!(matches!(
-            db.execute("CREATE COLLECTION broken (v VECTOR(0), a INT) WITH (capacity = 10);"),
+            db.execute(
+                "CREATE COLLECTION broken (v VECTOR(0), a INT PRIMARY KEY) WITH (capacity = 10);"
+            ),
             Err(Error::Compile(_))
         ));
 
@@ -547,33 +943,21 @@ mod tests {
         ));
 
         // ENGINE — reachable only for rules the BINDER does not know, because
-        // it pre-empts everything it does know. Two exist:
+        // it pre-empts everything it does know. One exists:
         //
-        //   * `id` is the ordinal pseudo-column SEARCH returns, so a stored
-        //     column may not shadow it. A storage rule, invisible to the binder.
-        assert!(matches!(
-            db.execute("CREATE COLLECTION reserved (v VECTOR(2), id INT) WITH (capacity = 4);"),
-            Err(Error::Engine(EngineError::ReservedColumn(name))) if name == "id"
-        ));
         //   * capacity is a RUNTIME property — how many rows are already there —
         //     so only the engine can know the collection is full. This one also
         //     shows why the eager/lazy split matters: the INSERT ran INSIDE
         //     `execute`, so its failure is an outer error, not a stream item.
-        db.execute("CREATE COLLECTION tiny (v VECTOR(2), a INT) WITH (capacity = 1);")
+        db.execute("CREATE COLLECTION tiny (v VECTOR(2), a INT PRIMARY KEY) WITH (capacity = 1);")
             .expect("creates");
-        let fill = "INSERT INTO tiny (v, a) VALUES ([1.0, 0.0], 1);";
-        db.execute(fill).expect("the first row fits");
+        db.execute("INSERT INTO tiny (v, a) VALUES ([1.0, 0.0], 1);")
+            .expect("the first row fits");
+        // A DIFFERENT key, so this is refused for being full rather than for
+        // repeating a key — which is a check that runs earlier.
         assert!(matches!(
-            db.execute(fill),
+            db.execute("INSERT INTO tiny (v, a) VALUES ([1.0, 0.0], 2);"),
             Err(Error::Engine(EngineError::CapacityExceeded { .. }))
-        ));
-
-        // UNSUPPORTED — the one built-out gap. It must be an ERROR, not the
-        // `todo!` panic the arm holds: a public API may not panic on input a
-        // user can type.
-        assert!(matches!(
-            db.execute("SELECT vector FROM docs;"),
-            Err(Error::Unsupported { .. })
         ));
 
         db.close().unwrap();
@@ -713,7 +1097,7 @@ mod tests {
         for (title, x, n) in [("far", 1.0, 1), ("near", 3.0, 2), ("mid", 2.0, 3)] {
             db.execute(&format!(
                 "INSERT INTO docs (author, vector, title, published_at) \
-                 VALUES ('alice', [{x}, 0.0, 0.0, 0.0], '{title}', {n});"
+                 VALUES ('{title} author', [{x}, 0.0, 0.0, 0.0], '{title}', {n});"
             ))
             .expect("seeded row inserts");
         }
@@ -754,7 +1138,7 @@ mod tests {
         assert_eq!(
             collect(stream),
             vec![vec![
-                RegValue::Str("alice".into()),
+                RegValue::Str("near author".into()),
                 RegValue::Str("near".into()),
                 RegValue::Int(2),
             ]]
@@ -770,7 +1154,7 @@ mod tests {
         for n in 1..=5 {
             db.execute(&format!(
                 "INSERT INTO docs (author, vector, title, published_at) \
-                 VALUES ('alice', [{n}.0, 0.0, 0.0, 0.0], 'doc {n}', {n});"
+                 VALUES ('a{n}', [{n}.0, 0.0, 0.0, 0.0], 'doc {n}', {n});"
             ))
             .expect("inserts");
         }
@@ -819,7 +1203,7 @@ mod tests {
         // so the clamp is doing all the work and a stray `k`-sized reservation
         // would still abort.
         db.execute(
-            "CREATE COLLECTION empty_docs (vector VECTOR(4), author TEXT) \
+            "CREATE COLLECTION empty_docs (vector VECTOR(4), author TEXT PRIMARY KEY) \
              WITH (capacity = 16);",
         )
         .expect("the collection is created");
@@ -906,17 +1290,17 @@ mod tests {
             collect(stream),
             vec![
                 vec![
-                    RegValue::Str("alice".into()),
+                    RegValue::Str("near author".into()),
                     RegValue::Str("near".into()),
                     RegValue::Int(2),
                 ],
                 vec![
-                    RegValue::Str("alice".into()),
+                    RegValue::Str("mid author".into()),
                     RegValue::Str("mid".into()),
                     RegValue::Int(3),
                 ],
                 vec![
-                    RegValue::Str("alice".into()),
+                    RegValue::Str("far author".into()),
                     RegValue::Str("far".into()),
                     RegValue::Int(1),
                 ],
@@ -943,7 +1327,7 @@ mod tests {
         for i in 0..n {
             db.execute(&format!(
                 "INSERT INTO docs (author, vector, title, published_at) \
-                 VALUES ('alice', [{}.0, 0.0, 0.0, 0.0], 'doc {i}', {i});",
+                 VALUES ('a{i}', [{}.0, 0.0, 0.0, 0.0], 'doc {i}', {i});",
                 i + 1
             ))
             .expect("seeded row inserts");
@@ -953,18 +1337,18 @@ mod tests {
     const QUERY: &str = "[1.0, 0.0, 0.0, 0.0]";
 
     #[test]
-    fn returning_id_and_score() {
+    fn returning_a_column_and_score() {
         let (_dir, db) = docs_db();
         seed_scored(&db, 4);
 
         let stream = db
             .execute(&format!(
-                "SEARCH TOP 4 NEAREST TO {QUERY} FROM docs RETURNING id, score;"
+                "SEARCH TOP 4 NEAREST TO {QUERY} FROM docs RETURNING published_at, score;"
             ))
             .expect("compiles and runs");
         // Labels are the RETURNING names, in order — NOT the collection's
         // columns, which is what a bare SEARCH would have reported.
-        assert_eq!(stream.labels(), ["id", "score"]);
+        assert_eq!(stream.labels(), ["published_at", "score"]);
 
         let rows = collect(stream);
         assert_eq!(rows.len(), 4);
@@ -976,26 +1360,26 @@ mod tests {
                 vec![RegValue::Int(1), RegValue::Real(2.0)],
                 vec![RegValue::Int(0), RegValue::Real(1.0)],
             ],
-            "nearest first, each id paired with its own score"
+            "nearest first, each row paired with its own score"
         );
 
         db.close().unwrap();
     }
 
     #[test]
-    fn score_aligns_with_its_ordinal() {
-        // THE load-bearing test. `score == id + 1` holds for every seeded row by
-        // construction, so ANY drift between a row's id and the score reported
-        // beside it breaks the invariant — including an index advanced one step
-        // out of step with the cursor, which is invisible to an assertion that
-        // only checks "scores descend".
+    fn score_aligns_with_its_row() {
+        // THE load-bearing test. `score == published_at + 1` holds for every
+        // seeded row by construction, so ANY drift between a row and the score
+        // reported beside it breaks the invariant — including an index advanced
+        // one step out of step with the cursor, which is invisible to an
+        // assertion that only checks "scores descend".
         let (_dir, db) = docs_db();
         seed_scored(&db, 6);
 
         for k in [1, 3, 6] {
             let stream = db
                 .execute(&format!(
-                    "SEARCH TOP {k} NEAREST TO {QUERY} FROM docs RETURNING id, score;"
+                    "SEARCH TOP {k} NEAREST TO {QUERY} FROM docs RETURNING published_at, score;"
                 ))
                 .expect("compiles and runs");
             let rows = collect(stream);
@@ -1003,16 +1387,16 @@ mod tests {
 
             let mut previous: Option<f64> = None;
             for row in rows {
-                let (id, score) = match (&row[0], &row[1]) {
-                    (RegValue::Int(id), RegValue::Real(score)) => (*id, *score),
+                let (n, score) = match (&row[0], &row[1]) {
+                    (RegValue::Int(n), RegValue::Real(score)) => (*n, *score),
                     other => panic!("expected (Int, Real), got {other:?}"),
                 };
                 assert_eq!(
                     score,
-                    (id + 1) as f64,
-                    "row {id} was reported with score {score}, but its own \
+                    (n + 1) as f64,
+                    "row {n} was reported with score {score}, but its own \
                      similarity is {}",
-                    id + 1
+                    n + 1
                 );
                 // ...and the ranking still descends, so the invariant above is
                 // not being satisfied by an accidentally-sorted-by-id result.
@@ -1033,7 +1417,7 @@ mod tests {
         // (`score`). Both are just registers by the time `ResultRow` runs, which
         // is exactly why this costs nothing. A design that special-cased
         // pseudo-columns — emitting them through a separate path instead of into
-        // the register file — would fail here even if `RETURNING id, score`
+        // the register file — would fail here even if `RETURNING title, score`
         // worked.
         let (_dir, db) = docs_db();
         seed_scored(&db, 3);
@@ -1056,10 +1440,13 @@ mod tests {
         // Interleaved the other way, and with all three kinds at once.
         let stream = db
             .execute(&format!(
-                "SEARCH TOP 2 NEAREST TO {QUERY} FROM docs RETURNING score, id, title, author;"
+                "SEARCH TOP 2 NEAREST TO {QUERY} FROM docs RETURNING score, published_at, title, author;"
             ))
             .expect("compiles and runs");
-        assert_eq!(stream.labels(), ["score", "id", "title", "author"]);
+        assert_eq!(
+            stream.labels(),
+            ["score", "published_at", "title", "author"]
+        );
         assert_eq!(
             collect(stream),
             vec![
@@ -1067,13 +1454,13 @@ mod tests {
                     RegValue::Real(3.0),
                     RegValue::Int(2),
                     RegValue::Str("doc 2".into()),
-                    RegValue::Str("alice".into()),
+                    RegValue::Str("a2".into()),
                 ],
                 vec![
                     RegValue::Real(2.0),
                     RegValue::Int(1),
                     RegValue::Str("doc 1".into()),
-                    RegValue::Str("alice".into()),
+                    RegValue::Str("a1".into()),
                 ],
             ]
         );
@@ -1087,14 +1474,14 @@ mod tests {
         seed_scored(&db, 2);
 
         for (clause, expected) in [
-            ("id", vec!["id"]),
+            ("published_at", vec!["published_at"]),
             ("score", vec!["score"]),
-            ("id, score", vec!["id", "score"]),
-            ("score, id", vec!["score", "id"]),
+            ("published_at, score", vec!["published_at", "score"]),
+            ("score, published_at", vec!["score", "published_at"]),
             ("title", vec!["title"]),
             (
-                "title, id, score, author",
-                vec!["title", "id", "score", "author"],
+                "title, published_at, score, author",
+                vec!["title", "published_at", "score", "author"],
             ),
         ] {
             let stream = db
@@ -1127,10 +1514,10 @@ mod tests {
 
         let stream = db
             .execute(&format!(
-                "SEARCH TOP 5 NEAREST TO {QUERY} FROM docs RETURNING id, score;"
+                "SEARCH TOP 5 NEAREST TO {QUERY} FROM docs RETURNING published_at, score;"
             ))
             .expect("SEARCH compiles");
-        assert_eq!(stream.labels(), ["id", "score"]);
+        assert_eq!(stream.labels(), ["published_at", "score"]);
         assert_eq!(
             collect(stream),
             vec![
@@ -1164,11 +1551,11 @@ mod tests {
         // therefore reads the wrong column — or, for alpha's ordinal 1 under
         // beta's schema, resolves to the VECTOR and emits nothing at all.
         db.execute(
-            "CREATE COLLECTION alpha (emb VECTOR(2), title TEXT, tag TEXT) WITH (capacity = 8);",
+            "CREATE COLLECTION alpha (emb VECTOR(2), title TEXT PRIMARY KEY, tag TEXT) WITH (capacity = 8);",
         )
         .expect("alpha is created");
         db.execute(
-            "CREATE COLLECTION beta (tag TEXT, emb VECTOR(2), title TEXT) WITH (capacity = 8);",
+            "CREATE COLLECTION beta (tag TEXT PRIMARY KEY, emb VECTOR(2), title TEXT) WITH (capacity = 8);",
         )
         .expect("beta is created");
 
@@ -1566,5 +1953,505 @@ mod tests {
             "the complement is bounded by the live set, not by capacity"
         );
         db.close().unwrap();
+    }
+    // -- DELETE, end to end through the front door ---------------------------
+
+    /// Every author still visible, sorted — the oracle for what a DELETE left.
+    fn remaining(db: &Db) -> Vec<String> {
+        let mut all = authors(
+            db.execute("SELECT author FROM docs WHERE published_at > 0;")
+                .expect("the select runs"),
+        );
+        all.sort();
+        all
+    }
+
+    /// Run a DELETE and insist it behaves like every mutation: no rows out.
+    fn delete(db: &Db, sql: &str) {
+        let stream = db.execute(sql).expect("the delete runs");
+        assert!(collect(stream).is_empty(), "a DELETE yields no rows");
+    }
+
+    #[test]
+    fn delete_removes_exactly_the_rows_its_where_admits() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        delete(&db, "DELETE FROM docs WHERE published_at = 1;");
+
+        assert_eq!(remaining(&db), vec!["bob", "dave"]);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn delete_takes_compound_predicates() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        // AND binds tighter than OR: (published_at = 1 AND author = 'alice') OR author = 'dave'.
+        delete(
+            &db,
+            "DELETE FROM docs WHERE published_at = 1 AND author = 'alice' OR author = 'dave';",
+        );
+
+        assert_eq!(remaining(&db), vec!["bob", "carol"]);
+        db.close().unwrap();
+    }
+
+    /// V-SQL has no NOT; `!=` is its negation, built as a complement WITHIN
+    /// the query's snapshot. A DELETE through it must hit only rows that were
+    /// live — it must neither resurrect a row deleted earlier nor reach past
+    /// the live set into ordinals no row has been given yet.
+    #[test]
+    fn a_negated_delete_stays_inside_the_live_set() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        delete(&db, "DELETE FROM docs WHERE author = 'alice';");
+        delete(&db, "DELETE FROM docs WHERE author != 'bob';");
+        assert_eq!(remaining(&db), vec!["bob"]);
+        assert!(
+            where_authors(&db, "author = 'alice'").is_empty(),
+            "no resurrection"
+        );
+
+        // A row inserted afterwards lands at a fresh ordinal and is visible:
+        // the complement did not pre-retire ordinal space beyond the live set.
+        insert(&db, "eve", "late", 3);
+        assert_eq!(remaining(&db), vec!["bob", "eve"]);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn a_delete_matching_nothing_succeeds_and_logs_nothing() {
+        let (dir, db) = docs_db();
+        seed_filterable(&db);
+
+        let wal = dir.path().join("wal.log");
+        let before = std::fs::metadata(&wal).expect("wal exists").len();
+        delete(&db, "DELETE FROM docs WHERE author = 'nobody';");
+
+        assert_eq!(std::fs::metadata(&wal).expect("wal exists").len(), before);
+        assert_eq!(remaining(&db), vec!["alice", "bob", "carol", "dave"]);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn a_delete_survives_reopen() {
+        let (dir, db) = docs_db();
+        seed_filterable(&db);
+        delete(&db, "DELETE FROM docs WHERE published_at = 1;");
+        drop(db); // no closing checkpoint: the WAL must carry the delete
+
+        let db = Db::open(dir.path(), &[], DbOptions::default()).expect("reopen");
+        assert_eq!(remaining(&db), vec!["bob", "dave"]);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn malformed_and_misaddressed_deletes_are_errors_not_panics() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        assert!(matches!(
+            db.execute("DELETE FROM docs;"),
+            Err(Error::Parse(_))
+        ));
+        assert!(matches!(
+            db.execute("DELETE FROM nope WHERE author = 'alice';"),
+            Err(Error::Bind(BindError::CollectionNotFound(_)))
+        ));
+        assert_eq!(remaining(&db).len(), 4, "a refused DELETE removes nothing");
+        db.close().unwrap();
+    }
+    // -- WHERE <key> = <value> -----------------------------------------------
+
+    #[test]
+    fn a_row_can_be_named_by_its_key() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db); // authors alice/bob/carol/dave — `author` is the key
+
+        assert_eq!(where_authors(&db, "author = 'carol'"), vec!["carol"]);
+        assert_eq!(where_authors(&db, "author = 'alice'"), vec!["alice"]);
+        // No such key: no row, no error.
+        assert!(where_authors(&db, "author = 'nobody'").is_empty());
+        db.close().unwrap();
+    }
+
+    /// An ordinal names a row, not a slot: once the row is retired, naming it
+    /// matches nothing. Otherwise naming the key would be a back door around
+    /// the liveness snapshot every other predicate goes through.
+    #[test]
+    fn a_retired_row_cannot_be_named_by_its_key() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        delete(&db, "DELETE FROM docs WHERE author = 'carol';");
+        assert!(where_authors(&db, "author = 'carol'").is_empty());
+        assert_eq!(remaining(&db).len(), 3);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn a_key_predicate_composes_with_a_column_one() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        assert_eq!(
+            where_authors(&db, "author = 'bob' AND published_at = 5"),
+            vec!["bob"]
+        );
+        assert!(where_authors(&db, "author = 'bob' AND published_at = 9").is_empty());
+        db.close().unwrap();
+    }
+
+    // -- UPDATE, end to end through the front door ---------------------------
+
+    /// Run an UPDATE and insist it behaves like every mutation: no rows out.
+    fn update(db: &Db, sql: &str) {
+        let stream = db.execute(sql).expect("the update runs");
+        assert!(collect(stream).is_empty(), "an UPDATE yields no rows");
+    }
+
+    /// `(author, published_at)` of every live row, sorted.
+    fn rows_of(db: &Db) -> Vec<(String, i64)> {
+        let stream = db
+            .execute("SELECT author, published_at FROM docs WHERE published_at > 0;")
+            .expect("the select runs");
+        let mut out: Vec<(String, i64)> = collect(stream)
+            .into_iter()
+            .map(|row| match (&row[0], &row[1]) {
+                (RegValue::Str(a), RegValue::Int(n)) => (a.clone(), *n),
+                other => panic!("unexpected row shape: {other:?}"),
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Every live row as `(title, published_at)` — the columns an UPDATE test
+    /// edits and filters on, now that `author` is the key and off limits.
+    fn titled_rows(db: &Db) -> Vec<(String, i64)> {
+        let stream = db
+            .execute("SELECT title, published_at FROM docs WHERE published_at > 0;")
+            .expect("the select runs");
+        let mut out: Vec<(String, i64)> = collect(stream)
+            .into_iter()
+            .map(|row| match (&row[0], &row[1]) {
+                (RegValue::Str(t), RegValue::Int(n)) => (t.clone(), *n),
+                other => panic!("unexpected row shape: {other:?}"),
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn update_rewrites_the_rows_its_where_admits() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        update(
+            &db,
+            "UPDATE docs SET title = 'archived' WHERE published_at = 1;",
+        );
+
+        assert_eq!(
+            titled_rows(&db),
+            vec![
+                ("archived".to_string(), 1),
+                ("archived".to_string(), 1),
+                ("doc".to_string(), 5),
+                ("doc".to_string(), 9),
+            ],
+            "alice's and carol's rows were rewritten; their other columns survived"
+        );
+        // And their keys came across untouched — the copy is the same row.
+        assert_eq!(remaining(&db), vec!["alice", "bob", "carol", "dave"]);
+        db.close().unwrap();
+    }
+
+    /// The embedding is copied across untouched, which only a vector search can
+    /// show: the rewritten row must still be found by its original vector.
+    #[test]
+    fn update_copies_the_embedding_unchanged() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db); // alice's vector is [1.0, 0, 0, 0]
+
+        update(
+            &db,
+            "UPDATE docs SET title = 'archived' WHERE published_at = 1;",
+        );
+
+        let found = authors(
+            db.execute("SEARCH TOP 1 NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM docs;")
+                .expect("the search runs"),
+        );
+        assert_eq!(
+            found,
+            vec!["alice"],
+            "the rewritten row is still reachable by its original embedding"
+        );
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn an_update_matching_nothing_succeeds_and_logs_nothing() {
+        let (dir, db) = docs_db();
+        seed_filterable(&db);
+
+        let wal = dir.path().join("wal.log");
+        let before = std::fs::metadata(&wal).expect("wal exists").len();
+        update(&db, "UPDATE docs SET title = 'x' WHERE published_at = 404;");
+
+        assert_eq!(std::fs::metadata(&wal).expect("wal exists").len(), before);
+        assert_eq!(titled_rows(&db).len(), 4);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn an_update_survives_reopen() {
+        let (dir, db) = docs_db();
+        seed_filterable(&db);
+        update(
+            &db,
+            "UPDATE docs SET title = 'archived' WHERE published_at = 9;",
+        );
+        drop(db); // no closing checkpoint: the WAL must carry it
+
+        let db = Db::open(dir.path(), &[], DbOptions::default()).expect("reopen");
+        assert_eq!(
+            titled_rows(&db),
+            vec![
+                ("archived".to_string(), 9),
+                ("doc".to_string(), 1),
+                ("doc".to_string(), 1),
+                ("doc".to_string(), 5),
+            ]
+        );
+        db.close().unwrap();
+    }
+
+    /// Two threads updating the same row at the same time. Both statements
+    /// must TAKE EFFECT — the loser re-resolves and tries again inside
+    /// `execute` — and the row must stay one row.
+    ///
+    /// The liveness version is the witness: an applied Mutate bumps it, a
+    /// conflicted one does not. So a statement whose conflict was swallowed
+    /// instead of retried shows up as a missing bump, which is exactly the
+    /// silent lost update this has to rule out.
+    /// Full replacement, the statement from the roadmap. Proving the embedding
+    /// REALLY changed takes two searches: the row must be found by its new
+    /// vector, and a search for its old one must now prefer a different row.
+    #[test]
+    fn update_replaces_a_named_rows_embedding() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db); // alice [1.0,0,0,0] at id 0, bob [0.9,0,0,0] at id 1
+
+        update(
+            &db,
+            "UPDATE docs SET vector = [0.0, 0.0, 0.0, 1.0], title = 'v2' WHERE author = 'alice';",
+        );
+
+        // Found by the NEW embedding...
+        assert_eq!(
+            authors(
+                db.execute("SEARCH TOP 1 NEAREST TO [0.0, 0.0, 0.0, 1.0] FROM docs;")
+                    .expect("the search runs")
+            ),
+            vec!["alice"]
+        );
+        // ...and no longer by the old one: bob is now the nearest to it.
+        assert_eq!(
+            authors(
+                db.execute("SEARCH TOP 1 NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM docs;")
+                    .expect("the search runs")
+            ),
+            vec!["bob"],
+            "alice's old embedding is gone, not merely shadowed"
+        );
+        db.close().unwrap();
+    }
+
+    /// The embedding may only be assigned to a row named by its KEY. Any other
+    /// predicate could match many rows, and one statement carries one vector —
+    /// so handing it to all of them is never what was meant.
+    #[test]
+    fn setting_a_vector_needs_a_key_predicate() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        // `title` is an ordinary column: every seeded row has title 'doc', so
+        // this is exactly the "one vector, many rows" mistake.
+        assert!(matches!(
+            db.execute("UPDATE docs SET vector = [0.0, 0.0, 0.0, 1.0] WHERE title = 'doc';"),
+            Err(Error::Bind(BindError::CannotSetVector { column })) if column == "vector"
+        ));
+        // A range over the key is not an identity either.
+        assert!(matches!(
+            db.execute("UPDATE docs SET vector = [0.0, 0.0, 0.0, 1.0] WHERE published_at < 9;"),
+            Err(Error::Bind(BindError::CannotSetVector { .. }))
+        ));
+        db.close().unwrap();
+    }
+
+    /// The ordinal is no longer addressable, and that is the point of the key:
+    /// an ordinal moves when a row is rewritten and is renumbered wholesale by
+    /// compaction, so a statement that named one could silently hit a different
+    /// row later. `id` is now an ordinary name with nothing behind it.
+    #[test]
+    fn a_row_cannot_be_named_by_its_ordinal() {
+        let (_dir, db) = docs_db();
+        seed_filterable(&db);
+
+        assert!(matches!(
+            db.execute("SELECT author FROM docs WHERE id = 0;"),
+            Err(Error::Bind(BindError::ColumnNotFound(name))) if name == "id"
+        ));
+        assert!(matches!(
+            db.execute("DELETE FROM docs WHERE id = 0;"),
+            Err(Error::Bind(BindError::ColumnNotFound(name))) if name == "id"
+        ));
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn a_replaced_embedding_survives_reopen() {
+        let (dir, db) = docs_db();
+        seed_filterable(&db);
+        update(
+            &db,
+            "UPDATE docs SET vector = [0.0, 0.0, 0.0, 1.0] WHERE author = 'alice';",
+        );
+        drop(db); // no closing checkpoint: the WAL must carry it
+
+        let db = Db::open(dir.path(), &[], DbOptions::default()).expect("reopen");
+        assert_eq!(
+            authors(
+                db.execute("SEARCH TOP 1 NEAREST TO [0.0, 0.0, 0.0, 1.0] FROM docs;")
+                    .expect("the search runs")
+            ),
+            vec!["alice"]
+        );
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn concurrent_updates_through_execute_all_take_effect() {
+        use std::sync::{Arc, Barrier};
+
+        const ROUNDS: usize = 8;
+        let (_dir, db) = docs_db();
+        insert(&db, "alice", "doc", 1); // the single contended row
+
+        let db = Arc::new(db);
+        let barrier = Arc::new(Barrier::new(2));
+        let before = db.live_snapshot(0).expect("collection open").version();
+
+        let workers: Vec<_> = (0..2)
+            .map(|tag| {
+                let db = Arc::clone(&db);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    // Failures are COLLECTED, not panicked: every round must
+                    // still reach its barrier, or a failing thread would leave
+                    // the other one blocked forever and the test would hang
+                    // instead of failing.
+                    let mut failures = Vec::new();
+                    for round in 0..ROUNDS {
+                        barrier.wait();
+                        if let Err(e) = db.execute(&format!(
+                            "UPDATE docs SET title = 't{tag}-{round}' WHERE author = 'alice';"
+                        )) {
+                            failures.push(e.to_string());
+                        }
+                    }
+                    failures
+                })
+            })
+            .collect();
+        let failures: Vec<String> = workers
+            .into_iter()
+            .flat_map(|w| w.join().expect("worker thread"))
+            .collect();
+        assert!(failures.is_empty(), "updates failed: {failures:?}");
+
+        assert_eq!(
+            db.live_snapshot(0).expect("collection open").version(),
+            before + (2 * ROUNDS) as u64,
+            "every statement applied: none was silently dropped on a conflict"
+        );
+        assert_eq!(rows_of(&db).len(), 1, "one row stays one row");
+    }
+
+    /// TWO THREADS, ONE KEY. The pre-WAL check cannot settle this: both
+    /// callers can look, both see the key absent, and both append — so without
+    /// a second check on the commit thread the collection ends up holding the
+    /// key twice, and equality on it stops naming one row.
+    ///
+    /// Exactly one insert must win per round. The loser gets a refusal, not a
+    /// conflict (retrying would lose again, forever) and certainly not a
+    /// poisoned database.
+    #[test]
+    fn concurrent_inserts_cannot_duplicate_a_key() {
+        use std::sync::{Arc, Barrier};
+
+        const ROUNDS: usize = 12;
+        let (_dir, db) = docs_db();
+        let db = Arc::new(db);
+        let barrier = Arc::new(Barrier::new(2));
+
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let db = Arc::clone(&db);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    // Outcomes are COLLECTED, never panicked on: a thread that
+                    // dies before its barrier leaves its peer blocked forever,
+                    // so the suite would hang instead of failing.
+                    let mut wins = 0usize;
+                    let mut wrong = Vec::new();
+                    for round in 0..ROUNDS {
+                        barrier.wait();
+                        let sql = format!(
+                            "INSERT INTO docs (author, vector, title, published_at) \
+                             VALUES ('k{round}', [0.1, 0.2, 0.3, 0.4], 'doc', {});",
+                            round + 1
+                        );
+                        match db.execute(&sql) {
+                            Ok(_) => wins += 1,
+                            Err(Error::Engine(EngineError::DuplicateKey { .. })) => {}
+                            Err(other) => wrong.push(other.to_string()),
+                        }
+                    }
+                    (wins, wrong)
+                })
+            })
+            .collect();
+
+        let mut total_wins = 0usize;
+        let mut wrong = Vec::new();
+        for worker in workers {
+            let (wins, mut errs) = worker.join().expect("worker thread");
+            total_wins += wins;
+            wrong.append(&mut errs);
+        }
+        assert!(
+            wrong.is_empty(),
+            "a loser must be refused, not fail some other way: {wrong:?}"
+        );
+        assert_eq!(
+            total_wins, ROUNDS,
+            "exactly one insert per key may be accepted"
+        );
+        assert!(!db.is_poisoned(), "a duplicate key must never halt the db");
+
+        // And the collection really holds each key once.
+        let rows = rows_of(&db);
+        assert_eq!(rows.len(), ROUNDS, "one row per key");
+        let mut keys: Vec<String> = rows.into_iter().map(|(author, _)| author).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), ROUNDS, "no key appears twice");
     }
 }

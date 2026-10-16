@@ -77,8 +77,24 @@ pub enum Token {
     And,
     /// `OR`
     Or,
-    // EXTEND: future reserved keywords (Delete, Update, Set, …) get a variant
-    // here AND an arm in `keyword()` — nothing else changes.
+    /// `DELETE`
+    Delete,
+    /// `UPDATE`
+    Update,
+    /// `SET`
+    Set,
+    /// `NOT` — reserved so it can be refused by name; V-SQL has no negation
+    /// operator (use `!=`, or rewrite with `AND`/`OR`).
+    Not,
+    /// `IN` — reserved so it can be refused by name; not in V-SQL for v1 (an
+    /// `IN` list is an `OR` chain).
+    In,
+    /// `PRIMARY`
+    Primary,
+    /// `KEY`
+    Key,
+    // EXTEND: future reserved keywords get a variant here AND an arm in
+    // `keyword()` — nothing else changes.
 
     // -- identifiers & literals ---------------------------------------------
     /// An identifier. Also carries *type names* (`VECTOR`, `INT`, `TEXT`,
@@ -239,6 +255,13 @@ fn keyword(word: &str) -> Option<Token> {
         "where" => Some(Token::Where),
         "and" => Some(Token::And),
         "or" => Some(Token::Or),
+        "delete" => Some(Token::Delete),
+        "update" => Some(Token::Update),
+        "set" => Some(Token::Set),
+        "not" => Some(Token::Not),
+        "in" => Some(Token::In),
+        "primary" => Some(Token::Primary),
+        "key" => Some(Token::Key),
         // EXTEND: future reserved keywords here.
         _ => None,
     }
@@ -543,6 +566,42 @@ mod tests {
         assert_eq!(lex("select"), vec![Token::Select]);
         assert_eq!(lex("SELECT"), vec![Token::Select]);
         assert_eq!(lex("SeLeCt"), vec![Token::Select]);
+    }
+
+    #[test]
+    fn update_and_set_are_keywords() {
+        assert_eq!(lex("update"), vec![Token::Update]);
+        assert_eq!(lex("UPDATE"), vec![Token::Update]);
+        assert_eq!(lex("set"), vec![Token::Set]);
+        assert_eq!(lex("SET"), vec![Token::Set]);
+    }
+
+    /// Reserved so they can be REFUSED BY NAME. Both lex as keywords even
+    /// though the grammar accepts neither: left as identifiers, `WHERE NOT x =
+    /// 1` parsed `NOT` as a column and then complained about the token after
+    /// it, which tells the reader nothing about what is actually unsupported.
+    #[test]
+    fn not_and_in_are_reserved_keywords() {
+        assert_eq!(lex("not"), vec![Token::Not]);
+        assert_eq!(lex("NOT"), vec![Token::Not]);
+        assert_eq!(lex("in"), vec![Token::In]);
+        assert_eq!(lex("IN"), vec![Token::In]);
+    }
+
+    #[test]
+    fn primary_key_is_two_keywords() {
+        assert_eq!(lex("primary"), vec![Token::Primary]);
+        assert_eq!(lex("PRIMARY"), vec![Token::Primary]);
+        assert_eq!(lex("key"), vec![Token::Key]);
+        assert_eq!(lex("KEY"), vec![Token::Key]);
+        assert_eq!(lex("PRIMARY KEY"), vec![Token::Primary, Token::Key]);
+    }
+
+    #[test]
+    fn delete_is_a_keyword() {
+        assert_eq!(lex("delete"), vec![Token::Delete]);
+        assert_eq!(lex("DELETE"), vec![Token::Delete]);
+        assert_eq!(lex("DeLeTe"), vec![Token::Delete]);
     }
 
     #[test]

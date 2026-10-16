@@ -61,6 +61,21 @@ pub enum Error {
     #[error("database halted at lsn {lsn}: {cause} (reopen to replay the unapplied record)")]
     Poisoned { lsn: u64, cause: String },
 
+    /// One statement's installed payload exceeds the per-record cap.
+    ///
+    /// A `Record::Mutate` is deliberately ONE frame with ONE checksum behind
+    /// ONE fsync — that is what makes a multi-row DELETE or UPDATE all-or-
+    /// nothing. The cost of that guarantee is that the whole statement must fit
+    /// in memory: on the commit thread now, and on every replay for the life of
+    /// the log. The cap turns "this UPDATE rewrites a million vectors" into a
+    /// named refusal at the door rather than an allocation failure inside the
+    /// commit loop, and it bounds how long the metadata lock is held, since
+    /// that is proportional to statement size.
+    ///
+    /// Split the statement with a narrower predicate.
+    #[error("statement installs {bytes} bytes, over the {cap}-byte per-record cap")]
+    StatementTooLarge { bytes: usize, cap: usize },
+
     /// A collection NAME did not resolve to a registered collection. Distinct
     /// from `UnknownCollection`, which reports an id: here there is no id to
     /// report — failing to produce one is the error. Raised by
@@ -82,11 +97,6 @@ pub enum Error {
 
     #[error("capacity must be > 0")]
     InvalidCapacity,
-
-    /// Schema uses a column name the engine reserves (the `id` pseudo-column
-    /// SEARCH returns is the ordinal, not a stored column).
-    #[error("reserved column name: {0}")]
-    ReservedColumn(String),
 
     // -- metadata layer (Phase 4) ------------------------------------------
     // Callers in Phase 4c only distinguish "retryable via WAL replay" (Io)
@@ -117,6 +127,41 @@ pub enum Error {
     /// provisioned with exactly one flat vector index.
     #[error("schema must have exactly one vector column, found {found}")]
     VectorColumnCount { found: usize },
+
+    /// A schema declared more than one PRIMARY KEY. V-SQL has no composite
+    /// keys: one column names the row, or none does.
+    #[error("schema must declare at most one primary key, found {found}")]
+    PrimaryKeyCount { found: usize },
+
+    /// A column that cannot serve as an identity was declared PRIMARY KEY.
+    #[error("column {column:?} of type {ty} cannot be a primary key (TEXT or INT only)")]
+    PrimaryKeyType {
+        /// The offending column.
+        column: String,
+        /// Its declared type.
+        ty: String,
+    },
+
+    /// A statement carrying a replacement embedding matched more than one row.
+    ///
+    /// The binder requires equality on the primary key for exactly this
+    /// reason, and the applier keeps that key unique — so reaching this means
+    /// those two guarantees disagree, not that the caller wrote a loose
+    /// predicate.
+    #[error("a replacement embedding matched {matched} rows; it may name only one")]
+    KeyMatchedManyRows {
+        /// How many rows the predicate matched.
+        matched: u64,
+    },
+
+    /// An insert or install carries a primary key some LIVE row already holds.
+    #[error("a live row already holds primary key {value} for column {column:?}")]
+    DuplicateKey {
+        /// The key column's name.
+        column: String,
+        /// The offending value, rendered for the message.
+        value: String,
+    },
 
     /// Snapshot file exists but failed magic/version/CRC checks.
     /// Phase 4a/4b policy: `open()` swallows this internally ("start empty at

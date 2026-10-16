@@ -28,18 +28,16 @@
 //!
 //! # What is here
 //!
-//! Fifteen of the sixteen opcodes: the chassis (loop, register file, loads),
-//! `CREATE COLLECTION`, the `INSERT` path (`OpenWrite` → `MakeRecord` →
-//! `Insert`), and the read loop (`OpenRead` → `SeekFirst` → `Column` →
-//! `ResultRow` → `Next`).
+//! Every opcode: the chassis (loop, register file, loads), `CREATE
+//! COLLECTION`, the `INSERT` path (`OpenWrite` → `MakeRecord` → `Insert`), the
+//! read loop (`OpenRead` → `SeekFirst` → `Column` → `ResultRow` → `Next`), and
+//! the mutation path (`Mutate`).
 //!
-//! [`Op::VectorFetch`] is the one still unbuilt, so `SELECT vector FROM …`
-//! reaches a `todo!`. It needs the flat index's `Reader`, which the cursor
-//! does not carry, plus a decision about copying an embedding out of the mmap
-//! into a `'static` register — see [`RegValue::Vector`]. It is a `todo!` rather
-//! than a no-op on purpose: an arm that silently did nothing would make a
-//! `SELECT` return zero rows and read as an empty collection, which is the most
-//! expensive way to be wrong.
+//! [`Op::VectorFetch`] was the last one unbuilt. It needed the flat index's
+//! `Reader`, which the cursor now carries for exactly this reason, plus a
+//! decision about getting an embedding out of the mmap and into a `'static`
+//! register — resolved by copying it once into an `Arc<[f32]>`, see
+//! [`RegValue::Vector`].
 //!
 //! # Three vocabularies meet here
 //!
@@ -74,6 +72,7 @@ use crate::metadata::common::{Ordinal, Schema, Value};
 use crate::metadata::index::{self as meta, LiveSet};
 use crate::vm::record::{Record, SplitError, split_record};
 use crate::vm::value;
+use crate::wal::wal::{Outcome, RejectReason};
 
 /// A value in a register.
 ///
@@ -195,8 +194,11 @@ enum Flow {
 /// other op works off state the [`Vm`] already owns — which is exactly why a
 /// read can detach after its cursor is open (see [`Vm::open_cursors`]).
 ///
-/// `VectorFetch` is deliberately absent: its arm is still a `todo!`, so listing
-/// it here would turn "not implemented" into the misleading "cannot detach".
+/// `VectorFetch` is deliberately absent, and that is a REQUIREMENT rather than
+/// an oversight: a `SELECT vector` stream has to go on producing rows after
+/// `open_cursors` has let the `Db` go, so the embedding is fetched through the
+/// flat reader the cursor owns. Listing it here would make every such query
+/// fail to detach.
 fn needs_db(op: &Op) -> bool {
     matches!(
         op,
@@ -204,6 +206,7 @@ fn needs_db(op: &Op) -> bool {
             | Op::OpenWrite { .. }
             | Op::KnnScan { .. }
             | Op::Insert { .. }
+            | Op::Mutate { .. }
             | Op::CreateCollection { .. }
             // Every bitmap op reads the collection's metadata index.
             | Op::BitmapEq { .. }
@@ -237,6 +240,7 @@ fn mnemonic(op: &Op) -> &'static str {
         Op::BitmapAnd { .. } => "BitmapAnd",
         Op::BitmapOr { .. } => "BitmapOr",
         Op::BitmapNot { .. } => "BitmapNot",
+        Op::Mutate { .. } => "Mutate",
         Op::Halt => "Halt",
     }
 }
@@ -726,9 +730,27 @@ impl Vm {
                     self.store(dst, value)?;
                 }
 
-                // -- not built yet ---------------------------------------------
-                // `todo!`, never a no-op. Each names the cycle that fills it.
-                Op::VectorFetch { .. } => todo!("5b: embedding fetch"),
+                Op::VectorFetch { cur, dst } => {
+                    let (cur, dst) = (*cur, *dst);
+                    let cursor = self
+                        .read_cursor(cur)
+                        .ok_or(ExecError::NotAReadCursor { cur: cur.0 })?;
+                    // Borrowed out of the mmap'd flat index, so it is COPIED
+                    // once into an `Arc<[f32]>`: a borrow of the mapping cannot
+                    // live in the register file, which outlives any one row.
+                    // One copy per row (3 KB at dim 768) is the price of
+                    // handing the embedding to a caller at all.
+                    //
+                    // No `Db` is touched — the cursor carries its own flat
+                    // reader — which is what keeps a `SELECT vector` stream
+                    // detachable. See `Cursor::vector`.
+                    let vector: Arc<[f32]> = Arc::from(
+                        cursor
+                            .vector()
+                            .ok_or(ExecError::CursorNotOnARow { cur: cur.0 })?,
+                    );
+                    self.store(dst, RegValue::Vector(vector))?;
+                }
 
                 // -- DML: pack a record, then write it through a write cursor --
                 Op::OpenWrite { cur, collection } => {
@@ -793,6 +815,61 @@ impl Vm {
                     // through a cursor the moment this returns.
                     db.insert(collection, &vector, row)
                         .map_err(ExecError::Engine)?;
+                }
+
+                // -- DELETE: one statement, one record --------------------------
+                Op::Mutate {
+                    collection,
+                    retire,
+                    set,
+                    vector,
+                } => {
+                    let retire = *retire;
+                    let db = db.ok_or(ExecError::Detached { op: "Mutate" })?;
+                    // The bitmap the predicate ops computed against THIS
+                    // query's snapshot. It is handed over whole: the engine
+                    // logs it as one record, so the statement is all or
+                    // nothing. The register keeps its own reference, hence the
+                    // copy rather than a move.
+                    let bitmap = self.bitmap(retire)?;
+                    let id = db.collection_id(collection).map_err(ExecError::Engine)?;
+                    // Blocks until durable AND applied: on return, no new
+                    // snapshot admits any of these rows.
+                    let outcome = match set {
+                        // UPDATE: copy each matched row with the assignments
+                        // applied, retire the originals, all in one record.
+                        Some(set) => {
+                            let assignments = match self.program.consts.get(*set) {
+                                Some(Const::Assignments(a)) => a.clone(),
+                                other => {
+                                    return Err(ExecError::bad_const(set.0, "a SET list", other));
+                                }
+                            };
+                            // A replacement embedding, when the statement named
+                            // one row and carried one.
+                            let replacement = match vector {
+                                Some(id) => match self.program.consts.get(*id) {
+                                    Some(Const::Vector(v)) => Some(v.clone()),
+                                    other => {
+                                        return Err(ExecError::bad_const(id.0, "a vector", other));
+                                    }
+                                },
+                                None => None,
+                            };
+                            db.update_rows(
+                                id,
+                                bitmap.as_ref(),
+                                &assignments,
+                                replacement.as_deref(),
+                            )
+                            .map_err(ExecError::Engine)?
+                        }
+                        // DELETE: retire and nothing else.
+                        None => db
+                            .mutate(id, bitmap.as_ref().clone(), Vec::new())
+                            .map_err(ExecError::Engine)?,
+                    };
+                    mutation_outcome(outcome)?;
                 }
 
                 // -- DDL: one fat op, nothing about it varies at runtime -------
@@ -980,6 +1057,27 @@ impl Vm {
     }
 }
 
+/// What the VM does with the verdict a durable mutation came back with.
+///
+/// Three outcomes, three fates, and keeping them apart is the whole point:
+///
+///   * APPLIED — the record is in the index; carry on.
+///   * CONFLICTED — the rows the statement was built from moved on while it was
+///     in flight. The VM cannot fix that (the predicate has to be resolved
+///     again from a fresh snapshot), so it hands the decision to
+///     [`crate::Db::execute`], which re-runs the whole program.
+///   * REJECTED — the applier refused the record outright. Re-running would
+///     reach the identical verdict, so this must NOT travel as a conflict:
+///     the retry loop would burn its budget and then report contention that
+///     never happened.
+fn mutation_outcome(outcome: Outcome) -> Result<(), ExecError> {
+    match outcome {
+        Outcome::Applied => Ok(()),
+        Outcome::Conflicted => Err(ExecError::Conflict),
+        Outcome::Rejected(reason) => Err(ExecError::Rejected(reason)),
+    }
+}
+
 /// Why execution could not proceed.
 ///
 /// A stage-local error type (CLAUDE.md §5). Every variant here is a
@@ -1025,6 +1123,16 @@ pub enum ExecError {
         at: usize,
     },
     /// `KnnScan`'s query register does not hold a vector.
+    /// A copy-on-write statement was built from rows that moved on before it
+    /// committed. Not a failure, and never surfaced to a caller: `Db::execute`
+    /// catches it, re-resolves the predicate against a fresh snapshot, and runs
+    /// the statement again.
+    Conflict,
+    /// A durable mutation was REFUSED by the applier: folding it in would break
+    /// an invariant the index enforces. Unlike [`ExecError::Conflict`] this is
+    /// final — the same record would be refused on every attempt — so it leaves
+    /// the retry loop immediately and reaches the caller.
+    Rejected(RejectReason),
     /// A register a bitmap op read does not hold a bitmap.
     NotABitmap {
         /// The offending register.
@@ -1151,6 +1259,7 @@ impl ExecError {
                 Some(Const::Vector(_)) => "a vector",
                 Some(Const::Str(_)) => "a string",
                 Some(Const::Schema(_)) => "a schema",
+                Some(Const::Assignments(_)) => "a SET list",
                 None => "nothing",
             },
         }
@@ -1172,6 +1281,12 @@ impl fmt::Display for ExecError {
             ExecError::Engine(e) => write!(f, "{e}"),
             ExecError::NotAVector { reg } => {
                 write!(f, "register r{reg} does not hold a query vector")
+            }
+            ExecError::Conflict => {
+                write!(f, "the rows this statement read were rewritten; retry it")
+            }
+            ExecError::Rejected(RejectReason::DuplicateKey) => {
+                write!(f, "a live row already holds this primary key")
             }
             ExecError::NotABitmap { reg } => {
                 write!(f, "register r{reg} does not hold a bitmap")
@@ -1227,15 +1342,34 @@ impl std::error::Error for ExecError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use super::{ExecError, OutputRow, RegValue, Vm};
+    use super::{ExecError, OutputRow, RegValue, Vm, mutation_outcome};
     use crate::compiler::bytecode::{Addr, Cursor, Op, Program, Reg};
     use crate::compiler::constants::{Const, ConstPool};
     use crate::engine::{CollectionConfig, Db, DbOptions};
     use crate::error::Error;
     use crate::metadata::common::{ColumnSpec, ColumnType, Row, Schema, Value};
     use crate::vm::record::SplitError;
+    use crate::wal::wal::{Outcome, RejectReason};
     use std::num::NonZeroUsize;
+    use std::sync::Arc;
+
+    /// The three apply outcomes map to three different fates, and the third is
+    /// the one worth a test of its own: a REFUSAL must not arrive as a
+    /// `Conflict`. If it did, the retry loop in `Db::execute` would spend its
+    /// whole budget re-running a statement whose verdict was final on the first
+    /// attempt, then report sustained contention that never happened.
+    #[test]
+    fn a_refusal_does_not_read_as_a_conflict() {
+        assert!(matches!(mutation_outcome(Outcome::Applied), Ok(())));
+        assert!(matches!(
+            mutation_outcome(Outcome::Conflicted),
+            Err(ExecError::Conflict)
+        ));
+        assert!(matches!(
+            mutation_outcome(Outcome::Rejected(RejectReason::DuplicateKey)),
+            Err(ExecError::Rejected(RejectReason::DuplicateKey))
+        ));
+    }
 
     /// A metadata row for `docs_schema` — keyed by storage `ColumnId`, which is
     /// NOT the declaration order: author #0, title #1, published_at #2 (the
@@ -1715,6 +1849,190 @@ mod tests {
         }
     }
 
+    // ======================================================================
+    // DELETE — Op::Mutate retires a whole bitmap as one statement.
+    // ======================================================================
+
+    /// `DELETE FROM docs WHERE author = <author>`, as the compiler emits it:
+    /// the predicate's bitmap, then one `Mutate` over it.
+    fn delete_where_author_program(author: &str) -> Program {
+        let mut consts = ConstPool::new();
+        let needle = consts.add(Const::Str(author.into()));
+        Program {
+            ops: vec![
+                Op::String {
+                    id: needle,
+                    dst: Reg(0),
+                },
+                Op::BitmapEq {
+                    collection: "docs".into(),
+                    col: 0, // author
+                    value: Reg(0),
+                    dst: Reg(1),
+                },
+                Op::Mutate {
+                    collection: "docs".into(),
+                    retire: Reg(1),
+                    set: None,
+                    vector: None,
+                },
+                Op::Halt,
+            ],
+            consts,
+            n_regs: 2,
+            n_cursors: 0,
+        }
+    }
+
+    fn run_to_halt(db: &Db, program: Program) -> Result<(), ExecError> {
+        let mut vm = Vm::new(program)?;
+        while vm.step(db)?.is_some() {}
+        Ok(())
+    }
+
+    /// `UPDATE docs SET title = 'archived' WHERE author = 'alice'`, as the
+    /// compiler emits it: the predicate's bitmap, then one `Mutate` carrying
+    /// the SET list.
+    fn update_where_author_program(author: &str, new_title: &str) -> Program {
+        let mut consts = ConstPool::new();
+        let needle = consts.add(Const::Str(author.into()));
+        // title is ColumnId 1 in the docs storage schema.
+        let set = consts.add(Const::Assignments(vec![(1, Value::Text(new_title.into()))]));
+        Program {
+            ops: vec![
+                Op::String {
+                    id: needle,
+                    dst: Reg(0),
+                },
+                Op::BitmapEq {
+                    collection: "docs".into(),
+                    col: 0, // author
+                    value: Reg(0),
+                    dst: Reg(1),
+                },
+                Op::Mutate {
+                    collection: "docs".into(),
+                    retire: Reg(1),
+                    set: Some(set),
+                    vector: None,
+                },
+                Op::Halt,
+            ],
+            consts,
+            n_regs: 2,
+            n_cursors: 0,
+        }
+    }
+
+    #[test]
+    fn mutate_with_a_set_list_rewrites_the_matched_rows() {
+        let (_dir, db) = docs_db();
+        for (author, n) in [("alice", 1), ("bob", 2), ("alice", 3)] {
+            run_to_halt(&db, insert_program(author, n)).expect("inserts");
+        }
+
+        run_to_halt(&db, update_where_author_program("alice", "archived")).expect("updates");
+
+        // Still three rows: two rewritten in place of their originals.
+        assert_eq!(live_rows(&db), 3);
+        let mut rows = Vec::new();
+        let mut cursor = db.scan(0).expect("collection 0 exists");
+        let mut has_row = cursor.seek_first().expect("reads");
+        while has_row {
+            rows.push(cursor.row().expect("parked on a row").to_vec());
+            has_row = cursor.next().expect("reads");
+        }
+        // bob is untouched; both alices carry the new title and their own
+        // published_at, which the copy preserved.
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Value::Text("bob".into()),
+                    Value::Text("doc 2".into()),
+                    Value::Int(2)
+                ],
+                vec![
+                    Value::Text("alice".into()),
+                    Value::Text("archived".into()),
+                    Value::Int(1)
+                ],
+                vec![
+                    Value::Text("alice".into()),
+                    Value::Text("archived".into()),
+                    Value::Int(3)
+                ],
+            ]
+        );
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn mutate_retires_every_row_in_the_bitmap() {
+        let (_dir, db) = docs_db();
+        for (author, n) in [("alice", 1), ("bob", 2), ("alice", 3)] {
+            run_to_halt(&db, insert_program(author, n)).expect("inserts");
+        }
+
+        run_to_halt(&db, delete_where_author_program("alice")).expect("deletes");
+
+        assert_eq!(live_rows(&db), 1, "both alices are gone, bob is not");
+        let mut cursor = db.scan(0).expect("collection 0 exists");
+        assert!(cursor.seek_first().expect("reads"));
+        assert_eq!(cursor.row().expect("parked")[0], Value::Text("bob".into()));
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn mutate_refuses_a_register_that_is_not_a_bitmap() {
+        let (_dir, db) = docs_db();
+        let program = Program {
+            ops: vec![
+                Op::Integer {
+                    value: 1,
+                    dst: Reg(0),
+                },
+                Op::Mutate {
+                    collection: "docs".into(),
+                    retire: Reg(0),
+                    set: None,
+                    vector: None,
+                },
+                Op::Halt,
+            ],
+            consts: ConstPool::new(),
+            n_regs: 1,
+            n_cursors: 0,
+        };
+        match run_to_halt(&db, program) {
+            Err(ExecError::NotABitmap { reg }) => assert_eq!(reg, 0),
+            other => panic!("expected NotABitmap, got {other:?}"),
+        }
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn mutate_register_is_range_checked_before_anything_runs() {
+        let program = Program {
+            ops: vec![
+                Op::Mutate {
+                    collection: "docs".into(),
+                    retire: Reg(5),
+                    set: None,
+                    vector: None,
+                },
+                Op::Halt,
+            ],
+            consts: ConstPool::new(),
+            n_regs: 1,
+            n_cursors: 0,
+        };
+        assert!(
+            matches!(Vm::new(program), Err(ExecError::Invalid(_))),
+            "an out-of-range retire register must fail validation, not execution"
+        );
+    }
+
     #[test]
     fn insert_then_scan() {
         let (_dir, db) = docs_db();
@@ -2096,6 +2414,72 @@ mod tests {
         db.close().unwrap();
     }
 
+    /// `VectorFetch` puts the current row's embedding in a register — and the
+    /// program it belongs to MUST STILL DETACH.
+    ///
+    /// That second half is the load-bearing part. A read stream hands rows out
+    /// after `open_cursors` has let go of the `Db`, so if fetching an embedding
+    /// needed the `Db` at row time, `SELECT vector` could not stream at all —
+    /// it would die with `CannotDetach` before yielding anything. The op is
+    /// absent from `needs_db` precisely to promise that, and this pins the
+    /// promise down.
+    #[test]
+    fn vector_fetch_reads_the_embedding_and_still_detaches() {
+        let (_dir, db) = docs_db();
+        db.insert(0, &embedding(7), row("alice", "the title", 42))
+            .expect("inserts");
+
+        let program = Program {
+            ops: vec![
+                Op::OpenRead {
+                    cur: Cursor(0),
+                    collection: "docs".into(),
+                    filter: None,
+                },
+                Op::SeekFirst {
+                    cur: Cursor(0),
+                    end: Addr(5),
+                },
+                Op::VectorFetch {
+                    cur: Cursor(0),
+                    dst: Reg(0),
+                },
+                Op::ResultRow {
+                    start: Reg(0),
+                    count: 1,
+                },
+                Op::Next {
+                    cur: Cursor(0),
+                    body: Addr(2),
+                },
+                Op::Halt,
+            ],
+            consts: ConstPool::new(),
+            n_regs: 1,
+            n_cursors: 1,
+        };
+
+        // Attached: the whole embedding comes back, not a handle or a prefix.
+        let mut vm = Vm::new(program.clone()).expect("well-formed");
+        let row = vm.step(&db).expect("reads").expect("one row");
+        match &row.0[0] {
+            RegValue::Vector(v) => assert_eq!(&v[..], embedding(7).as_slice()),
+            other => panic!("expected an embedding, got {other:?}"),
+        }
+
+        // DETACHED: open the cursors, drop the `Db` reference, keep pulling.
+        let mut vm = Vm::new(program).expect("well-formed");
+        vm.open_cursors(&db)
+            .expect("a vector fetch must not force a program to stay attached");
+        let row = vm.resume().expect("reads detached").expect("one row");
+        match &row.0[0] {
+            RegValue::Vector(v) => assert_eq!(&v[..], embedding(7).as_slice()),
+            other => panic!("expected an embedding, got {other:?}"),
+        }
+
+        db.close().unwrap();
+    }
+
     #[test]
     fn column_outside_the_projection_is_an_error() {
         let (_dir, db) = docs_db();
@@ -2247,13 +2631,18 @@ mod tests {
         db.close().unwrap();
     }
 
+    /// `VectorFetch` on a cursor that was never opened is a TYPED ERROR, not a
+    /// panic and above all not a silent no-op.
+    ///
+    /// This test used to assert the opposite — that the arm was still a `todo!`
+    /// — because an unbuilt cursor op that quietly did nothing would make
+    /// `SELECT` return zero rows and read as an empty collection, the single
+    /// most expensive way to be wrong here. The arm is built now, so the same
+    /// concern is expressed as the machine fault it should be. No `todo!`
+    /// remains in this module.
     #[test]
-    #[should_panic(expected = "5b")]
-    fn an_unbuilt_opcode_panics_loudly() {
+    fn vector_fetch_on_an_unopened_cursor_is_an_error() {
         let (_dir, db) = scratch();
-        // The out-of-scope arms are `todo!`, NOT silent no-ops. A cursor op that
-        // quietly did nothing would make `SELECT` return zero rows and look like
-        // an empty collection — the single most expensive way to be wrong here.
         let mut vm = Vm::new(Program {
             ops: vec![
                 Op::VectorFetch {
@@ -2267,6 +2656,10 @@ mod tests {
             n_cursors: 1,
         })
         .expect("well-formed");
-        let _ = vm.step(&db);
+        assert!(
+            matches!(vm.step(&db), Err(ExecError::NotAReadCursor { cur: 0 })),
+            "an unopened cursor must fault, never yield a phantom row"
+        );
+        db.close().unwrap();
     }
 }

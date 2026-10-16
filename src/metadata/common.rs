@@ -162,6 +162,15 @@ pub struct Schema {
     pub vector: VectorColumn,
     /// scalar name → ColumnId, built from `columns` at construction time.
     pub by_name: HashMap<String, ColumnId>,
+    /// The PRIMARY KEY column, if this collection declared one.
+    ///
+    /// `Some` for everything V-SQL creates — `CREATE COLLECTION` requires a key
+    /// — and optionally `Some` for a collection declared programmatically via
+    /// [`CollectionConfig`]. When it is `Some`, the applier enforces that no two
+    /// LIVE rows carry the same value for it; when it is `None` the collection
+    /// has no identity beyond its ordinals, and keyed `UPDATE`/`DELETE` cannot
+    /// address it.
+    pub primary_key: Option<ColumnId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -210,6 +219,20 @@ pub enum ColumnSpec {
         name: String,
         /// Embedding dimension.
         dim: NonZeroUsize,
+    },
+    /// The PRIMARY KEY column — an ordinary scalar that also names the row.
+    ///
+    /// A variant rather than a flag on `Scalar` so that "which column is the
+    /// key?" is answered by the declaration itself and cannot be lost in
+    /// translation between the layers that rebuild a schema.
+    ///
+    /// Only TEXT and INT may serve: equality over a FLOAT is not identity, and
+    /// the embedding has no equality path at all.
+    Key {
+        /// Column name.
+        name: String,
+        /// Scalar type — TEXT or INT.
+        ty: ColumnType,
     },
 }
 
@@ -263,6 +286,7 @@ impl Schema {
         let mut by_name = HashMap::new();
         let mut seen = std::collections::HashSet::new();
         let mut vector = None;
+        let mut primary_key = None;
         for (ordinal, spec) in cols.into_iter().enumerate() {
             let ordinal = DeclarationOrdinal::new(ordinal);
             match spec {
@@ -286,6 +310,32 @@ impl Schema {
                     }
                     vector = Some(VectorColumn { name, ordinal, dim });
                 }
+                ColumnSpec::Key { name, ty } => {
+                    if !seen.insert(name.clone()) {
+                        return Err(Error::DuplicateColumn(name));
+                    }
+                    if !matches!(ty, ColumnType::Int | ColumnType::Text) {
+                        return Err(Error::PrimaryKeyType {
+                            column: name,
+                            ty: format!("{ty:?}"),
+                        });
+                    }
+                    if primary_key.is_some() {
+                        return Err(Error::PrimaryKeyCount { found: 2 });
+                    }
+                    // A key is a scalar first: same ColumnId space, same
+                    // storage, same by-name lookup. Only `primary_key`
+                    // distinguishes it.
+                    let id = columns.len() as ColumnId;
+                    by_name.insert(name.clone(), id);
+                    columns.push(ColumnDef {
+                        id,
+                        name,
+                        ty,
+                        ordinal,
+                    });
+                    primary_key = Some(id);
+                }
             }
         }
         // `vector_count == 1` above guarantees this is Some.
@@ -294,6 +344,7 @@ impl Schema {
             columns,
             vector,
             by_name,
+            primary_key,
         })
     }
 

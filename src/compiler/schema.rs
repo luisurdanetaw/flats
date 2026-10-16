@@ -65,22 +65,28 @@ pub fn to_metadata_schema(bound: &BindSchema) -> Result<MetaSchema, SchemaError>
                     column: column.name.clone(),
                 })?,
             },
-            AstType::Int => ColumnSpec::Scalar {
-                name: column.name.clone(),
-                ty: MetaType::Int,
-            },
-            AstType::Float => ColumnSpec::Scalar {
-                name: column.name.clone(),
-                ty: MetaType::Float,
-            },
-            AstType::Text => ColumnSpec::Scalar {
-                name: column.name.clone(),
-                ty: MetaType::Text,
-            },
+            AstType::Int => scalar_or_key(column.primary_key, column.name.clone(), MetaType::Int),
+            AstType::Float => {
+                scalar_or_key(column.primary_key, column.name.clone(), MetaType::Float)
+            }
+            AstType::Text => scalar_or_key(column.primary_key, column.name.clone(), MetaType::Text),
         };
         specs.push(spec);
     }
     MetaSchema::from_columns(specs).map_err(SchemaError::Storage)
+}
+
+/// One scalar spec, as the key or as an ordinary column.
+///
+/// The key IS a scalar — same `ColumnId` space, same storage, same by-name
+/// lookup — so this picks the variant and changes nothing else. A FLOAT key
+/// reaches `from_columns`, which refuses it there: one rule, one place.
+fn scalar_or_key(primary_key: bool, name: String, ty: MetaType) -> ColumnSpec {
+    if primary_key {
+        ColumnSpec::Key { name, ty }
+    } else {
+        ColumnSpec::Scalar { name, ty }
+    }
 }
 
 /// Why a bound schema could not be lowered to its storage form.
@@ -172,6 +178,9 @@ mod tests {
                     ty: *ty,
                     ordinal,
                     is_vector: matches!(ty, AstType::Vector(_)),
+                    // `author` is the fixture key, so the round-trip proves the
+                    // key survives the lowering too.
+                    primary_key: *name == "author",
                 })
                 .collect(),
         }

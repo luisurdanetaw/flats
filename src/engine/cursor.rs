@@ -69,6 +69,7 @@
 //! `column` could see the row deleted mid-row and hand back a torn projection.
 
 use crate::error::{Error, Result};
+use crate::index::index::Reader as VectorReader;
 use crate::metadata::common::{ColumnId, Ordinal, Value};
 use crate::metadata::tuples::{self, RowGet};
 
@@ -92,6 +93,15 @@ pub struct Cursor<'a> {
     /// the catalog snapshot, so there is no `&Reader` outliving the call to
     /// hand out. Cloning costs one atomic increment.
     tuples: tuples::Reader,
+    /// Read handle into the FLAT VECTOR INDEX, owned for the same reason
+    /// `tuples` is — and carried for a sharper one.
+    ///
+    /// A read stream DETACHES from the `Db` once its cursors are open and goes
+    /// on yielding rows without it, so an embedding cannot be fetched through
+    /// the `Db` at row time. It has to be reachable from the cursor, which is
+    /// why `Op::VectorFetch` needs no `Db` and a `SELECT vector` stream stays
+    /// as lazy as any other.
+    vectors: VectorReader,
     /// The columns materialized per row, in the order [`row`](Self::row)
     /// returns them. THE PROJECTION, fixed at construction.
     columns: Vec<ColumnId>,
@@ -123,11 +133,13 @@ impl<'a> Cursor<'a> {
     pub fn over(
         ordinals: impl Iterator<Item = Ordinal> + 'a,
         tuples: tuples::Reader,
+        vectors: VectorReader,
         columns: Vec<ColumnId>,
     ) -> Cursor<'a> {
         Cursor {
             ordinals: Box::new(ordinals),
             tuples,
+            vectors,
             columns,
             snapshot_sourced: None,
             current: None,
@@ -152,11 +164,12 @@ impl<'a> Cursor<'a> {
         collection: u32,
         ordinals: impl Iterator<Item = Ordinal> + 'a,
         tuples: tuples::Reader,
+        vectors: VectorReader,
         columns: Vec<ColumnId>,
     ) -> Cursor<'a> {
         Cursor {
             snapshot_sourced: Some(collection),
-            ..Cursor::over(ordinals, tuples, columns)
+            ..Cursor::over(ordinals, tuples, vectors, columns)
         }
     }
 
@@ -235,6 +248,25 @@ impl<'a> Cursor<'a> {
     /// for and emits accordingly.
     pub fn column(&self, i: usize) -> Option<&Value> {
         self.row.as_ref()?.get(i)
+    }
+
+    /// The current row's EMBEDDING, borrowed straight out of the mmap'd flat
+    /// index. `None` before the first row and after exhaustion — the same
+    /// contract [`column`](Self::column) follows.
+    ///
+    /// Read by ORDINAL, and safe to read whenever the caller likes rather than
+    /// only under a lock, because of two properties the writer upholds: apply
+    /// writes a row's vector BEFORE the row becomes live, so an ordinal this
+    /// cursor can see already has its bytes; and vectors are never overwritten
+    /// in place, because an UPDATE installs its copy at a FRESH ordinal and a
+    /// retired row keeps its own. So the bytes at an ordinal do not change for
+    /// as long as the cursor exists.
+    ///
+    /// NOTE FOR COMPACTION: it breaks both halves — it rewrites the file and
+    /// renumbers ordinals — so open cursors are state the generation flip has
+    /// to drain, not just a cache to invalidate.
+    pub fn vector(&self) -> Option<&[f32]> {
+        self.vectors.vector_at(self.current?)
     }
 
     /// How many ordinals this cursor skipped as `Missing`/`Deleted`.
@@ -416,6 +448,43 @@ mod tests {
         db.close().unwrap();
     }
 
+    /// The embedding is reachable FROM THE CURSOR, not from the `Db`.
+    ///
+    /// That is the whole shape of `SELECT vector`: a read stream detaches from
+    /// the `Db` once its cursors are open and keeps yielding rows, so anything
+    /// a row needs must already be in the cursor's hand. The flat reader rides
+    /// along exactly as the tuple reader does.
+    #[test]
+    fn vector_is_the_rows_own_embedding() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path());
+        insert_n(&db, 3);
+
+        let mut cursor = db.scan(0).unwrap();
+        // Never valid before the first row — same contract as `column`.
+        assert!(cursor.vector().is_none(), "no row, no embedding");
+
+        let mut seen = 0u64;
+        let mut has_row = cursor.seek_first().unwrap();
+        while has_row {
+            let ordinal = cursor.ordinal().expect("parked on a row").0 as u64;
+            assert_eq!(
+                cursor.vector(),
+                Some(vector_for(ordinal).as_slice()),
+                "row {ordinal} must report ITS OWN embedding"
+            );
+            seen += 1;
+            has_row = cursor.next().unwrap();
+        }
+        assert_eq!(seen, 3);
+        assert!(
+            cursor.vector().is_none(),
+            "exhausted cursor has no embedding either"
+        );
+
+        db.close().unwrap();
+    }
+
     #[test]
     fn single_row_reads_back() {
         let dir = tempfile::tempdir().unwrap();
@@ -488,7 +557,8 @@ mod tests {
         // A REORDERED SUBSET: c (id 2) then a (id 0), skipping b entirely.
         let tuples = db.tuple_reader(0).unwrap();
         let live = db.metadata_reader(0).unwrap().live();
-        let mut cursor = Cursor::over(live.into_iter().map(Ordinal), tuples, vec![2, 0]);
+        let vectors = db.reader(0).unwrap();
+        let mut cursor = Cursor::over(live.into_iter().map(Ordinal), tuples, vectors, vec![2, 0]);
 
         let mut has_row = cursor.seek_first().unwrap();
         let mut seen = 0;
@@ -518,6 +588,7 @@ mod tests {
         insert_n(&db, 8);
 
         let tuples = db.tuple_reader(0).unwrap();
+        let vectors = db.reader(0).unwrap();
 
         // THE SEAM. A hand-built bitmap that is NOT `live()` — every one of
         // these 8 ordinals is live, so a cursor wired to `live()` would return
@@ -526,6 +597,7 @@ mod tests {
         let mut cursor = Cursor::over(
             bitmap.into_iter().map(Ordinal),
             tuples.clone(),
+            vectors.clone(),
             ALL.to_vec(),
         );
         assert_eq!(ordinals(&mut cursor), vec![3, 5]);
@@ -533,7 +605,12 @@ mod tests {
         // …and the source is an ITERATOR, not a bitmap: a plain Vec drives the
         // same cursor. That is the shape a ranked KNN result arrives in.
         let knn = vec![Ordinal(6), Ordinal(1), Ordinal(4)];
-        let mut cursor = Cursor::over(knn.into_iter(), tuples.clone(), ALL.to_vec());
+        let mut cursor = Cursor::over(
+            knn.into_iter(),
+            tuples.clone(),
+            vectors.clone(),
+            ALL.to_vec(),
+        );
         assert_eq!(
             ordinals(&mut cursor),
             vec![6, 1, 4],
@@ -546,7 +623,7 @@ mod tests {
         // then lives no longer than the bitmap. `Db::scan` hands over an owned
         // iterator instead, which is why it yields `Cursor<'static>`.
         let keep = &bitmap_of([2, 7]);
-        let mut cursor = Cursor::over(keep.iter().map(Ordinal), tuples, ALL.to_vec());
+        let mut cursor = Cursor::over(keep.iter().map(Ordinal), tuples, vectors, ALL.to_vec());
         assert_eq!(ordinals(&mut cursor), vec![2, 7]);
 
         db.close().unwrap();
@@ -606,10 +683,23 @@ mod tests {
         let written_at_drain_start = written.load(Ordering::Acquire);
         let mut seen = Vec::new();
         let mut has_row = cursor.seek_first().unwrap();
+        let mut waited_for_a_write = false;
         while has_row {
             let o = cursor.ordinal().expect("parked on a row").0 as u64;
             assert_eq!(cursor.row().unwrap(), values_for(o).as_slice());
             seen.push(o);
+            // Once, mid-scan: WAIT for the writer to land a row rather than
+            // trusting the sleep below to be long enough. The property this
+            // test rests on is that rows arrive while the cursor walks, and a
+            // loaded host can starve the writer for longer than any sleep we
+            // would be willing to spend. Waiting makes it certain; the
+            // assertion after the loop then holds structurally.
+            if !waited_for_a_write {
+                while written.load(Ordering::Acquire) <= written_at_drain_start {
+                    std::thread::yield_now();
+                }
+                waited_for_a_write = true;
+            }
             std::thread::sleep(Duration::from_micros(200));
             has_row = cursor.next().unwrap();
         }
@@ -620,7 +710,8 @@ mod tests {
 
         // Without this the test could pass vacuously: a cursor that re-read
         // liveness mid-scan only picks up rows that land WHILE it walks, so
-        // there must have been some.
+        // there must have been some. Guaranteed by the wait inside the loop
+        // rather than by the sleep, so a busy host cannot turn it red.
         assert!(
             written_at_drain_end > written_at_drain_start,
             "no rows landed during the drain ({written_at_drain_start} -> \
@@ -662,11 +753,17 @@ mod tests {
         let db = open(dir.path());
         insert_n(&db, 4);
         let tuples = db.tuple_reader(0).unwrap();
+        let vectors = db.reader(0).unwrap();
 
         // Ordinal 9 was never written, so it stands in for a row a snapshot
         // admits and the tuple store cannot produce.
-        let mut strict =
-            Cursor::over_snapshot(0, std::iter::once(Ordinal(9)), tuples.clone(), ALL.to_vec());
+        let mut strict = Cursor::over_snapshot(
+            0,
+            std::iter::once(Ordinal(9)),
+            tuples.clone(),
+            vectors.clone(),
+            ALL.to_vec(),
+        );
         match strict.seek_first() {
             Err(crate::Error::SnapshotRowMissing {
                 collection: 0,
@@ -681,6 +778,7 @@ mod tests {
             0,
             [Ordinal(0), Ordinal(1), Ordinal(9)].into_iter(),
             tuples.clone(),
+            vectors.clone(),
             ALL.to_vec(),
         );
         assert!(strict.seek_first().unwrap());
@@ -702,10 +800,12 @@ mod tests {
         let db = open(dir.path());
         insert_n(&db, 4);
         let tuples = db.tuple_reader(0).unwrap();
+        let vectors = db.reader(0).unwrap();
 
         let mut lenient = Cursor::over(
             [Ordinal(0), Ordinal(9), Ordinal(2)].into_iter(),
             tuples,
+            vectors,
             ALL.to_vec(),
         );
         assert_eq!(ordinals(&mut lenient), vec![0, 2]);
@@ -852,6 +952,14 @@ mod tests {
             // scan reaches the frontier long after the window shuts, so
             // without this role the skip path would go essentially unexercised.
             let full_scan = role == 0;
+            // A COVERAGE FLOOR, enforced by the loop condition below rather
+            // than asserted at the end: whether a reader thread gets CPU is a
+            // property of the machine, and this test runs alongside hundreds of
+            // siblings. A starved run must come out slower, never red.
+            //
+            // Per role, because the two cost wildly different amounts: a full
+            // scan drains and verifies every live row, a probe touches one.
+            let min_iters: u64 = if full_scan { 20 } else { 350 };
             let db = Arc::clone(&db);
             let stop = Arc::clone(&stop);
             let scans = Arc::clone(&scans);
@@ -859,8 +967,13 @@ mod tests {
             let skips = Arc::clone(&skips);
             handles.push(std::thread::spawn(move || {
                 let tuples = db.tuple_reader(0).expect("tuple reader");
+                let vectors = db.reader(0).expect("vector reader");
                 let meta = db.metadata_reader(0).expect("metadata reader");
-                while !stop.load(Ordering::Relaxed) {
+                let mut seen = 0u64;
+                // Runs for as long as the writer does — that is where the race
+                // lives — then keeps going until this reader has met its floor.
+                while !stop.load(Ordering::Relaxed) || seen < min_iters {
+                    seen += 1;
                     if full_scan {
                         let mut cursor = db.scan(0).expect("scan");
                         // `drain` verifies every row's values against its
@@ -875,6 +988,7 @@ mod tests {
                         let mut cursor = Cursor::over(
                             std::iter::once(Ordinal(frontier)),
                             tuples.clone(),
+                            vectors.clone(),
                             ALL.to_vec(),
                         );
                         // The whole point: `seek_first` on a mid-apply ordinal
@@ -957,10 +1071,19 @@ mod tests {
             "the one liveness authority must match the writer's live set"
         );
 
-        // A run where the readers never got going would prove nothing.
-        assert!(scans.load(Ordering::Relaxed) > 1_000, "readers barely ran");
+        // A run where the readers never got going would prove nothing, so the
+        // floors above guarantee they did. STRUCTURAL: these hold by the loop
+        // condition, and are kept so an edit that weakens it fails here instead
+        // of quietly making the test vacuous.
+        let floor: u64 = 20 + (threads as u64 - 1) * 350;
         assert!(
-            rows_read.load(Ordering::Relaxed) > 1_000,
+            scans.load(Ordering::Relaxed) >= floor,
+            "every reader must meet its coverage floor (expected >= {floor})"
+        );
+        assert!(
+            // Each full scan drains the whole live set, which never drops below
+            // the seeded rows, so 20 of them alone clear this.
+            rows_read.load(Ordering::Relaxed) >= 20 * seed_rows,
             "readers saw almost no rows"
         );
         assert!(frontier > seed_rows, "writer made no progress");

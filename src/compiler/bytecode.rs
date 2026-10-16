@@ -74,6 +74,19 @@
 //                                     stores. One fat op — nothing about DDL
 //                                     varies at runtime, so there is nothing to
 //                                     interpret.
+//   Mutate       collection, retireReg, #set?
+//                                     retire every ordinal in the bitmap as ONE
+//                                     statement: one Record::Mutate, one fsync.
+//                                     What DELETE compiles to — no cursor, no
+//                                     loop, because a per-row delete would be N
+//                                     commit points instead of one.
+//                                     With a SET list it is UPDATE: each matched
+//                                     row is copied to a fresh ordinal with the
+//                                     assignments applied and the original
+//                                     retired, in the same record. A replacement
+//                                     embedding rides in the optional #vector
+//                                     operand; without it each copy keeps its
+//                                     own.
 //
 // WHERE — predicates are SET ALGEBRA, not per-row comparisons
 //   BitmapEq     collection, colId, valueReg, dst
@@ -102,15 +115,15 @@
 // Control
 //   Halt                              stop execution
 //
-// 24 opcodes = a working engine, vector search, RETURNING and WHERE included.
+// 25 opcodes = a working engine, vector search, RETURNING, WHERE and DELETE.
 //
 // ---------------------------------------------------------------------------
 // EXTEND: — not built yet. Added one statement at a time, as emission demands.
 // ---------------------------------------------------------------------------
 //
 // DML
-//   Delete       cur                  delete the row under the cursor
-//   Update       cur, rec             replace the row under the cursor
+//   UPDATE extends `Mutate` with an install side (the copy-on-write rows) rather
+//   than getting a per-row `Update cur, rec`: one statement stays one record.
 //
 // SEARCH — the rest
 //   GRANULARITY NOTE: KnnScan is deliberately COARSE. Interpreting the distance
@@ -457,6 +470,34 @@ pub enum Op {
         /// Destination register.
         dst: Reg,
     },
+    /// Retire every row in a bitmap — ONE statement, logged as ONE durable
+    /// record.
+    ///
+    /// Set-at-a-time on purpose. The bitmap is the predicate's answer, already
+    /// computed by the `Bitmap*` ops above against this query's snapshot, and it
+    /// is handed to the engine whole: one `Record::Mutate`, one fsync, all or
+    /// nothing. A cursor loop issuing a delete per row would be N records and N
+    /// commit points — exactly the non-atomic shape that design exists to rule
+    /// out.
+    Mutate {
+        /// The collection to retire rows from.
+        collection: String,
+        /// Register holding the bitmap of ordinals to retire.
+        retire: Reg,
+        /// An UPDATE's SET list in the constant pool, or `None` for a DELETE.
+        ///
+        /// With it, the op is copy-on-write: read each matched row, write an
+        /// edited copy at a fresh ordinal, retire the original — still ONE
+        /// record. Without it, the matched rows are simply retired.
+        set: Option<ConstId>,
+        /// A replacement embedding in the constant pool, or `None` to copy each
+        /// row's own across.
+        ///
+        /// Separate from `set` because a vector is not a scalar `Value`, and
+        /// because the binder only permits it when the statement names ONE row
+        /// by ordinal — one statement carries one embedding.
+        vector: Option<ConstId>,
+    },
     /// Provision a collection. One fat op — nothing about DDL varies at runtime.
     CreateCollection {
         /// New collection name.
@@ -571,6 +612,17 @@ impl Program {
                 Op::BitmapNot { src, dst, .. } => {
                     self.check_reg(at, *src)?;
                     self.check_reg(at, *dst)?;
+                }
+                Op::Mutate {
+                    retire,
+                    set,
+                    vector,
+                    ..
+                } => {
+                    self.check_reg(at, *retire)?;
+                    for id in set.iter().chain(vector.iter()) {
+                        self.check_const(at, *id)?;
+                    }
                 }
                 Op::CreateCollection { schema, .. } => {
                     self.check_const(at, *schema)?;

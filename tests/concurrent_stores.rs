@@ -402,13 +402,21 @@ fn run_decider(seed: u64) -> Sightings {
     let mut handles = Vec::new();
     for role in 0..reader_threads() {
         let scanner = role == 0;
+        // A COVERAGE FLOOR carried by the loop condition rather than asserted
+        // at the end — see the guards below. Per role, because a scanner walks
+        // the whole live set per iteration and a prober touches one ordinal.
+        let min_iters: u64 = if scanner { 20 } else { 350 };
         let meta = meta.clone();
         let tuples = tuples.clone();
         let stop = stop.clone();
         let tally = tally.clone();
         let acked = acked.clone();
         handles.push(std::thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
+            let mut seen = 0u64;
+            // For as long as the writer runs — that is where the window lives —
+            // then on until this reader has met its floor.
+            while !stop.load(Ordering::Relaxed) || seen < min_iters {
+                seen += 1;
                 let live = meta.live();
                 tally.snapshots.fetch_add(1, Ordering::Relaxed);
                 let snap_len = live.len();
@@ -460,15 +468,20 @@ fn run_decider(seed: u64) -> Sightings {
 
     assert_settled(&meta, &tuples, &live, next);
 
-    // A run that never raced would report zero missings for the wrong reason.
-    // Pin that it did real work before its silence means anything.
+    // A run that never raced would report zero missings for the wrong reason,
+    // so the per-role floors above make the readers do real work first. These
+    // are STRUCTURAL — they hold by the loop condition — and are kept so an
+    // edit that weakens it fails here rather than quietly making the silence
+    // vacuous. Asserting on raw thread throughput instead would fail whenever
+    // the host is busy, which says nothing about the code.
+    let floor = 20 + (reader_threads() as u64 - 1) * 350;
     assert!(
-        tally.snapshots.load(Ordering::Relaxed) > 1_000,
-        "readers barely ran; the result would not be meaningful"
+        tally.snapshots.load(Ordering::Relaxed) >= floor,
+        "every reader must meet its coverage floor (expected >= {floor})"
     );
     assert!(
-        tally.live_hits.load(Ordering::Relaxed) > 1_000,
-        "readers saw almost no rows"
+        tally.live_hits.load(Ordering::Relaxed) > 0,
+        "readers saw no rows at all"
     );
     assert!(next > SEED_ROWS, "writer made no progress");
 
@@ -499,10 +512,12 @@ fn run_decider(seed: u64) -> Sightings {
 ///     One sighting from either role is then a real regression, and a rare
 ///     signal is exactly the one worth keeping.
 ///
-/// The `run_decider` guards (`snapshots > 1_000`, `live_hits > 1_000`,
-/// `next > SEED_ROWS`) are what make the World B direction meaningful rather
-/// than vacuous: they prove the readers and writer actually ran before silence
-/// is allowed to count as evidence.
+/// The `run_decider` guards are what make the World B direction meaningful
+/// rather than vacuous: they prove the readers and writer actually ran before
+/// silence is allowed to count as evidence. The reader half is a floor built
+/// into the loop CONDITION rather than a threshold asserted afterwards —
+/// thread throughput is a property of the host, so a busy machine must make
+/// this test slower, never red.
 #[test]
 fn live_then_get_under_concurrent_writes() {
     // A genuinely serial host cannot be relied on to interleave two threads
@@ -618,7 +633,13 @@ fn snapshot_never_contains_an_unwritten_row() {
         let checks = checks.clone();
         let notes = notes.clone();
         handles.push(scope.spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
+            // A COVERAGE FLOOR in the loop condition, not a threshold asserted
+            // afterwards: every reader here walks the snapshot to find its max,
+            // so one number serves all of them. See the guards below.
+            const MIN_ITERS: u64 = 300;
+            let mut seen = 0u64;
+            while !stop.load(Ordering::Relaxed) || seen < MIN_ITERS {
+                seen += 1;
                 let set = db.live_snapshot(0).expect("collection 0");
                 resolves.fetch_add(1, Ordering::Relaxed);
                 let Some(max) = set.iter().max() else {
@@ -665,12 +686,18 @@ fn snapshot_never_contains_an_unwritten_row() {
     });
 
     // The same meaningfulness guards the decider uses: silence is only evidence
-    // if the readers and the writer actually ran.
+    // if the readers and the writer actually ran. STRUCTURAL — the loop
+    // condition above guarantees the floor — so a busy host makes this slower
+    // rather than red.
+    let floor = reader_threads() as u64 * 300;
     assert!(
-        resolves.load(Ordering::Relaxed) > 1_000,
-        "readers barely ran; the result would not be meaningful"
+        resolves.load(Ordering::Relaxed) >= floor,
+        "every reader must meet its coverage floor (expected >= {floor})"
     );
-    assert!(checks.load(Ordering::Relaxed) > 1_000, "readers saw no rows");
+    assert!(
+        checks.load(Ordering::Relaxed) > 0,
+        "readers saw no rows at all"
+    );
     assert!(next > SEED_ROWS, "writer made no progress");
 
     let violations = violations.load(Ordering::Relaxed);

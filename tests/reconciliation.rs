@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use flats::index::index::{FlatIndex, Reader, Writer};
-use flats::wal::wal::{Apply, Lsn, Record, Wal, WalHandle};
+use flats::wal::wal::{Apply, Lsn, Outcome, Record, Wal, WalHandle};
 
 // Slot 1 lives on page 1 (mirrored from index.rs for the torn-flush simulation).
 const SLOT1_OFFSET: u64 = 4096;
@@ -56,8 +56,8 @@ fn insert_rec(ordinal: u64) -> Record {
 /// `Writer`, so apply here is a no-op.
 struct LogOnly;
 impl Apply for LogOnly {
-    fn apply(&mut self, _lsn: Lsn, _record: &Record) -> io::Result<()> {
-        Ok(())
+    fn apply(&mut self, _lsn: Lsn, _record: &Record) -> io::Result<Outcome> {
+        Ok(Outcome::Applied)
     }
     fn checkpoint(&mut self) -> io::Result<Option<u64>> {
         Ok(None)
@@ -71,7 +71,7 @@ struct WriterApplier {
     applied: Arc<AtomicUsize>,
 }
 impl Apply for WriterApplier {
-    fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<()> {
+    fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<Outcome> {
         match record {
             Record::Insert {
                 ordinal, vector, ..
@@ -79,13 +79,13 @@ impl Apply for WriterApplier {
             // The flat index no longer participates in a delete: retiring a
             // row clears a bit in the metadata index and nothing else.
             Record::Delete { .. } => {}
-            Record::CreateCollection { .. } => {
-                unreachable!("this test never logs CreateCollection records")
+            Record::CreateCollection { .. } | Record::Mutate { .. } => {
+                unreachable!("this test only logs Insert and Delete records")
             }
         }
         self.writer.advance_applied_lsn(lsn.0);
         self.applied.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        Ok(Outcome::Applied)
     }
     fn checkpoint(&mut self) -> io::Result<Option<u64>> {
         let wm = self.writer.sync().map_err(to_io)?;
@@ -96,14 +96,14 @@ impl Apply for WriterApplier {
 /// Log a record AND mirror it into the test-owned writer, in lockstep (this is
 /// what the real applier does; split so the test keeps the writer).
 fn log_and_apply(h: &WalHandle, w: &mut Writer, rec: Record) {
-    let lsn = h.append(rec.clone()).expect("append durable");
+    let lsn = h.append(rec.clone()).expect("append durable").lsn;
     match &rec {
         Record::Insert {
             ordinal, vector, ..
         } => w.write_at(*ordinal, vector).expect("write_at"),
         Record::Delete { .. } => {}
-        Record::CreateCollection { .. } => {
-            unreachable!("this test never logs CreateCollection records")
+        Record::CreateCollection { .. } | Record::Mutate { .. } => {
+            unreachable!("this test only logs Insert and Delete records")
         }
     }
     w.advance_applied_lsn(lsn.0);

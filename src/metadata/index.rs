@@ -91,7 +91,9 @@ use crate::metadata::common::{
 };
 
 const MAGIC: &[u8; 4] = b"MET0";
-const VERSION: u32 = 1;
+/// 2 = the embedded `Schema` carries a PRIMARY KEY. The snapshot serializes
+/// the schema itself, so a field added to it re-shapes this file.
+const VERSION: u32 = 2;
 const SNAP_FILE: &str = "metadata.snap";
 const TMP_FILE: &str = "metadata.snap.tmp";
 
@@ -462,6 +464,120 @@ impl Writer {
             inner.columns[*col as usize].insert(*col, ordinal, value)?;
         }
         inner.live.insert(ordinal.0);
+        Ok(())
+    }
+
+    /// Is this statement STALE — built from rows that have since moved on?
+    ///
+    /// A copy-on-write statement (an UPDATE) is assembled on its caller's
+    /// thread: find the rows, read them, log "retire the old, install the
+    /// copy". Two callers can do that concurrently against the same row, and
+    /// both records are perfectly valid by the time the commit thread sees
+    /// them — so applying both would install two copies of one row. This is
+    /// the check that stops it, asked on the commit thread where everything is
+    /// already serialized.
+    ///
+    /// Stale means BOTH of:
+    ///
+    ///  * some ordinal it retires is already retired — someone got there first;
+    ///  * none of the ordinals it installs are live — its own copy never landed.
+    ///
+    /// The second clause is not redundant, it is what keeps REPLAY correct. A
+    /// record that applied successfully gets redelivered (replay covers every
+    /// frame above the checkpoint, and the conservative global watermark
+    /// re-delivers more than that). Its retires are done by then, so the first
+    /// clause alone would call it stale and skip it — losing the row if some
+    /// store had not yet absorbed its installs. Its installs ARE live, so the
+    /// second clause re-applies it idempotently instead. The loser's record
+    /// satisfies neither clause, on the first pass and on every replay after
+    /// it, which is what makes the verdict deterministic.
+    ///
+    /// A statement that installs nothing (a DELETE) is never stale: retiring a
+    /// retired row is already a no-op, so there is nothing to protect.
+    pub fn is_stale(&self, retire: &RoaringBitmap, install: &[Ordinal]) -> bool {
+        if install.is_empty() {
+            return false;
+        }
+        let inner = self.lock();
+        if retire.is_subset(&inner.live) {
+            return false; // nobody got there first
+        }
+        !install.iter().any(|o| inner.live.contains(o.0))
+    }
+
+    /// Whether any LIVE row already holds `value` in `col`.
+    ///
+    /// The authoritative uniqueness check for a primary key. It runs on the
+    /// commit thread, under a single lock hold, against the writer's own
+    /// `live` — so unlike a caller-side lookup the answer cannot change
+    /// between asking and acting. Two callers racing on the same key both
+    /// reach this, one at a time, and the second sees the first.
+    ///
+    /// Masked by `live` on purpose: a key retired by a DELETE is free again.
+    pub fn is_key_taken(&self, col: ColumnId, value: &Value) -> Result<bool> {
+        let inner = self.lock();
+        let store = inner
+            .columns
+            .get(col as usize)
+            .ok_or(Error::UnknownColumn { column: col })?;
+        let holders = store.lookup_eq(col, value)?;
+        Ok(!(holders & inner.live.clone()).is_empty())
+    }
+
+    /// Apply ONE `Record::Mutate` — every retirement and every installation —
+    /// under a SINGLE lock hold.
+    ///
+    /// # Why one hold, and not a loop of `insert_row`/`remove_row`
+    ///
+    /// Those take the lock per row and release it. That is atomic enough for a
+    /// one-row record, but a statement spanning N rows would release the lock
+    /// N times, and `LiveHandle::resolve` takes that same lock to copy `live`
+    /// when its cache is stale. A reader landing between two rows would
+    /// materialize a HALF-APPLIED statement, label it with the current version
+    /// (the applier bumps only once, at the end), and cache it — and a query
+    /// holds its snapshot for its whole life. Half an UPDATE is exactly the
+    /// state the one-record-per-statement design exists to make unobservable.
+    ///
+    /// So the rule is: everything a single record changes happens inside one
+    /// critical section. The caller then bumps the version, publishing it.
+    ///
+    /// # Cost
+    ///
+    /// The hold is proportional to the statement, so a bulk mutation blocks
+    /// snapshot materialization and metadata lookups for its duration. Vector
+    /// and tuple-store writes deliberately happen OUTSIDE this call (see the
+    /// engine's apply order), so only postings and bitmap work is inside, and
+    /// the WAL's installed-payload cap bounds the worst case.
+    ///
+    /// # Semantics
+    ///
+    /// Installs are applied before retirements, so a statement that retires and
+    /// reinstalls the same ordinal ends with it RETIRED — matching the WAL
+    /// record's reading of "retire this set, install these rows". Validation
+    /// covers every row before anything mutates: there is no rollback here, so
+    /// a bad row must fail the statement whole. Retiring an ordinal that is not
+    /// live is a silent no-op, as in `remove_row`, which is what makes replay
+    /// idempotent.
+    pub fn apply_mutation(
+        &mut self,
+        retire: &RoaringBitmap,
+        install: &[(Ordinal, &Row)],
+    ) -> Result<()> {
+        let mut inner = self.lock();
+
+        // Validate EVERYTHING first — no partial statement, ever.
+        for (_, row) in install {
+            inner.schema.validate_row(row)?;
+        }
+
+        for (ordinal, row) in install {
+            for (col, value) in *row {
+                inner.columns[*col as usize].insert(*col, *ordinal, value)?;
+            }
+            inner.live.insert(ordinal.0);
+        }
+        // Retire last: see the ordering note above.
+        inner.live -= retire;
         Ok(())
     }
 
@@ -1020,6 +1136,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<(MetadataInner, Lsn)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
     use crate::metadata::common::{ColumnSpec, ColumnType};
     use std::num::NonZeroUsize;
 
@@ -1385,6 +1502,137 @@ mod tests {
         (handle, inner)
     }
 
+    // -----------------------------------------------------------------------
+    // apply_mutation — one statement, one publish
+    // -----------------------------------------------------------------------
+
+    /// A `Record::Mutate` retires and installs in ONE lock hold.
+    ///
+    /// The tear this rules out is specific and reachable. `resolve`'s fast path
+    /// returns the cached snapshot while the version is unchanged, so a reader
+    /// mid-statement usually sees the clean pre-state. But if the cache is
+    /// STALE when it resolves — a previous bump that no reader has materialized
+    /// yet — it takes the metadata lock and copies `live` as it finds it. With
+    /// per-row locking that copy lands between two rows of the statement, and
+    /// the half-applied result gets LABELLED with the current version and
+    /// cached. A query holding it sees half an UPDATE for its entire life.
+    ///
+    /// The invariant asserted is the one a caller actually cares about: an
+    /// UPDATE moves rows from set A to set B, so the live COUNT never changes.
+    /// Any observed count other than `N` is a statement caught mid-flight.
+    #[test]
+    fn apply_mutation_publishes_retire_and_install_together() {
+        const N: u32 = 64;
+        const ROUNDS: usize = 300;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut w, r) = MetadataIndex::create(dir.path(), test_schema()).unwrap();
+        let live = Arc::new(r.live_handle());
+
+        // Seed set A live.
+        let set_a: Vec<(Ordinal, Row)> = (0..N).map(|o| (Ordinal(o), row(o as i64, 0.0, "a"))).collect();
+        let set_b: Vec<(Ordinal, Row)> =
+            (N..2 * N).map(|o| (Ordinal(o), row(o as i64, 0.0, "b"))).collect();
+        for (ord, r) in &set_a {
+            w.insert_row(*ord, r).unwrap();
+        }
+        live.bump();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let live = Arc::clone(&live);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut worst = None;
+                while !stop.load(Ordering::Relaxed) {
+                    let snap = live.resolve();
+                    if snap.len() != u64::from(N) {
+                        worst = Some(snap.len());
+                        break;
+                    }
+                }
+                worst
+            })
+        };
+
+        let bitmap_of = |rows: &[(Ordinal, Row)]| -> RoaringBitmap {
+            rows.iter().map(|(o, _)| o.0).collect()
+        };
+        for i in 0..ROUNDS {
+            let (retire, install) = if i % 2 == 0 {
+                (bitmap_of(&set_a), &set_b)
+            } else {
+                (bitmap_of(&set_b), &set_a)
+            };
+            let installs: Vec<(Ordinal, &Row)> = install.iter().map(|(o, r)| (*o, r)).collect();
+            w.apply_mutation(&retire, &installs).unwrap();
+            // Publish AFTER the statement is whole, exactly as the applier does.
+            live.bump();
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let torn = reader.join().unwrap();
+        assert_eq!(
+            torn, None,
+            "a reader observed {torn:?} live rows — a statement was visible half-applied"
+        );
+    }
+
+    /// Validation covers the WHOLE statement before anything mutates. A bad row
+    /// in the middle must leave the index untouched, not half-installed — there
+    /// is no rollback here, and a partially applied statement would be
+    /// published by the very next bump.
+    #[test]
+    fn apply_mutation_validates_every_row_before_mutating() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut w, r) = MetadataIndex::create(dir.path(), test_schema()).unwrap();
+
+        w.insert_row(Ordinal(0), &row(1, 1.0, "keep")).unwrap();
+        let before = r.live();
+
+        let good = row(2, 2.0, "new");
+        // Column 1 is FLOAT; an Int there is a type error.
+        let bad: Row = vec![
+            (0, Value::Int(3)),
+            (1, Value::Int(3)),
+            (2, Value::Text("bad".into())),
+        ];
+        let installs: Vec<(Ordinal, &Row)> = vec![(Ordinal(1), &good), (Ordinal(2), &bad)];
+
+        let retire: RoaringBitmap = [0u32].into_iter().collect();
+        w.apply_mutation(&retire, &installs)
+            .expect_err("a bad row anywhere fails the whole statement");
+
+        assert_eq!(
+            r.live(),
+            before,
+            "a refused statement must not retire, install, or otherwise touch liveness"
+        );
+    }
+
+    /// Replay redelivers a statement verbatim until a checkpoint folds it away,
+    /// so applying it twice must be indistinguishable from once.
+    #[test]
+    fn apply_mutation_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut w, r) = MetadataIndex::create(dir.path(), test_schema()).unwrap();
+
+        for o in 0..4u32 {
+            w.insert_row(Ordinal(o), &row(o as i64, 0.0, "old")).unwrap();
+        }
+
+        let new_row = row(99, 9.0, "new");
+        let installs: Vec<(Ordinal, &Row)> = vec![(Ordinal(10), &new_row)];
+        let retire: RoaringBitmap = [1u32, 2].into_iter().collect();
+
+        w.apply_mutation(&retire, &installs).unwrap();
+        let once = r.live();
+        w.apply_mutation(&retire, &installs).unwrap();
+
+        assert_eq!(r.live(), once, "replaying a statement changes nothing");
+        assert_eq!(once, bm(&[0, 3, 10]));
+    }
+
     #[test]
     fn live_set_carries_its_version() {
         let set = LiveSet::new(7, bm(&[1, 4, 9]));
@@ -1482,18 +1730,35 @@ mod tests {
     #[test]
     fn snapshot_version_never_leads_its_contents() {
         const WRITES: u32 = 20_000;
+        const READERS: usize = 4;
+        /// How many times each reader must evaluate the assertion before the
+        /// test is allowed to finish. A run where the readers never got
+        /// scheduled would pass vacuously, so this is a floor on coverage.
+        ///
+        /// Enforced by the loop CONDITION, never asserted afterwards. Whether a
+        /// thread gets CPU is a property of the machine — under a full suite
+        /// four readers compete with every other test — and asserting on it
+        /// makes the test fail for reasons that have nothing to do with the code
+        /// it covers. The condition instead makes a starved run SLOWER rather
+        /// than red: once the writer stops bumping, `resolve` takes its fast
+        /// path (an atomic load and an `Arc` clone, no lock, no bitmap copy), so
+        /// the remaining checks cost nanoseconds apiece.
+        const MIN_CHECKS: u64 = 1_000;
 
         let (handle, inner) = live_handle_with_state();
         let handle = Arc::new(handle);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let mut readers = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..READERS {
             let handle = Arc::clone(&handle);
             let stop = Arc::clone(&stop);
             readers.push(std::thread::spawn(move || {
                 let mut seen = 0u64;
-                while !stop.load(Ordering::Relaxed) {
+                // Run for as long as the writer does — that is where the
+                // interleaving worth testing lives — and then keep going until
+                // this reader has met the floor.
+                while !stop.load(Ordering::Relaxed) || seen < MIN_CHECKS {
                     let set = handle.resolve();
                     assert!(
                         set.version() <= set.len(),
@@ -1525,7 +1790,13 @@ mod tests {
             .sum();
 
         assert_eq!(handle.version(), WRITES as u64);
-        assert!(total > 1_000, "readers barely ran ({total}); proves nothing");
+        // STRUCTURAL, not statistical: the loop condition already guarantees
+        // it. Kept so a future edit that weakens the condition fails here
+        // instead of quietly making the test vacuous.
+        assert!(
+            total >= READERS as u64 * MIN_CHECKS,
+            "each reader must meet the coverage floor; got {total} across {READERS}"
+        );
     }
 
     /// Two readers racing a stale cache must not both build. At-most-once is

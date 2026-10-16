@@ -29,8 +29,8 @@
 use std::fmt;
 
 use crate::sql::ast::{
-    CollectionOption, ColumnDef, ColumnType, CompareOp, CreateStmt, Expr, InsertStmt, Literal,
-    Projection, SearchStmt, SelectStmt, Statement,
+    Assignment, CollectionOption, ColumnDef, ColumnType, CompareOp, CreateStmt, DeleteStmt, Expr,
+    InsertStmt, Literal, Projection, SearchStmt, SelectStmt, Statement, UpdateStmt,
 };
 use crate::sql::lexer::{LexError, Lexer, Span, SpannedToken, Token};
 
@@ -63,6 +63,16 @@ pub enum ParseErrorKind {
     },
     /// A word in type position that names no known type (e.g. `BLOB`).
     UnknownType(String),
+    /// A construct V-SQL reserves but deliberately does not support.
+    ///
+    /// Reserved rather than left as an identifier so the refusal can NAME it:
+    /// `WHERE NOT x = 1` with `NOT` as an ordinary word parses the keyword as a
+    /// column and then complains about the token after it, which tells the
+    /// reader nothing about what is missing.
+    Unsupported {
+        /// What was written, and what to reach for instead.
+        what: String,
+    },
     /// Input remained after a complete statement + its `;`.
     TrailingTokens,
     /// Input ended while a rule still expected more tokens.
@@ -83,6 +93,9 @@ impl fmt::Display for ParseError {
             ),
             ParseErrorKind::UnknownType(t) => {
                 write!(f, "unknown type {t:?} at byte {}", self.span.start)
+            }
+            ParseErrorKind::Unsupported { what } => {
+                write!(f, "{what} is not supported at byte {}", self.span.start)
             }
             ParseErrorKind::TrailingTokens => {
                 write!(f, "unexpected trailing tokens at byte {}", self.span.start)
@@ -219,19 +232,20 @@ impl Parser {
 
     // -- one function per grammar rule -------------------------------------
 
-    /// `statement := (select | insert | create | search) ';'`
+    /// `statement := (select | insert | create | search | delete | update) ';'`
     pub fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         let stmt = match self.peek() {
             Token::Select => Statement::Select(self.parse_select()?),
             Token::Insert => Statement::Insert(self.parse_insert()?),
             Token::Create => Statement::CreateCollection(self.parse_create()?),
             Token::Search => Statement::Search(self.parse_search()?),
-            // EXTEND: dispatch Delete/Update on their leading keyword.
+            Token::Delete => Statement::Delete(self.parse_delete()?),
+            Token::Update => Statement::Update(self.parse_update()?),
             Token::Eof => return Err(self.error(ParseErrorKind::UnexpectedEof)),
             _ => {
                 let found = format!("{:?}", self.peek());
                 return Err(self.error(ParseErrorKind::UnexpectedToken {
-                    expected: "SELECT, INSERT, CREATE, or SEARCH".to_string(),
+                    expected: "SELECT, INSERT, CREATE, SEARCH, DELETE, or UPDATE".to_string(),
                     found,
                 }));
             }
@@ -252,6 +266,61 @@ impl Parser {
             from,
             filter,
         })
+    }
+
+    /// `update := UPDATE ident SET assignment (',' assignment)* WHERE expr`
+    ///
+    /// `WHERE` is required, like a DELETE's: leaving it out would rewrite every
+    /// row, which is not a thing a user should be able to type by accident.
+    /// The predicate uses the shared expression grammar, so it means the same
+    /// here as in the SELECT that previews which rows are about to change.
+    fn parse_update(&mut self) -> Result<UpdateStmt, ParseError> {
+        self.expect(Token::Update)?;
+        let collection = self.expect_ident()?;
+        self.expect(Token::Set)?;
+
+        let mut assignments = vec![self.parse_assignment()?];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            assignments.push(self.parse_assignment()?);
+        }
+
+        self.expect(Token::Where)?;
+        let filter = self.parse_expr()?;
+        Ok(UpdateStmt {
+            collection,
+            assignments,
+            filter,
+        })
+    }
+
+    /// `assignment := ident '=' literal`
+    ///
+    /// The right-hand side is a LITERAL, not an expression. V-SQL has no
+    /// arithmetic, so `SET n = n + 1` is not in the language — and accepting
+    /// the expression grammar here would parse `SET a = b` into something the
+    /// binder could only reject with a worse message.
+    fn parse_assignment(&mut self) -> Result<Assignment, ParseError> {
+        let column = self.expect_ident()?;
+        self.expect(Token::Eq)?;
+        let value = self.parse_literal()?;
+        Ok(Assignment { column, value })
+    }
+
+    /// `delete := DELETE FROM ident WHERE expr`
+    ///
+    /// The clause is required, so this expects `WHERE` itself rather than going
+    /// through the optional [`parse_where`](Self::parse_where): a DELETE that
+    /// forgot its predicate is an error here, never a whole-collection delete.
+    /// The expression grammar is the shared one, so a predicate means the same
+    /// thing in a DELETE as in the SELECT a user would run to preview it.
+    fn parse_delete(&mut self) -> Result<DeleteStmt, ParseError> {
+        self.expect(Token::Delete)?;
+        self.expect(Token::From)?;
+        let from = self.expect_ident()?;
+        self.expect(Token::Where)?;
+        let filter = self.parse_expr()?;
+        Ok(DeleteStmt { from, filter })
     }
 
     /// `where := WHERE expr` — the whole clause, absent when the keyword is not
@@ -312,6 +381,13 @@ impl Parser {
             Token::Ge => CompareOp::Ge,
             Token::Eq => CompareOp::Eq,
             Token::Ne => CompareOp::Ne,
+            // `IN` sits exactly where an operator goes, so it is caught here
+            // rather than falling through and surfacing as a stray token.
+            Token::In => {
+                return Err(self.error(ParseErrorKind::Unsupported {
+                    what: "`IN` (write the alternatives as `a = x OR a = y`)".to_string(),
+                }));
+            }
             _ => return Ok(left),
         };
         self.advance();
@@ -336,6 +412,11 @@ impl Parser {
                 Ok(inner)
             }
             Token::Ident(_) => Ok(Expr::Column(self.expect_ident()?)),
+            // Refused HERE, where the word was written, rather than left to
+            // confuse the next rule. V-SQL has no negation operator.
+            Token::Not => Err(self.error(ParseErrorKind::Unsupported {
+                what: "`NOT` (use `!=` for inequality, or rewrite with `AND`/`OR`)".to_string(),
+            })),
             // Every literal form the rest of the grammar knows, including
             // vectors — which no predicate can usefully compare, but rejecting
             // that HERE would mean the parser knowing what a comparison means.
@@ -445,11 +526,27 @@ impl Parser {
         })
     }
 
-    /// `col_def := ident type`
+    /// `col_def := ident type [ PRIMARY KEY ]`
+    ///
+    /// The marker is column-level because V-SQL has no composite keys: one
+    /// column names the row, or nothing does. `PRIMARY` with no `KEY` is a
+    /// parse error rather than a shorthand — a half-typed constraint must not
+    /// silently decide a collection's identity.
     fn parse_col_def(&mut self) -> Result<ColumnDef, ParseError> {
         let name = self.expect_ident()?;
         let ty = self.parse_type()?;
-        Ok(ColumnDef { name, ty })
+        let primary_key = if *self.peek() == Token::Primary {
+            self.advance();
+            self.expect(Token::Key)?;
+            true
+        } else {
+            false
+        };
+        Ok(ColumnDef {
+            name,
+            ty,
+            primary_key,
+        })
     }
 
     /// `type := VECTOR '(' int_lit ')' | TEXT | INT | FLOAT`.
@@ -845,6 +942,139 @@ mod tests {
         Box::new(Expr::Compare { left, op, right })
     }
 
+    // -- UPDATE ------------------------------------------------------------
+    //
+    // `update := UPDATE ident SET assignment (',' assignment)* WHERE expr`
+
+    fn update_of(sql: &str) -> UpdateStmt {
+        match ok(sql) {
+            Statement::Update(u) => u,
+            other => panic!("expected an UPDATE, got {other:?}"),
+        }
+    }
+
+    fn assign(column: &str, value: Literal) -> Assignment {
+        Assignment {
+            column: column.to_string(),
+            value,
+        }
+    }
+
+    #[test]
+    fn parses_update_with_one_assignment() {
+        assert_eq!(
+            ok("UPDATE docs SET category = 'archived' WHERE published_at < 5;"),
+            Statement::Update(UpdateStmt {
+                collection: "docs".to_string(),
+                assignments: vec![assign("category", Literal::Str("archived".into()))],
+                filter: *cmp(col("published_at"), CompareOp::Lt, int(5)),
+            })
+        );
+        // Keywords are case-insensitive; the collection keeps its source case.
+        assert_eq!(
+            update_of("update MyDocs set a = 1 where z < 2;").collection,
+            "MyDocs"
+        );
+    }
+
+    #[test]
+    fn parses_several_assignments_in_source_order() {
+        assert_eq!(
+            update_of("UPDATE docs SET a = 1, b = 2.5, c = 'x' WHERE z < 2;").assignments,
+            vec![
+                assign("a", Literal::Int(1)),
+                assign("b", Literal::Float(2.5)),
+                assign("c", Literal::Str("x".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn update_takes_the_full_where_grammar() {
+        assert_eq!(
+            update_of("UPDATE docs SET a = 1 WHERE b = 2 OR c = 3 AND d = 4;").filter,
+            Expr::Or(
+                cmp(col("b"), CompareOp::Eq, int(2)),
+                Box::new(Expr::And(
+                    cmp(col("c"), CompareOp::Eq, int(3)),
+                    cmp(col("d"), CompareOp::Eq, int(4)),
+                )),
+            )
+        );
+    }
+
+    #[test]
+    fn update_without_where_is_an_error() {
+        // No accidental whole-collection rewrite.
+        err("UPDATE docs SET a = 1;");
+        err("UPDATE docs SET a = 1 WHERE;");
+    }
+
+    #[test]
+    fn malformed_updates_are_errors() {
+        err("UPDATE docs a = 1 WHERE z < 2;"); // no SET
+        err("UPDATE SET a = 1 WHERE z < 2;"); // no collection
+        err("UPDATE docs SET WHERE z < 2;"); // empty SET list
+        err("UPDATE docs SET a WHERE z < 2;"); // assignment without a value
+        err("UPDATE docs SET a = 1, WHERE z < 2;"); // trailing comma
+        err("UPDATE docs SET a = 1 WHERE z < 2"); // no semicolon
+    }
+
+    // -- DELETE ------------------------------------------------------------
+    //
+    // `delete := DELETE FROM ident WHERE expr` — the WHERE is mandatory.
+
+    fn delete_of(sql: &str) -> DeleteStmt {
+        match ok(sql) {
+            Statement::Delete(d) => d,
+            other => panic!("expected a DELETE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_delete_with_a_predicate() {
+        assert_eq!(
+            ok("DELETE FROM docs WHERE z < 2;"),
+            Statement::Delete(DeleteStmt {
+                from: "docs".to_string(),
+                filter: *cmp(col("z"), CompareOp::Lt, int(2)),
+            })
+        );
+        // Keywords are case-insensitive; the collection keeps its source case.
+        assert_eq!(delete_of("delete from MyDocs where z < 2;").from, "MyDocs");
+    }
+
+    #[test]
+    fn delete_takes_the_full_where_grammar() {
+        // The same expression parser as SELECT, so AND binds tighter than OR.
+        assert_eq!(
+            delete_of("DELETE FROM docs WHERE a = 1 OR b = 2 AND c = 3;").filter,
+            Expr::Or(
+                cmp(col("a"), CompareOp::Eq, int(1)),
+                Box::new(Expr::And(
+                    cmp(col("b"), CompareOp::Eq, int(2)),
+                    cmp(col("c"), CompareOp::Eq, int(3)),
+                )),
+            )
+        );
+    }
+
+    #[test]
+    fn delete_without_where_is_an_error() {
+        // No accidental whole-collection delete: leaving the clause out does
+        // not parse. (`err` panics unless the parse fails.)
+        err("DELETE FROM docs;");
+        err("DELETE FROM docs WHERE;");
+    }
+
+    #[test]
+    fn malformed_deletes_are_errors() {
+        err("DELETE docs WHERE z < 2;");
+        err("DELETE FROM WHERE z < 2;");
+        err("DELETE FROM docs WHERE z < 2");
+        err("DELETE FROM docs WHERE z < 2 RETURNING id;");
+    }
+
     #[test]
     fn a_statement_without_where_has_no_filter() {
         assert_eq!(filter_of("SELECT x FROM docs;"), None);
@@ -1032,22 +1262,86 @@ mod tests {
             vec![
                 ColumnDef {
                     name: "a".to_string(),
-                    ty: ColumnType::Vector(4)
+                    ty: ColumnType::Vector(4),
+                    primary_key: false,
                 },
                 ColumnDef {
                     name: "b".to_string(),
-                    ty: ColumnType::Text
+                    ty: ColumnType::Text,
+                    primary_key: false,
                 },
                 ColumnDef {
                     name: "d".to_string(),
-                    ty: ColumnType::Int
+                    ty: ColumnType::Int,
+                    primary_key: false,
                 },
                 ColumnDef {
                     name: "e".to_string(),
-                    ty: ColumnType::Float
+                    ty: ColumnType::Float,
+                    primary_key: false,
                 },
             ]
         );
+    }
+
+    /// `PRIMARY KEY` is a column-level marker, so it parses as part of the
+    /// column definition rather than as a separate table constraint. V-SQL has
+    /// no composite keys, which is exactly why the single-column form is the
+    /// only one.
+    #[test]
+    fn a_column_can_be_marked_primary_key() {
+        let stmt =
+            ok("CREATE COLLECTION c (doc_id TEXT PRIMARY KEY, v VECTOR(2)) WITH (capacity = 1);");
+        assert_eq!(
+            create_columns(&stmt),
+            vec![
+                ColumnDef {
+                    name: "doc_id".to_string(),
+                    ty: ColumnType::Text,
+                    primary_key: true,
+                },
+                ColumnDef {
+                    name: "v".to_string(),
+                    ty: ColumnType::Vector(2),
+                    primary_key: false,
+                },
+            ]
+        );
+    }
+
+    /// `PRIMARY` alone is a typo, not a shorthand. Accepting it would make the
+    /// key silently depend on a word the user did not finish typing.
+    #[test]
+    fn primary_without_key_is_a_parse_error() {
+        assert!(
+            parse("CREATE COLLECTION c (a TEXT PRIMARY, v VECTOR(2)) WITH (capacity = 1);")
+                .is_err()
+        );
+    }
+
+    /// `NOT` and `IN` are refused BY NAME, and the message says what to use
+    /// instead. Neither is in V-SQL: `!=` covers negated equality, `AND`/`OR`
+    /// cover the rest, and `IN` is an OR chain — so the cost of leaving them
+    /// out is a few more characters, while the cost of a bad error is a user
+    /// guessing at the grammar.
+    #[test]
+    fn not_and_in_are_refused_by_name() {
+        for (src, needle) in [
+            ("SELECT a FROM docs WHERE NOT n = 1;", "NOT"),
+            ("SELECT a FROM docs WHERE n IN (1, 2);", "IN"),
+        ] {
+            let err = parse(src).expect_err("must be refused");
+            let text = err.to_string();
+            assert!(
+                text.contains(needle) && text.contains("not supported"),
+                "`{src}` must be refused by name, got: {text}"
+            );
+            // And NOT as the puzzle it used to be.
+            assert!(
+                !text.contains("expected Semicolon"),
+                "the old message leaked: {text}"
+            );
+        }
     }
 
     #[test]
@@ -1059,7 +1353,8 @@ mod tests {
             create_columns(&lower),
             vec![ColumnDef {
                 name: "author".to_string(),
-                ty: ColumnType::Text
+                ty: ColumnType::Text,
+                primary_key: false,
             }]
         );
     }
@@ -1072,7 +1367,8 @@ mod tests {
             create_columns(&stmt),
             vec![ColumnDef {
                 name: "vector".to_string(),
-                ty: ColumnType::Vector(768)
+                ty: ColumnType::Vector(768),
+                primary_key: false,
             }]
         );
     }
@@ -1232,19 +1528,23 @@ mod tests {
                 columns: vec![
                     ColumnDef {
                         name: "vector".to_string(),
-                        ty: ColumnType::Vector(768)
+                        ty: ColumnType::Vector(768),
+                        primary_key: false,
                     },
                     ColumnDef {
                         name: "author".to_string(),
-                        ty: ColumnType::Text
+                        ty: ColumnType::Text,
+                        primary_key: false,
                     },
                     ColumnDef {
                         name: "title".to_string(),
-                        ty: ColumnType::Text
+                        ty: ColumnType::Text,
+                        primary_key: false,
                     },
                     ColumnDef {
                         name: "published_at".to_string(),
-                        ty: ColumnType::Int
+                        ty: ColumnType::Int,
+                        primary_key: false,
                     },
                 ],
                 options: vec![CollectionOption {

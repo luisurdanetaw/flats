@@ -25,7 +25,7 @@
 // Every node derives Debug + Clone + PartialEq: the planner tests assert whole
 // plans with `assert_eq!`, so structural equality is load-bearing.
 
-use crate::sql::bind::{BoundPredicate, Projected, Schema, TypedValue};
+use crate::sql::bind::{BoundPredicate, ColumnRef, Projected, Schema, TypedValue};
 
 /// One resolved query plan — the relational-algebra root the compiler consumes.
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +41,10 @@ pub enum LogicalPlan {
     /// Rank a collection's rows by similarity to a query vector (leaf of a
     /// ranked read tree).
     Knn(Knn),
+    /// Retire every row a predicate admits, as one statement.
+    Delete(Delete),
+    /// Rewrite every row a predicate admits, as one statement.
+    Update(Update),
 }
 
 // NOTE: there is deliberately no `Filter` node. A `WHERE` predicate in V-SQL is
@@ -125,6 +129,44 @@ pub struct Insert {
     /// One [`TypedValue`] per schema column, in schema order (the binder
     /// already reordered and type-checked it; the planner does not touch it).
     pub row: Vec<TypedValue>,
+}
+
+/// Retire every row `predicate` admits — one statement, one durable record.
+///
+/// A LEAF with no row loop above or below it. The predicate is answered as one
+/// bitmap by the metadata index, and that bitmap IS the statement: it is logged
+/// whole as a single `Record::Mutate`. A per-row delete loop would be N records
+/// and N commit points, which is exactly the non-atomic shape the one-record
+/// design exists to prevent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Delete {
+    /// The collection deleted from (already confirmed to exist by the binder).
+    pub collection: String,
+    /// Its resolved schema — the predicate's ordinals are relative to it.
+    pub schema: Schema,
+    /// Which rows go. Not optional: V-SQL has no whole-collection DELETE.
+    pub predicate: BoundPredicate,
+}
+
+/// Rewrite every row `predicate` admits — one statement, one durable record.
+///
+/// A LEAF, like [`Delete`], and for the same reason: the predicate is one
+/// bitmap and the whole statement is one `Record::Mutate`. There is no row loop
+/// because the rewrite is copy-on-write in bulk — read the matched rows, write
+/// their edited copies at fresh ordinals, retire the originals — and that must
+/// land atomically or a row is lost or duplicated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Update {
+    /// The collection rewritten (already confirmed to exist by the binder).
+    pub collection: String,
+    /// Its resolved schema.
+    pub schema: Schema,
+    /// The scalar SET list in source order, resolved and type-checked.
+    pub assignments: Vec<(ColumnRef, TypedValue)>,
+    /// A replacement embedding, or `None` to copy the old row's across.
+    pub vector: Option<Vec<f32>>,
+    /// Which rows to rewrite. Not optional.
+    pub predicate: BoundPredicate,
 }
 
 /// Provision a new collection with a resolved schema.

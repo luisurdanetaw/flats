@@ -21,9 +21,10 @@
 //!
 
 use crate::sql::bind::{
-    BoundCreate, BoundInsert, BoundSearch, BoundSelect, BoundStatement, Projected,
+    BoundCreate, BoundDelete, BoundInsert, BoundSearch, BoundSelect, BoundStatement, BoundUpdate,
+    Projected,
 };
-use crate::sql::plan::{CreateCollection, Insert, Knn, LogicalPlan, Project, Scan};
+use crate::sql::plan::{CreateCollection, Delete, Insert, Knn, LogicalPlan, Project, Scan, Update};
 
 /// Build the [`LogicalPlan`] for an already-bound statement. Infallible: the
 /// binder validated everything, so this only reshapes statement-shaped IR into
@@ -34,8 +35,34 @@ pub fn plan(bound: BoundStatement) -> LogicalPlan {
         BoundStatement::Insert(i) => plan_insert(i),
         BoundStatement::CreateCollection(c) => plan_create(c),
         BoundStatement::Search(s) => plan_search(s),
-        // EXTEND: Delete/Update -> their own nodes.
+        BoundStatement::Delete(d) => plan_delete(d),
+        BoundStatement::Update(u) => plan_update(u),
     }
+}
+
+/// `BoundUpdate` → a single `Update` leaf. Same shape as `plan_delete`, and
+/// for the same reason: one bitmap, one record, no row loop.
+fn plan_update(bound: BoundUpdate) -> LogicalPlan {
+    LogicalPlan::Update(Update {
+        collection: bound.collection,
+        schema: bound.schema,
+        assignments: bound.assignments,
+        vector: bound.vector,
+        predicate: bound.filter,
+    })
+}
+
+/// `BoundDelete` → a single `Delete` leaf.
+///
+/// No `Scan` underneath: a scan exists to walk rows one at a time, and a DELETE
+/// never does — its predicate resolves to one bitmap that is logged whole. See
+/// [`Delete`].
+fn plan_delete(bound: BoundDelete) -> LogicalPlan {
+    LogicalPlan::Delete(Delete {
+        collection: bound.from,
+        schema: bound.schema,
+        predicate: bound.filter,
+    })
 }
 
 // Per-variant shape transforms. Each carries the binder's resolved fields
@@ -70,9 +97,9 @@ fn plan_select(bound: BoundSelect) -> LogicalPlan {
 /// and a full read differ only in their row source, so the compiler emits one
 /// loop for both and only the prologue that opens the cursor differs.
 ///
-/// `include_vector` is `false`: bare `SEARCH` returns the matched rows' stored
-/// columns, never the embedding — the same rule as `SELECT *`. `RETURNING` is
-/// what will let a caller ask for more.
+/// `include_vector` comes straight from the binder, which sets it only when
+/// `RETURNING` named the embedding: a bare `SEARCH` returns the matched rows'
+/// stored columns and nothing else, the same rule as `SELECT *`.
 fn plan_search(bound: BoundSearch) -> LogicalPlan {
     LogicalPlan::Project(Project {
         input: Box::new(LogicalPlan::Knn(Knn {
@@ -83,7 +110,7 @@ fn plan_search(bound: BoundSearch) -> LogicalPlan {
             predicate: bound.filter,
         })),
         columns: bound.projection,
-        include_vector: false,
+        include_vector: bound.include_vector,
     })
 }
 
@@ -109,13 +136,16 @@ fn plan_create(bound: BoundCreate) -> LogicalPlan {
 #[cfg(test)]
 mod tests {
     use super::plan;
-    use crate::sql::ast::{ColumnType, Literal};
+    use crate::sql::ast::{ColumnType, CompareOp, Literal};
     use crate::sql::bind::{
-        BoundCreate, BoundInsert, BoundSearch, BoundSelect, BoundStatement, Catalog, ColumnRef,
-        ColumnSchema, Projected, Schema, TypedValue, analyze,
+        BoundCreate, BoundDelete, BoundInsert, BoundPredicate, BoundSearch, BoundSelect,
+        BoundStatement, BoundUpdate, Catalog, ColumnRef, ColumnSchema, Projected, Schema,
+        TypedValue, analyze,
     };
     use crate::sql::parser::parse;
-    use crate::sql::plan::{CreateCollection, Insert, Knn, LogicalPlan, Project, Scan};
+    use crate::sql::plan::{
+        CreateCollection, Delete, Insert, Knn, LogicalPlan, Project, Scan, Update,
+    };
     use std::collections::HashMap;
 
     // -- resolved-value helpers (mirror the binder's docs fixture) ---------
@@ -126,6 +156,18 @@ mod tests {
             ty,
             ordinal,
             is_vector,
+            primary_key: false,
+        }
+    }
+
+    /// The same, for the column a fixture declares `PRIMARY KEY`.
+    fn col_key(name: &str, ty: ColumnType, ordinal: usize) -> ColumnSchema {
+        ColumnSchema {
+            name: name.to_string(),
+            ty,
+            ordinal,
+            is_vector: false,
+            primary_key: true,
         }
     }
 
@@ -135,7 +177,7 @@ mod tests {
         Schema {
             columns: vec![
                 col("vector", ColumnType::Vector(768), 0, true),
-                col("author", ColumnType::Text, 1, false),
+                col_key("author", ColumnType::Text, 1),
                 col("title", ColumnType::Text, 2, false),
                 col("published_at", ColumnType::Int, 3, false),
             ],
@@ -226,6 +268,70 @@ mod tests {
     // -- unit: plan(bound) shape transform (Bound* built directly) ---------
 
     #[test]
+    fn plans_update_as_a_single_leaf() {
+        let filter = BoundPredicate::Compare {
+            column: colref("published_at", 3),
+            op: CompareOp::Lt,
+            value: TypedValue {
+                value: Literal::Int(5),
+                ty: ColumnType::Int,
+            },
+        };
+        let assignments = vec![(
+            colref("author", 1),
+            TypedValue {
+                value: Literal::Str("bob".to_string()),
+                ty: ColumnType::Text,
+            },
+        )];
+        let bound = BoundStatement::Update(BoundUpdate {
+            collection: "docs".to_string(),
+            schema: docs_schema(),
+            assignments: assignments.clone(),
+            vector: None,
+            filter: filter.clone(),
+        });
+        assert_eq!(
+            plan(bound),
+            LogicalPlan::Update(Update {
+                collection: "docs".to_string(),
+                schema: docs_schema(),
+                assignments,
+                vector: None,
+                predicate: filter,
+            })
+        );
+    }
+
+    /// A DELETE is ONE leaf — no `Scan`, no row loop. Its predicate resolves to
+    /// a single bitmap that is logged whole, so there is never a per-row step
+    /// for a loop to drive.
+    #[test]
+    fn plans_delete_as_a_single_leaf() {
+        let filter = BoundPredicate::Compare {
+            column: colref("author", 1),
+            op: CompareOp::Eq,
+            value: TypedValue {
+                value: Literal::Str("alice".to_string()),
+                ty: ColumnType::Text,
+            },
+        };
+        let bound = BoundStatement::Delete(BoundDelete {
+            from: "docs".to_string(),
+            schema: docs_schema(),
+            filter: filter.clone(),
+        });
+        assert_eq!(
+            plan(bound),
+            LogicalPlan::Delete(Delete {
+                collection: "docs".to_string(),
+                schema: docs_schema(),
+                predicate: filter,
+            })
+        );
+    }
+
+    #[test]
     fn plans_select_projection_over_scan() {
         let bound = BoundStatement::Select(BoundSelect {
             from: "docs".to_string(),
@@ -291,6 +397,7 @@ mod tests {
             k: 5,
             query: vec![0.5; 768],
             projection: stored(vec![colref("author", 1), colref("title", 2)]),
+            include_vector: false,
             filter: None,
         });
         assert_eq!(
@@ -328,6 +435,7 @@ mod tests {
                 k,
                 query: query.clone(),
                 projection: stored(vec![colref("author", 1)]),
+                include_vector: false,
                 filter: None,
             });
             match plan(bound) {
@@ -468,7 +576,7 @@ mod tests {
         let cat = TestCatalog::new();
         let src = "CREATE COLLECTION docs (
             vector VECTOR(768),
-            author TEXT,
+            author TEXT PRIMARY KEY,
             title TEXT,
             published_at INT
         ) WITH (capacity = 1000000);";

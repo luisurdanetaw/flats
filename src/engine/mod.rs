@@ -59,11 +59,19 @@ use crate::error::{Error, Result};
 use crate::index::index::{FlatIndex, Ordinal, Reader, SearchResult, Writer};
 use roaring::RoaringBitmap;
 
-use crate::metadata::common::{Row, Schema};
+use crate::metadata::common::{ColumnId, Row, Schema, Value};
 use crate::metadata::index::MetadataIndex;
 use crate::metadata::tuples::TupleStore;
 use crate::metadata::{crc32, index as meta, tuples, write_snapshot_atomic};
-use crate::wal::wal::{Apply, Lsn, Record, Wal, WalHandle};
+use crate::wal::wal::{Apply, Bitmap, Install, Lsn, Outcome, Record, RejectReason, Wal, WalHandle};
+
+/// Ceiling on the installed payload of one `Record::Mutate`, in bytes.
+///
+/// One statement is one record, so the whole thing has to fit in memory on the
+/// commit thread and on every future replay. 256 MiB is far above any
+/// reasonable predicate-scoped UPDATE and far below anything that threatens a
+/// small deployment's memory. See `Error::StatementTooLarge`.
+pub const MAX_INSTALL_BYTES: usize = 256 * 1024 * 1024;
 
 /// Re-exported from `metadata::common` (it moved there in Phase 6 so
 /// `Record::CreateCollection` can carry it — the WAL may only depend on plain
@@ -125,6 +133,55 @@ struct Collection {
 }
 
 impl Collection {
+    /// Raise the allocator's high-water mark to `at_least`, so ordinals a
+    /// statement placed itself are never handed out again.
+    ///
+    /// `Db::mutate` installs rows at ordinals chosen on the logging side rather
+    /// than drawn from `alloc_ordinal`, so without this the next `insert` would
+    /// allocate straight over a freshly installed row. Monotonic and racy-safe:
+    /// a concurrent `alloc_ordinal` either loses the CAS and retries above the
+    /// new mark, or wins and is already above it.
+    fn reserve_through(&self, at_least: u64) {
+        let mut cur = self.next_ordinal.load(Ordering::Acquire);
+        while cur < at_least {
+            match self.next_ordinal.compare_exchange_weak(
+                cur,
+                at_least,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Reserve `count` CONSECUTIVE ordinals, or fail if they would not fit.
+    ///
+    /// One CAS for the whole run, which is what makes an UPDATE's capacity
+    /// check meaningful: a per-row loop could pass its check, allocate half
+    /// the rows, and then fail — leaving a statement that must be abandoned
+    /// with ordinals already burned. Either the whole run is reserved or
+    /// nothing is, and the check happens before the record is built at all.
+    fn alloc_ordinals(&self, count: u64) -> Result<u64> {
+        loop {
+            let cur = self.next_ordinal.load(Ordering::Acquire);
+            let end = cur
+                .checked_add(count)
+                .filter(|end| *end <= self.config.capacity as u64)
+                .ok_or(Error::CapacityExceeded {
+                    capacity: self.config.capacity,
+                })?;
+            if self
+                .next_ordinal
+                .compare_exchange_weak(cur, end, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(cur);
+            }
+        }
+    }
+
     /// Reserve the next ordinal, or fail if the collection is at capacity.
     /// CAS loop so a full collection never overshoots the high-water mark.
     fn alloc_ordinal(&self) -> Result<u64> {
@@ -292,7 +349,7 @@ impl Apply for IndexApplier {
     /// consult must already hold it by then. Inserts publish liveness last,
     /// deletes publish it first. Do not reorder — `concurrent_stores.rs`
     /// asserts the resulting property directly.
-    fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<()> {
+    fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<Outcome> {
         match record {
             Record::Insert {
                 collection,
@@ -300,6 +357,36 @@ impl Apply for IndexApplier {
                 vector,
                 metadata,
             } => {
+                // THE UNIQUENESS DECISION, and it has to be made here.
+                //
+                // The caller already checked, but a check on a caller's thread
+                // settles nothing: two of them can read "absent" and both
+                // append. This thread is the only serialization point in the
+                // system, so this is the only place where "no live row holds
+                // this key" is still true by the time the row goes in.
+                //
+                // A refusal is NOT an error. Returning `Err` here would poison
+                // the log (an apply failure means the index could not absorb a
+                // committed record), and a repeated key is an ordinary caller
+                // mistake, not a broken database. It is also not a conflict:
+                // every replay of this frame reaches the same verdict, because
+                // the winner's row is live by then — which is exactly the
+                // determinism replay needs.
+                if let Some(reason) = self.duplicate_key(*collection, metadata)? {
+                    // The watermarks still advance, for the same reason a
+                    // conflicted Mutate's do: a refused record IS fully
+                    // reflected (it changed nothing), and the verdict is
+                    // deterministic, so replay reaches it again and refuses it
+                    // again. Stalling them here would wedge truncation behind
+                    // a frame that will never do anything — one duplicate key
+                    // would stop the log from ever shedding bytes.
+                    let w = self.writers(*collection)?;
+                    w.flat.advance_applied_lsn(lsn.0);
+                    w.meta.advance_applied_lsn(lsn);
+                    w.tuple.advance_applied_lsn(lsn);
+                    self.last_applied = self.last_applied.max(lsn.0);
+                    return Ok(Outcome::Rejected(reason));
+                }
                 let w = self.writers(*collection)?;
                 let ord32 = ordinal32(*ordinal)?;
                 // DATA FIRST, LIVENESS LAST. `meta.insert_row` is what makes
@@ -336,11 +423,63 @@ impl Apply for IndexApplier {
             Record::CreateCollection { config } => {
                 self.apply_create(lsn, config)?;
             }
+            Record::Mutate {
+                collection,
+                retire,
+                install,
+            } => {
+                let w = self.writers(*collection)?;
+                let rows: Vec<(Ordinal, &Row)> = install
+                    .iter()
+                    .map(|r| ordinal32(r.ordinal).map(|o| (o, &r.metadata)))
+                    .collect::<io::Result<_>>()?;
+
+                // STALENESS, checked before anything is written. A statement
+                // built from rows that have since been retired by someone else
+                // must not land, or one row becomes two — see
+                // `Writer::is_stale`. Deliberately NOT an error: the record is
+                // durable and the database is healthy, so halting on it (see
+                // `wal::Poison`) would be wrong. The waiter is told, and
+                // retries.
+                let installed: Vec<Ordinal> = rows.iter().map(|(o, _)| *o).collect();
+                if w.meta.is_stale(&retire.0, &installed) {
+                    // The watermarks still advance: a skipped record IS fully
+                    // reflected (it changed nothing), and the verdict is
+                    // deterministic, so replay reaches it again and skips it
+                    // again. Stalling them here would wedge truncation behind
+                    // a record that will never do anything.
+                    w.flat.advance_applied_lsn(lsn.0);
+                    w.meta.advance_applied_lsn(lsn);
+                    w.tuple.advance_applied_lsn(lsn);
+                    self.last_applied = self.last_applied.max(lsn.0);
+                    return Ok(Outcome::Conflicted);
+                }
+
+                // DATA FIRST, LIVENESS LAST — the same rule as `Insert`, but
+                // now spanning a whole statement. Every installed row must be
+                // readable in both stores before anything publishes it, or a
+                // snapshot could admit a row the tuple store has never seen.
+                for row in install {
+                    let ord32 = ordinal32(row.ordinal)?;
+                    w.flat.write_at(row.ordinal, &row.vector).map_err(to_io)?;
+                    w.tuple.write_row(ord32, &row.metadata).map_err(to_io)?;
+                }
+                // ONE publish for the whole statement. `apply_mutation` holds
+                // the metadata lock across every retire and install precisely
+                // so no reader can materialize a snapshot mid-statement — see
+                // its doc. A loop of insert_row/remove_row here would be
+                // correct on disk and wrong in memory.
+                w.meta.apply_mutation(&retire.0, &rows).map_err(to_io)?;
+                w.live.bump();
+                w.flat.advance_applied_lsn(lsn.0);
+                w.meta.advance_applied_lsn(lsn);
+                w.tuple.advance_applied_lsn(lsn);
+            }
         }
         // The catalog watermark advances only on success — a `?` above skips
         // this, so a failed record can never be claimed as reflected.
         self.last_applied = self.last_applied.max(lsn.0);
-        Ok(())
+        Ok(Outcome::Applied)
     }
 
     /// Checkpoint every store of every collection, returning the WAL
@@ -396,6 +535,38 @@ impl Apply for IndexApplier {
 }
 
 impl IndexApplier {
+    /// `Some(DuplicateKey)` when `row`'s primary key is already held by a live
+    /// row of `collection`; `None` when the collection declares no key, or the
+    /// key is free.
+    ///
+    /// Reads the key column off the REGISTERED schema rather than the record,
+    /// so a frame cannot nominate its own key column.
+    fn duplicate_key(&mut self, collection: u32, row: &Row) -> io::Result<Option<RejectReason>> {
+        let Some(key) = self
+            .registry
+            .iter()
+            .find(|c| c.id == collection)
+            .and_then(|c| c.schema.primary_key)
+        else {
+            return Ok(None);
+        };
+        let Some(value) = row
+            .iter()
+            .find(|(id, _)| *id == key)
+            .map(|(_, v)| v.clone())
+        else {
+            // Every column is present by the time a record is logged
+            // (`validate_row`), so a missing key column would be a
+            // contradiction rather than a caller error.
+            return Ok(None);
+        };
+        let w = self.writers(collection)?;
+        if w.meta.is_key_taken(key, &value).map_err(to_io)? {
+            return Ok(Some(RejectReason::DuplicateKey));
+        }
+        Ok(None)
+    }
+
     fn writers(&mut self, id: u32) -> io::Result<&mut CollectionWriters> {
         self.writers.get_mut(&id).ok_or_else(|| {
             io::Error::new(
@@ -555,7 +726,7 @@ impl Flusher {
 // make the operator decide.
 
 const CATALOG_MAGIC: &[u8; 4] = b"CAT0";
-const CATALOG_VERSION: u32 = 2;
+const CATALOG_VERSION: u32 = 3;
 const CATALOG_FILE: &str = "catalog.snap";
 const CATALOG_TMP: &str = "catalog.snap.tmp";
 
@@ -789,18 +960,59 @@ impl Db {
             });
         }
         coll.config.schema.validate_row(&row)?;
+        // A key some live row already holds is refused HERE, before the frame
+        // is written, so the common case costs the caller nothing and the
+        // error can name the column and the value.
+        //
+        // This check alone is NOT the guarantee: two callers can both read
+        // "absent" and both append. The authoritative check runs at apply
+        // time, on the single commit thread, where the answer cannot change
+        // underneath it — see the `Record::Insert` arm. This one exists for
+        // the diagnostic, not the invariant.
+        if let Some(key) = coll.config.schema.primary_key {
+            self.check_duplicate_key(&coll, key, &row)?;
+        }
         // Refuse before allocating: a halted log is going to reject this
         // append anyway, and burning an ordinal for a write that never reaches
         // the file costs the collection a slot of its capacity for nothing.
         self.check_poison()?;
         let ordinal = coll.alloc_ordinal()?;
+        // The row is moved into the record below, so capture the two strings
+        // an error would need WHILE the row is still here. A collection with
+        // no key cannot be refused, hence the `Option`.
+        let key_described = coll.config.schema.primary_key.map(|key| {
+            let value = row
+                .iter()
+                .find(|(id, _)| *id == key)
+                .map(|(_, v)| render_key(v))
+                // `validate_row` above proved every column is present, so this
+                // is unreachable; described rather than unwrapped, because
+                // library code does not panic on an invariant it can state.
+                .unwrap_or_else(|| "<missing>".to_string());
+            (Self::key_name(&coll.config.schema, key), value)
+        });
         match self.wal_handle()?.append(Record::Insert {
             collection,
             ordinal,
             vector: vector.to_vec(),
             metadata: row,
         }) {
-            Ok(_lsn) => Ok(Ordinal(ordinal as u32)),
+            // REFUSED on the commit thread: the frame is durable but the row
+            // was not folded in, because a live row already holds this key.
+            // The pre-WAL check above missed it, which is exactly the race it
+            // cannot see — so the error is reported from here instead.
+            //
+            // An insert has exactly one way to be refused, so the reason needs
+            // no inspection; a keyless collection has no way at all, which is
+            // why the `None` arm cannot be reached from a rejection.
+            Ok(committed) if !committed.applied() => match key_described {
+                Some((column, value)) => Err(Error::DuplicateKey { column, value }),
+                None => Err(Error::DuplicateKey {
+                    column: "<none>".to_string(),
+                    value: "<none>".to_string(),
+                }),
+            },
+            Ok(_committed) => Ok(Ordinal(ordinal as u32)),
             Err(e) => {
                 // Two different failures arrive here and the caller must not
                 // conflate them:
@@ -852,6 +1064,218 @@ impl Db {
             })
             .map_err(|e| self.wal_err(e))?;
         Ok(())
+    }
+
+    /// Apply ONE statement — retire a set of ordinals, install a set of rows —
+    /// as a single durable record. Blocks until durable.
+    ///
+    /// This is the primitive `DELETE` and `UPDATE` compile to. A `DELETE`
+    /// installs nothing; an `UPDATE` is copy-on-write, retiring the old
+    /// ordinals and installing their replacements at fresh ones. Both are
+    /// all-or-nothing because both are one frame, one CRC, one fsync.
+    ///
+    /// Retiring an ordinal that is not live is a silent no-op (as for
+    /// `delete`), which is what keeps replay idempotent. A statement that
+    /// retires nothing and installs nothing succeeds without logging: a
+    /// predicate matching zero rows is a successful no-op, not an error.
+    ///
+    /// Everything that can be checked is checked BEFORE logging — dim, rows,
+    /// capacity, and the payload cap — because a record that cannot apply must
+    /// never reach the durable WAL, or it would fail apply forever on every
+    /// replay and (since Phase 7) halt the database each time.
+    pub fn mutate(
+        &self,
+        collection: u32,
+        mut retire: RoaringBitmap,
+        install: Vec<Install>,
+    ) -> Result<Outcome> {
+        let coll = self.collection(collection)?;
+        if retire.is_empty() && install.is_empty() {
+            return Ok(Outcome::Applied);
+        }
+        // Collapse contiguous runs into run containers before the bitmap is
+        // encoded. A bulk DELETE retires long runs, and this is the difference
+        // between ~16 KiB and a few dozen bytes per 100k rows in the frame. We
+        // own the bitmap here, so it costs no copy.
+        retire.optimize();
+        self.check_poison()?;
+
+        let dim = coll.config.schema.vector().dim.get();
+        for row in &install {
+            if row.vector.len() != dim {
+                return Err(Error::DimensionMismatch {
+                    expected: dim,
+                    got: row.vector.len(),
+                });
+            }
+            coll.config.schema.validate_row(&row.metadata)?;
+            if row.ordinal >= coll.config.capacity as u64 {
+                return Err(Error::CapacityExceeded {
+                    capacity: coll.config.capacity,
+                });
+            }
+        }
+
+        // Measured on the installs alone: the retire bitmap is compressed and
+        // bounded by the collection, while installs carry the vectors that
+        // actually make a statement big.
+        let bytes = bincode::serialized_size(&install)
+            .map_err(|e| Error::Io(io::Error::new(io::ErrorKind::InvalidData, e.to_string())))?
+            as usize;
+        if bytes > MAX_INSTALL_BYTES {
+            return Err(Error::StatementTooLarge {
+                bytes,
+                cap: MAX_INSTALL_BYTES,
+            });
+        }
+
+        // Claim the installed ordinals BEFORE logging: a concurrent `insert`
+        // must not be able to allocate one of them in the window between the
+        // append and the reservation. Like `insert`, a failed append leaves the
+        // reservation burned — the ordinals are simply never reused.
+        if let Some(highest) = install.iter().map(|r| r.ordinal).max() {
+            coll.reserve_through(highest + 1);
+        }
+
+        let committed = self
+            .wal_handle()?
+            .append(Record::Mutate {
+                collection,
+                retire: Bitmap(retire),
+                install,
+            })
+            .map_err(|e| self.wal_err(e))?;
+        // `Conflicted` is a normal return, not an error: the record committed,
+        // the commit thread judged it stale, and the caller's move is to read
+        // the rows again and retry. Ordinals reserved above stay burned.
+        Ok(committed.outcome)
+    }
+
+    /// Rewrite every row in `matched`, copy-on-write: read each row, apply the
+    /// `set` overrides to a copy at a FRESH ordinal, and retire the original —
+    /// all as one `Record::Mutate`, so the statement lands whole or not at all.
+    ///
+    /// `vector` REPLACES each copy's embedding; `None` copies the old row's
+    /// across untouched. The binder only allows a replacement when the
+    /// statement names one row by ordinal, so in practice `Some` arrives with
+    /// exactly one matched row. `set` is storage-level (`ColumnId`), already
+    /// resolved and type-checked by the binder, and is applied in order so a
+    /// column named twice takes its last value.
+    ///
+    /// Returns `Outcome::Conflicted` when the rows moved on between the read
+    /// and the commit — the caller re-resolves its predicate and tries again.
+    pub fn update_rows(
+        &self,
+        collection: u32,
+        matched: &RoaringBitmap,
+        set: &[(ColumnId, Value)],
+        vector: Option<&[f32]>,
+    ) -> Result<Outcome> {
+        let coll = self.collection(collection)?;
+        // A predicate matching no rows is a successful no-op, like a DELETE's:
+        // nothing to copy, nothing to log, no fsync spent.
+        if matched.is_empty() {
+            return Ok(Outcome::Applied);
+        }
+        self.check_poison()?;
+
+        // Checked before anything is read or logged, exactly as `insert` does.
+        // The binder already enforces it, so reaching this means a caller built
+        // the statement by hand — a record that cannot apply must still never
+        // reach the WAL.
+        let dim = coll.config.schema.vector().dim.get();
+        if let Some(vector) = vector
+            && vector.len() != dim
+        {
+            return Err(Error::DimensionMismatch {
+                expected: dim,
+                got: vector.len(),
+            });
+        }
+
+        let tuples = self
+            .tuple_reader(collection)
+            .ok_or(Error::UnknownCollection { id: collection })?;
+        let vectors = self
+            .reader(collection)
+            .ok_or(Error::UnknownCollection { id: collection })?;
+        // Every scalar column: an UPDATE rewrites the WHOLE row, so the copy
+        // must carry the columns it does not change as well as the ones it does.
+        let scalars: Vec<ColumnId> = (0..coll.config.schema.columns.len() as ColumnId).collect();
+
+        // A replacement embedding may reach EXACTLY ONE row. The binder has
+        // already insisted the predicate be equality on the primary key, which
+        // the applier keeps unique — so more than one match means those two
+        // guarantees disagree, and silently handing one vector to several rows
+        // is the specific mistake the key exists to prevent. Checked here
+        // because only the engine sees how many rows actually matched.
+        if vector.is_some() && matched.len() > 1 {
+            return Err(Error::KeyMatchedManyRows {
+                matched: matched.len(),
+            });
+        }
+
+        // 1. READ the matched rows and build their edited copies. Nothing is
+        //    logged yet, and no ordinal is claimed — a failure here costs
+        //    nothing but the work.
+        let mut copies: Vec<(Vec<f32>, Row)> = Vec::with_capacity(matched.len() as usize);
+        for ordinal in matched {
+            let ordinal = Ordinal(ordinal);
+            let values = match tuples.get(ordinal, &scalars)? {
+                tuples::RowGet::Live(values) => values,
+                // The caller's bitmap came from a liveness snapshot, so an
+                // ordinal in it that the tuple store never saw means those two
+                // disagree — the same consistency failure `SnapshotRowMissing`
+                // exists to catch, not something to skip past.
+                tuples::RowGet::Missing => {
+                    return Err(Error::SnapshotRowMissing {
+                        collection,
+                        ordinal: ordinal.0,
+                    });
+                }
+            };
+            // The statement's embedding replaces the old one when it carries
+            // one; otherwise the row's own vector rides along unchanged.
+            let vector = match vector {
+                Some(replacement) => replacement.to_vec(),
+                None => vectors
+                    .vector_at(ordinal)
+                    .ok_or(Error::SnapshotRowMissing {
+                        collection,
+                        ordinal: ordinal.0,
+                    })?
+                    .to_vec(),
+            };
+
+            let mut row: Row = values
+                .into_iter()
+                .enumerate()
+                .map(|(id, value)| (id as ColumnId, value))
+                .collect();
+            // Overrides in order: a column assigned twice takes its last value.
+            for (column, value) in set {
+                row[*column as usize] = (*column, value.clone());
+            }
+            copies.push((vector, row));
+        }
+
+        // 2. CLAIM the ordinals for the copies — one reservation, capacity
+        //    checked, before any record exists.
+        let start = coll.alloc_ordinals(copies.len() as u64)?;
+        let install: Vec<Install> = copies
+            .into_iter()
+            .enumerate()
+            .map(|(i, (vector, metadata))| Install {
+                ordinal: start + i as u64,
+                vector,
+                metadata,
+            })
+            .collect();
+
+        // 3. ONE record: retire the originals, install the copies. If the rows
+        //    moved on while we were reading them, the commit thread says so and
+        //    the caller retries — see `Outcome`.
+        self.mutate(collection, matched.clone(), install)
     }
 
     /// Brute-force top-`k` search within `collection`. Tombstoned vectors are
@@ -912,13 +1336,11 @@ impl Db {
         // `Schema::from_columns`. Re-check in case the caller hand-assembled one
         // and bypassed the constructor.
         schema.validate()?;
-        // `id` is the ordinal pseudo-column SEARCH returns — a stored column
-        // by that name would collide with it in RETURNING.
-        for col in &schema.columns {
-            if col.name.eq_ignore_ascii_case("id") {
-                return Err(Error::ReservedColumn(col.name.clone()));
-            }
-        }
+        // `id` used to be reserved here, because it named the ordinal
+        // pseudo-column SEARCH returned. That pseudo-column is gone — identity
+        // is a declared PRIMARY KEY now — so `id` is an ordinary name, and in
+        // fact the conventional one for a key. Reserving it would forbid the
+        // most natural schema a caller can write.
         let snapshot = catalog_snapshot(&self.catalog);
         if snapshot.values().any(|c| c.config.name == name) {
             return Err(Error::CollectionExists { name: name.into() });
@@ -1043,6 +1465,9 @@ impl Db {
             collection,
             ordinals,
             coll.tuple.clone(),
+            // The flat reader rides along so the row's embedding is reachable
+            // without the `Db` — see `Cursor::vector`.
+            coll.reader.clone(),
             columns,
         ))
     }
@@ -1122,6 +1547,39 @@ impl Db {
         Ok(())
     }
 
+    /// The key column's declared name, for an error message. Falls back to the
+    /// `ColumnId` only if the schema and the key disagree, which construction
+    /// rules out.
+    fn key_name(schema: &Schema, key: ColumnId) -> String {
+        schema
+            .columns
+            .iter()
+            .find(|c| c.id == key)
+            .map_or_else(|| format!("#{key}"), |c| c.name.clone())
+    }
+
+    /// Refuse a row whose primary key a LIVE row already holds.
+    ///
+    /// One equality lookup against the metadata index, masked by the current
+    /// liveness snapshot — so a key freed by a DELETE is available again,
+    /// which is the behaviour a caller expects after removing a row.
+    fn check_duplicate_key(&self, coll: &Collection, key: ColumnId, row: &Row) -> Result<()> {
+        let Some(value) = row.iter().find(|(id, _)| *id == key).map(|(_, v)| v) else {
+            // `validate_row` already insisted every column is present, so a
+            // missing key column would be a contradiction rather than a
+            // caller error.
+            return Ok(());
+        };
+        let live = coll.live.resolve();
+        if !coll.meta.lookup_eq(key, value, &live)?.is_empty() {
+            return Err(Error::DuplicateKey {
+                column: Self::key_name(&coll.config.schema, key),
+                value: render_key(value),
+            });
+        }
+        Ok(())
+    }
+
     fn collection(&self, id: u32) -> Result<Arc<Collection>> {
         catalog_snapshot(&self.catalog)
             .get(&id)
@@ -1191,6 +1649,18 @@ impl Drop for Db {
     }
 }
 
+/// A key value as it should read back to the person who typed it — `'alice'`,
+/// not `Text("alice")`. Only for error messages.
+fn render_key(value: &Value) -> String {
+    match value {
+        Value::Text(s) => format!("'{s}'"),
+        Value::Int(n) => n.to_string(),
+        // A FLOAT key is refused at declaration, so this is unreachable from a
+        // declared key; rendered anyway rather than panicking in an error path.
+        Value::Float(f) => f.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Query frontend integration: the binder's catalog read path
 // ---------------------------------------------------------------------------
@@ -1212,6 +1682,8 @@ pub(crate) fn bind_schema(schema: &Schema) -> crate::sql::bind::Schema {
         ty: AstType::Vector(v.dim.get()),
         ordinal: v.ordinal.get(),
         is_vector: true,
+        // The embedding can never be the key — `from_columns` refuses it.
+        primary_key: false,
     });
     for def in &schema.columns {
         columns.push(ColumnSchema {
@@ -1223,6 +1695,9 @@ pub(crate) fn bind_schema(schema: &Schema) -> crate::sql::bind::Schema {
             },
             ordinal: def.ordinal.get(),
             is_vector: false,
+            // Read off the PERSISTED schema, so a reopened collection keys on
+            // the column it was created with rather than on a name convention.
+            primary_key: schema.primary_key == Some(def.id),
         });
     }
     // Declaration order — the binder indexes projections by these ordinals.
@@ -1443,6 +1918,966 @@ mod tests {
             Err(Error::Poisoned { .. }) => {}
             other => panic!("expected Poisoned, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Record::Mutate — one statement, one record
+    // -----------------------------------------------------------------------
+
+    fn install(ordinal: u64, x: f32) -> Install {
+        Install {
+            ordinal,
+            vector: vec![x, 0.0],
+            metadata: vec![],
+        }
+    }
+
+    /// An installed ordinal is OCCUPIED. The allocator hands out the next
+    /// free one, so a statement that places a row without telling it would let
+    /// the very next `insert` allocate the same ordinal and overwrite the row
+    /// it just installed — silently, and only until the next reopen reseeds
+    /// the allocator from the flat index's high-water mark.
+    #[test]
+    fn installing_a_row_reserves_its_ordinal_against_the_allocator() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        assert_eq!(db.insert(0, &[1.0, 0.0], vec![]).unwrap(), Ordinal(0));
+
+        // Install past the allocator's high-water mark, leaving a gap.
+        db.mutate(0, RoaringBitmap::new(), vec![install(4, 7.0)])
+            .unwrap();
+
+        assert_eq!(
+            db.insert(0, &[3.0, 0.0], vec![]).unwrap(),
+            Ordinal(5),
+            "the allocator must resume above every installed ordinal"
+        );
+        // And the installed row is still intact, not overwritten.
+        let hits = db.search(0, &[7.0, 0.0], 8).unwrap();
+        assert!(hits.iter().any(|h| h.id == Ordinal(4)));
+    }
+
+    #[test]
+    fn mutate_end_to_end_then_reopen_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfgs = [cfg(0, 2, 64)];
+
+        {
+            let db = Db::open(dir.path(), &cfgs, manual_opts()).unwrap();
+            db.insert(0, &[1.0, 0.0], vec![]).unwrap();
+            db.insert(0, &[2.0, 0.0], vec![]).unwrap();
+
+            // The UPDATE shape: retire ordinal 0, install its copy-on-write
+            // replacement at a fresh ordinal. One record, one fsync.
+            let retire: RoaringBitmap = [0u32].into_iter().collect();
+            db.mutate(0, retire, vec![install(2, 9.0)]).unwrap();
+
+            let hits = db.search(0, &[9.0, 0.0], 8).unwrap();
+            assert_eq!(hits.len(), 2, "one retired, one installed => count holds");
+            assert!(
+                hits.iter().any(|h| h.id == Ordinal(2)),
+                "the installed row is searchable"
+            );
+            assert!(
+                !hits.iter().any(|h| h.id == Ordinal(0)),
+                "the retired row is gone"
+            );
+            db.close().unwrap();
+        }
+
+        // The whole statement must come back from the log as one unit.
+        let db = Db::open(dir.path(), &cfgs, manual_opts()).unwrap();
+        let hits = db.search(0, &[9.0, 0.0], 8).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|h| h.id == Ordinal(2)));
+        assert!(!hits.iter().any(|h| h.id == Ordinal(0)));
+    }
+
+    /// The fan-out rule from `Insert`, extended to a statement: any ordinal the
+    /// liveness snapshot admits must ALREADY be readable in the tuple store and
+    /// the flat index. A snapshot is immutable, so a reader that catches an
+    /// installed ordinal before its data landed stays wrong for its whole life.
+    #[test]
+    fn mutate_writes_data_before_publishing_liveness() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap();
+
+        let retire: RoaringBitmap = [0u32].into_iter().collect();
+        db.mutate(0, retire, vec![install(1, 5.0), install(2, 6.0)])
+            .unwrap();
+
+        let snap = db.live_snapshot(0).expect("collection is open");
+        let reader = db.reader(0).expect("collection is open");
+        for ordinal in snap.iter() {
+            assert!(
+                reader.vector_at(Ordinal(ordinal)).is_some(),
+                "ordinal {ordinal} is live but has no vector"
+            );
+        }
+        assert_eq!(snap.iter().collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    /// A statement matching nothing is a successful no-op, not an error and not
+    /// a log record. `DELETE FROM docs WHERE <matches nothing>` must succeed,
+    /// and burning an fsync on a record that changes nothing is pure cost.
+    #[test]
+    fn empty_mutate_is_a_no_op_and_logs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap();
+
+        let before = std::fs::metadata(dir.path().join("wal.log")).unwrap().len();
+        db.mutate(0, RoaringBitmap::new(), vec![])
+            .expect("an empty statement succeeds");
+        assert_eq!(
+            std::fs::metadata(dir.path().join("wal.log")).unwrap().len(),
+            before,
+            "an empty statement must not reach the log"
+        );
+    }
+
+    /// A keyed collection: (k INT PRIMARY KEY) alongside the vector.
+    fn cfg_keyed(id: u32, dim: usize, capacity: usize) -> CollectionConfig {
+        CollectionConfig {
+            id,
+            name: format!("k{id}"),
+            capacity,
+            schema: Schema::from_columns(vec![
+                ColumnSpec::Vector {
+                    name: "vector".into(),
+                    dim: NonZeroUsize::new(dim).unwrap(),
+                },
+                ColumnSpec::Key {
+                    name: "k".into(),
+                    ty: ColumnType::Int,
+                },
+            ])
+            .unwrap(),
+        }
+    }
+
+    /// Log a duplicate-key insert the way a LOST RACE does: straight to the
+    /// WAL handle, past `Db::insert`'s pre-WAL lookup.
+    ///
+    /// That lookup is what makes the refusal unreachable through the public
+    /// API single-threaded — which is the point of it — so a deterministic
+    /// test of the apply-time verdict has to go around it, exactly as a second
+    /// thread does by reading "absent" before the winner commits.
+    fn log_duplicate(db: &Db, collection: u32, ordinal: u64, key: i64) -> Outcome {
+        db.wal
+            .as_ref()
+            .expect("wal present")
+            .handle()
+            .append(Record::Insert {
+                collection,
+                ordinal,
+                vector: vec![0.0, 1.0],
+                metadata: vec![(0, Value::Int(key))],
+            })
+            .expect("a refusal is success, not an error")
+            .outcome
+    }
+
+    /// A REFUSED record is durable and will never do anything, so the
+    /// watermarks must advance past it exactly as they do past a conflicted
+    /// one. Otherwise one duplicate key wedges truncation forever: the log can
+    /// never shed the refused frame, and every reopen replays it again.
+    #[test]
+    fn a_refused_insert_does_not_wedge_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_keyed(0, 2, 64)], manual_opts()).unwrap();
+
+        db.insert(0, &[1.0, 0.0], vec![(0, Value::Int(1))]).unwrap();
+        // Same key, logged past the pre-WAL check: durable, and refused on the
+        // commit thread. Deliberately the LAST record — a later applied one
+        // would advance the high-water mark past it and hide the stall.
+        assert_eq!(
+            log_duplicate(&db, 0, 1, 1),
+            Outcome::Rejected(RejectReason::DuplicateKey)
+        );
+
+        db.checkpoint().expect("checkpoint runs");
+        let after = std::fs::metadata(dir.path().join("wal.log")).unwrap().len();
+        assert_eq!(
+            after, 8,
+            // A fully truncated log is just its magic+version header.
+            "truncation must get past the refused frame, not stall on it"
+        );
+        db.close().unwrap();
+    }
+
+    /// And the verdict survives a reopen: the refused frame is replayed, and
+    /// must be refused AGAIN rather than installing a second row with the same
+    /// key. Determinism is what makes a refusal safe to reach on the apply
+    /// path at all.
+    #[test]
+    fn a_refusal_is_reached_again_on_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Db::open(dir.path(), &[cfg_keyed(0, 2, 64)], manual_opts()).unwrap();
+            db.insert(0, &[1.0, 0.0], vec![(0, Value::Int(1))]).unwrap();
+            assert_eq!(
+                log_duplicate(&db, 0, 1, 1),
+                Outcome::Rejected(RejectReason::DuplicateKey)
+            );
+            // No checkpoint and no close: both frames stay in the log, so
+            // reopening replays them.
+            drop(db);
+        }
+
+        let db = Db::open(dir.path(), &[cfg_keyed(0, 2, 64)], manual_opts()).unwrap();
+        assert!(
+            !db.is_poisoned(),
+            "replaying a refusal must not halt the db"
+        );
+        let live = db.live_snapshot(0).expect("collection open");
+        assert_eq!(
+            live.bitmap().len(),
+            1,
+            "replay must refuse the duplicate again, not install it"
+        );
+        db.close().unwrap();
+    }
+
+    /// One record means one buffer, on the commit thread now and on every
+    /// replay forever. The cap turns "this UPDATE rewrites a million vectors"
+    /// into a named error at the door instead of an allocation failure inside
+    /// the commit loop — and it is what bounds the metadata lock hold, since
+    /// that is proportional to statement size.
+    #[test]
+    fn oversized_install_is_refused_before_logging() {
+        let dir = tempfile::tempdir().unwrap();
+        // 4096 floats = 16 KiB of vector per row; enough rows to clear 256 MiB.
+        let dim = 4096;
+        let per_row = dim * std::mem::size_of::<f32>();
+        let rows = MAX_INSTALL_BYTES / per_row + 2;
+        let db = Db::open(dir.path(), &[cfg(0, dim, rows + 8)], manual_opts()).unwrap();
+
+        let installs: Vec<Install> = (0..rows as u64)
+            .map(|ordinal| Install {
+                ordinal,
+                vector: vec![0.5; dim],
+                metadata: vec![],
+            })
+            .collect();
+
+        let before = std::fs::metadata(dir.path().join("wal.log")).unwrap().len();
+        match db.mutate(0, RoaringBitmap::new(), installs) {
+            Err(Error::StatementTooLarge { bytes, cap }) => {
+                assert!(bytes > cap);
+                assert_eq!(cap, MAX_INSTALL_BYTES);
+            }
+            other => panic!("expected StatementTooLarge, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::metadata(dir.path().join("wal.log")).unwrap().len(),
+            before,
+            "a refused statement must never reach the durable log"
+        );
+    }
+
+    #[test]
+    fn install_just_under_the_cap_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let dim = 4096;
+        // bincode spends ~24 bytes of framing per Install on top of the vector
+        // (ordinal, plus a length prefix for each of the two vecs). Budget for
+        // it, or "just under" silently becomes "just over".
+        let per_row = dim * std::mem::size_of::<f32>() + 32;
+        let rows = MAX_INSTALL_BYTES / per_row - 1;
+        let db = Db::open(dir.path(), &[cfg(0, dim, rows + 8)], manual_opts()).unwrap();
+
+        let installs: Vec<Install> = (0..rows as u64)
+            .map(|ordinal| Install {
+                ordinal,
+                vector: vec![0.5; dim],
+                metadata: vec![],
+            })
+            .collect();
+        // Pin that this really is a boundary case rather than a small
+        // statement that trivially fits.
+        let bytes = bincode::serialized_size(&installs).unwrap() as usize;
+        assert!(
+            bytes <= MAX_INSTALL_BYTES && bytes > MAX_INSTALL_BYTES - 1024 * 1024,
+            "expected a statement just under the cap, got {bytes}"
+        );
+
+        db.mutate(0, RoaringBitmap::new(), installs)
+            .expect("just under the cap is a legal statement");
+        assert_eq!(db.live_snapshot(0).unwrap().len(), rows as u64);
+    }
+
+    // -----------------------------------------------------------------------
+    // DELETE — a predicate resolved to a bitmap, logged as one Mutate
+    // -----------------------------------------------------------------------
+
+    /// Resolve `c = value` against the CURRENT snapshot and delete the matches,
+    /// exactly as the VM's `Op::Mutate` will: the predicate becomes a bitmap on
+    /// the logging side, and the bitmap becomes one `Record::Mutate` with
+    /// nothing installed. Returns what was matched.
+    fn delete_where_c(db: &Db, value: &str) -> RoaringBitmap {
+        let snapshot = db.live_snapshot(0).unwrap();
+        let matched = db
+            .metadata_reader(0)
+            .unwrap()
+            .lookup_eq(1, &Value::Text(value.into()), &snapshot)
+            .unwrap();
+        db.mutate(0, matched.clone(), vec![]).unwrap();
+        matched
+    }
+
+    fn seed_alice_bob_alice(db: &Db) {
+        db.insert(0, &[1.0, 0.0], meta_row(1, "alice")).unwrap(); // ord 0
+        db.insert(0, &[2.0, 0.0], meta_row(2, "bob")).unwrap(); // ord 1
+        db.insert(0, &[3.0, 0.0], meta_row(3, "alice")).unwrap(); // ord 2
+    }
+
+    /// The core contract, through every read path: a deleted row is gone from
+    /// search, from scans, and from metadata lookups — and nothing else is.
+    #[test]
+    fn delete_by_bitmap_retires_exactly_the_matched_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        seed_alice_bob_alice(&db);
+
+        let matched = delete_where_c(&db, "alice");
+        assert_eq!(matched.iter().collect::<Vec<_>>(), vec![0, 2]);
+
+        let hits = db.search(0, &[1.0, 0.0], 8).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![Ordinal(1)]
+        );
+
+        let mut cursor = db.scan(0).unwrap();
+        assert!(cursor.seek_first().unwrap());
+        assert_eq!(cursor.ordinal().unwrap(), Ordinal(1));
+        assert!(!cursor.next().unwrap(), "the scan sees nothing but bob");
+
+        let snapshot = db.live_snapshot(0).unwrap();
+        let meta = db.metadata_reader(0).unwrap();
+        assert!(
+            meta.lookup_eq(1, &Value::Text("alice".into()), &snapshot)
+                .unwrap()
+                .is_empty(),
+            "a deleted row satisfies no predicate"
+        );
+    }
+
+    /// Drop skips the closing checkpoint, so the delete survives only if the
+    /// WAL replays it on open.
+    #[test]
+    fn delete_by_bitmap_replays_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfgs = [cfg_meta(0, 2, 64)];
+        {
+            let db = Db::open(dir.path(), &cfgs, manual_opts()).unwrap();
+            seed_alice_bob_alice(&db);
+            delete_where_c(&db, "alice");
+            drop(db);
+        }
+        let db = Db::open(dir.path(), &cfgs, manual_opts()).unwrap();
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    /// Two statements racing to delete the same rows, or one replayed after a
+    /// crash, must both succeed: retiring a retired row is a no-op, not an error.
+    #[test]
+    fn deleting_already_deleted_rows_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        seed_alice_bob_alice(&db);
+
+        let stale: RoaringBitmap = [0u32, 2].into_iter().collect();
+        db.mutate(0, stale.clone(), vec![]).unwrap();
+        db.mutate(0, stale, vec![])
+            .expect("retiring retired rows succeeds");
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    /// `DELETE … WHERE <matches nothing>` is a successful no-op that costs no
+    /// fsync.
+    #[test]
+    fn zero_match_delete_logs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        seed_alice_bob_alice(&db);
+
+        let wal = dir.path().join("wal.log");
+        let before = std::fs::metadata(&wal).unwrap().len();
+        assert!(delete_where_c(&db, "carol").is_empty());
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), before);
+        assert_eq!(db.live_snapshot(0).unwrap().len(), 3);
+    }
+
+    /// A DELETE deletes what matched in the snapshot it read. A row inserted
+    /// after that snapshot survives even if it matches — and it can never be
+    /// hit by accident, because ordinals are never reused, so a stale bitmap
+    /// cannot name a newer row.
+    #[test]
+    fn delete_resolved_on_an_old_snapshot_spares_later_inserts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], meta_row(1, "alice")).unwrap(); // ord 0
+
+        let snapshot = db.live_snapshot(0).unwrap();
+        let matched = db
+            .metadata_reader(0)
+            .unwrap()
+            .lookup_eq(1, &Value::Text("alice".into()), &snapshot)
+            .unwrap();
+
+        // A matching row lands between resolving and logging.
+        let late = db.insert(0, &[2.0, 0.0], meta_row(2, "alice")).unwrap();
+        db.mutate(0, matched, vec![]).unwrap();
+
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![late.0],
+            "the late insert was not in the statement's snapshot"
+        );
+    }
+
+    /// "The record is kilobytes": a bulk DELETE of a contiguous range must log
+    /// a few hundred bytes, not one entry per row. Roaring only reaches that
+    /// size in RUN containers, which it builds on `optimize()` — left alone, the
+    /// same 100k ordinals sit in two 8 KiB bitmap containers.
+    #[test]
+    fn delete_of_100k_contiguous_rows_logs_kilobytes() {
+        const ROWS: u64 = 100_000;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, ROWS as usize)], manual_opts()).unwrap();
+
+        // Seed in ONE record: 100k single-row inserts would be 100k fsyncs.
+        let seed: Vec<Install> = (0..ROWS).map(|o| install(o, 1.0)).collect();
+        db.mutate(0, RoaringBitmap::new(), seed).unwrap();
+        assert_eq!(db.live_snapshot(0).unwrap().len(), ROWS);
+
+        let wal = dir.path().join("wal.log");
+        let before = std::fs::metadata(&wal).unwrap().len();
+        let everything: RoaringBitmap = (0..ROWS as u32).collect();
+        db.mutate(0, everything, vec![]).unwrap();
+        let grew = std::fs::metadata(&wal).unwrap().len() - before;
+
+        assert!(db.live_snapshot(0).unwrap().is_empty());
+        assert!(
+            grew < 1024,
+            "deleting {ROWS} contiguous rows logged {grew} bytes; runs must be compressed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Staleness — a copy-on-write statement whose rows moved on
+    // -----------------------------------------------------------------------
+    //
+    // An UPDATE is built on the caller's thread: find the rows, read them,
+    // then log "retire the old, install the copy". Two callers can do that
+    // concurrently and both read the same row, so both log a copy of it — and
+    // the WAL, doing exactly its job, applies both and the row exists twice.
+    //
+    // The fix is a precondition checked where everything is already
+    // serialized, on the commit thread: a record that INSTALLS rows is stale
+    // if the rows it retires are already retired AND none of the rows it
+    // installs are live. Stale records are skipped whole.
+
+    /// The loser of a race: it retires a row someone else already retired, and
+    /// its own copy never landed. Skipping it is what stops the duplicate.
+    #[test]
+    fn a_stale_mutate_is_skipped_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap(); // ord 0
+        db.insert(0, &[2.0, 0.0], vec![]).unwrap(); // ord 1
+
+        // The winner retires ordinal 0 and installs its copy at 2.
+        db.mutate(0, [0u32].into_iter().collect(), vec![install(2, 9.0)])
+            .unwrap();
+
+        // The loser was built from the same read: same retire set, its own
+        // fresh ordinal. By now ordinal 0 is gone and 3 was never installed.
+        db.mutate(0, [0u32].into_iter().collect(), vec![install(3, 9.0)])
+            .unwrap();
+
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![1, 2],
+            "the loser's copy must not be installed — that is the duplicate"
+        );
+        assert!(
+            db.reader(0).unwrap().vector_at(Ordinal(3)).is_none()
+                || !db.live_snapshot(0).unwrap().contains(3),
+            "ordinal 3 is not live"
+        );
+    }
+
+    /// The winner, and the ordinary case: the rows it retires are still live,
+    /// so it applies.
+    #[test]
+    fn a_fresh_mutate_still_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap(); // ord 0
+
+        db.mutate(0, [0u32].into_iter().collect(), vec![install(1, 9.0)])
+            .unwrap();
+
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![1]
+        );
+        let hits = db.search(0, &[9.0, 0.0], 8).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![Ordinal(1)]
+        );
+    }
+
+    /// Retiring nothing cannot be stale. This is the bulk-load shape the WAL
+    /// and delete tests seed with, and the precondition must leave it alone.
+    #[test]
+    fn a_bulk_install_with_no_retire_is_never_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+
+        let rows: Vec<Install> = (0..8u64).map(|o| install(o, o as f32)).collect();
+        db.mutate(0, RoaringBitmap::new(), rows).unwrap();
+
+        assert_eq!(db.live_snapshot(0).unwrap().len(), 8);
+    }
+
+    /// A DELETE retires rows and installs nothing, so it is idempotent and must
+    /// never be judged stale — replay redelivers it and it must stay a no-op
+    /// rather than becoming a skipped record.
+    #[test]
+    fn a_retire_only_mutate_is_never_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap(); // ord 0
+        db.insert(0, &[2.0, 0.0], vec![]).unwrap(); // ord 1
+
+        let retire: RoaringBitmap = [0u32].into_iter().collect();
+        db.mutate(0, retire.clone(), vec![]).unwrap();
+        db.mutate(0, retire, vec![]).unwrap();
+
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    /// The loser of the race has to LEARN it lost, or it silently drops the
+    /// user's update. Applied vs conflicted is the difference between "done"
+    /// and "read the row again and try once more".
+    #[test]
+    fn mutate_tells_its_caller_it_conflicted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap(); // ord 0
+
+        let retire: RoaringBitmap = [0u32].into_iter().collect();
+        assert_eq!(
+            db.mutate(0, retire.clone(), vec![install(1, 9.0)]).unwrap(),
+            Outcome::Applied,
+            "the winner applies"
+        );
+        assert_eq!(
+            db.mutate(0, retire, vec![install(2, 9.0)]).unwrap(),
+            Outcome::Conflicted,
+            "the loser is told, rather than silently dropped"
+        );
+    }
+
+    /// The second staleness clause, seen from outside. A record that already
+    /// applied gets redelivered by replay; its retires are long done, so the
+    /// first clause alone would call it stale. Its installs are live, so it
+    /// must be re-applied idempotently instead — otherwise a store that had
+    /// not yet absorbed it would never get the row.
+    #[test]
+    fn a_redelivered_mutate_reports_applied_not_conflicted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg(0, 2, 64)], manual_opts()).unwrap();
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap(); // ord 0
+
+        let record = Record::Mutate {
+            collection: 0,
+            retire: Bitmap([0u32].into_iter().collect()),
+            install: vec![install(1, 9.0)],
+        };
+        let handle = db.wal.as_ref().expect("wal present").handle();
+        assert_eq!(
+            handle.append(record.clone()).unwrap().outcome,
+            Outcome::Applied
+        );
+        // The same record again — exactly what recovery delivers.
+        assert_eq!(
+            handle.append(record).unwrap().outcome,
+            Outcome::Applied,
+            "a record whose installs are live is redone, not skipped"
+        );
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    /// THE test this whole mechanism exists for.
+    ///
+    /// Two threads run the copy-on-write shape of an UPDATE against the same
+    /// single row: read the live row, then log "retire it, install my copy at
+    /// my own fresh ordinal". Barriers make both threads read BEFORE either
+    /// logs, which is exactly the interleaving that produces the bug — both
+    /// records are built from the same row, and applying both leaves two live
+    /// copies of one row.
+    ///
+    /// Two invariants, checked every round: the collection still holds exactly
+    /// one row, and exactly one of the two writers was told it conflicted. The
+    /// loser simply re-reads on the next round, which is what the UPDATE
+    /// executor will do in a retry loop.
+    #[test]
+    fn concurrent_copy_on_write_updates_cannot_duplicate_a_row() {
+        use std::sync::Barrier;
+
+        const ROUNDS: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open(dir.path(), &[cfg(0, 2, 256)], manual_opts()).unwrap());
+        db.insert(0, &[1.0, 0.0], vec![]).unwrap(); // ord 0: the row
+
+        // Each thread draws its own fresh ordinals, as the executor will from
+        // the collection's allocator.
+        let next_ordinal = Arc::new(AtomicU64::new(1));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let workers: Vec<_> = (0..2)
+            .map(|tag| {
+                let db = Arc::clone(&db);
+                let next_ordinal = Arc::clone(&next_ordinal);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut conflicts = 0usize;
+                    for _ in 0..ROUNDS {
+                        // PHASE 1 — read. The barrier below guarantees the
+                        // other thread has also read before either writes.
+                        let live = db.live_snapshot(0).expect("collection open");
+                        let current = live.iter().next().expect("exactly one row");
+                        let old = db
+                            .reader(0)
+                            .expect("collection open")
+                            .vector_at(Ordinal(current))
+                            .expect("the live row has a vector")
+                            .to_vec();
+                        barrier.wait();
+
+                        // PHASE 2 — copy-on-write: retire what we read,
+                        // install our edit of it at a fresh ordinal.
+                        let ordinal = next_ordinal.fetch_add(1, Ordering::SeqCst);
+                        let edited = vec![old[0] + 1.0, tag as f32];
+                        let outcome = db
+                            .mutate(
+                                0,
+                                [current].into_iter().collect::<RoaringBitmap>(),
+                                vec![Install {
+                                    ordinal,
+                                    vector: edited,
+                                    metadata: vec![],
+                                }],
+                            )
+                            .expect("a conflict is not an error");
+                        if outcome == Outcome::Conflicted {
+                            conflicts += 1;
+                        }
+                        barrier.wait();
+                    }
+                    conflicts
+                })
+            })
+            .collect();
+
+        let conflicts: usize = workers.into_iter().map(|w| w.join().unwrap()).sum();
+
+        assert_eq!(
+            db.live_snapshot(0).unwrap().len(),
+            1,
+            "one row must stay one row, however the two writers interleaved"
+        );
+        assert_eq!(
+            conflicts, ROUNDS,
+            "each round has exactly one winner and one loser"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // UPDATE — copy-on-write, one statement, one record
+    // -----------------------------------------------------------------------
+
+    fn seed_three(db: &Db) {
+        db.insert(0, &[1.0, 0.0], meta_row(1, "draft")).unwrap(); // ord 0
+        db.insert(0, &[2.0, 0.0], meta_row(2, "draft")).unwrap(); // ord 1
+        db.insert(0, &[3.0, 0.0], meta_row(3, "draft")).unwrap(); // ord 2
+    }
+
+    /// Read a live row's (a, c) values plus its vector, by ordinal.
+    fn row_at(db: &Db, ordinal: u32) -> (Vec<Value>, Vec<f32>) {
+        let values = match db
+            .tuple_reader(0)
+            .unwrap()
+            .get(Ordinal(ordinal), &[0, 1])
+            .unwrap()
+        {
+            tuples::RowGet::Live(values) => values,
+            other => panic!("ordinal {ordinal} is not readable: {other:?}"),
+        };
+        let vector = db
+            .reader(0)
+            .unwrap()
+            .vector_at(Ordinal(ordinal))
+            .expect("live row has a vector")
+            .to_vec();
+        (values, vector)
+    }
+
+    /// The whole contract of a metadata-only UPDATE: the SET columns change,
+    /// everything else survives — including the embedding, byte for byte —
+    /// the originals retire, and rows nobody matched are untouched.
+    #[test]
+    fn update_rows_copies_each_row_with_the_set_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        seed_three(&db);
+
+        let matched: RoaringBitmap = [0u32, 2].into_iter().collect();
+        let outcome = db
+            .update_rows(0, &matched, &[(1, Value::Text("archived".into()))], None)
+            .unwrap();
+        assert_eq!(outcome, Outcome::Applied);
+
+        let live: Vec<u32> = db.live_snapshot(0).unwrap().iter().collect();
+        assert_eq!(
+            live,
+            vec![1, 3, 4],
+            "originals retired, copies at fresh ordinals"
+        );
+
+        // The untouched row is exactly as it was.
+        assert_eq!(
+            row_at(&db, 1).0,
+            vec![Value::Int(2), Value::Text("draft".into())]
+        );
+
+        // Each copy: SET column changed, other column kept, vector identical.
+        let (values, vector) = row_at(&db, 3);
+        assert_eq!(values, vec![Value::Int(1), Value::Text("archived".into())]);
+        assert_eq!(vector, vec![1.0, 0.0], "the embedding is copied unchanged");
+
+        let (values, vector) = row_at(&db, 4);
+        assert_eq!(values, vec![Value::Int(3), Value::Text("archived".into())]);
+        assert_eq!(vector, vec![3.0, 0.0]);
+    }
+
+    /// One statement is one publish, however many rows it rewrites. The
+    /// liveness version is what readers watch, so a multi-row UPDATE that
+    /// bumped it per row would invalidate every cached snapshot N times and,
+    /// worse, expose the half-rewritten states in between.
+    #[test]
+    fn a_multi_row_update_publishes_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        seed_three(&db);
+
+        let before = db.live_snapshot(0).unwrap().version();
+        let matched: RoaringBitmap = [0u32, 1, 2].into_iter().collect();
+        db.update_rows(0, &matched, &[(1, Value::Text("archived".into()))], None)
+            .unwrap();
+
+        assert_eq!(
+            db.live_snapshot(0).unwrap().version(),
+            before + 1,
+            "three rows rewritten, one publish"
+        );
+    }
+
+    /// Later assignments win, so `SET c = 'a', c = 'b'` means 'b'.
+    #[test]
+    fn update_applies_assignments_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        seed_three(&db);
+
+        let matched: RoaringBitmap = [0u32].into_iter().collect();
+        db.update_rows(
+            0,
+            &matched,
+            &[
+                (1, Value::Text("first".into())),
+                (1, Value::Text("last".into())),
+            ],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            row_at(&db, 3).0,
+            vec![Value::Int(1), Value::Text("last".into())]
+        );
+    }
+
+    #[test]
+    fn an_update_matching_nothing_logs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        seed_three(&db);
+
+        let wal = dir.path().join("wal.log");
+        let before = std::fs::metadata(&wal).unwrap().len();
+        let outcome = db
+            .update_rows(
+                0,
+                &RoaringBitmap::new(),
+                &[(1, Value::Text("x".into()))],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(outcome, Outcome::Applied);
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), before);
+        assert_eq!(db.live_snapshot(0).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn an_update_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfgs = [cfg_meta(0, 2, 64)];
+        {
+            let db = Db::open(dir.path(), &cfgs, manual_opts()).unwrap();
+            seed_three(&db);
+            let matched: RoaringBitmap = [1u32].into_iter().collect();
+            db.update_rows(0, &matched, &[(1, Value::Text("archived".into()))], None)
+                .unwrap();
+            drop(db); // no closing checkpoint: the WAL must carry it
+        }
+        let db = Db::open(dir.path(), &cfgs, manual_opts()).unwrap();
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
+        assert_eq!(
+            row_at(&db, 3).0,
+            vec![Value::Int(2), Value::Text("archived".into())]
+        );
+    }
+
+    /// Roadmap step 8, as it applies to UPDATE: the room for every copy is
+    /// checked in ONE reservation, before the record is built. Half a statement
+    /// is not a thing that can happen — a per-row allocator could pass its
+    /// check, claim some ordinals, then fail, leaving the statement abandoned
+    /// with capacity burned.
+    #[test]
+    fn an_update_that_would_exceed_capacity_is_refused_before_logging() {
+        let dir = tempfile::tempdir().unwrap();
+        // Capacity 8, five rows used: four copies need 5..9, one past the end.
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 8)], manual_opts()).unwrap();
+        for n in 0..5i64 {
+            db.insert(0, &[n as f32, 0.0], meta_row(n, "draft"))
+                .unwrap();
+        }
+
+        let wal = dir.path().join("wal.log");
+        let before = std::fs::metadata(&wal).unwrap().len();
+        let matched: RoaringBitmap = [0u32, 1, 2, 3].into_iter().collect();
+        match db.update_rows(0, &matched, &[(1, Value::Text("archived".into()))], None) {
+            Err(Error::CapacityExceeded { capacity }) => assert_eq!(capacity, 8),
+            other => panic!("expected CapacityExceeded, got {other:?}"),
+        }
+
+        assert_eq!(
+            std::fs::metadata(&wal).unwrap().len(),
+            before,
+            "a refused update must never reach the log"
+        );
+        assert_eq!(db.live_snapshot(0).unwrap().len(), 5, "no row changed");
+        // The allocator did not move either: the next insert takes ordinal 5.
+        assert_eq!(
+            db.insert(0, &[9.0, 0.0], meta_row(9, "draft")).unwrap(),
+            Ordinal(5)
+        );
+    }
+
+    #[test]
+    fn an_update_that_exactly_fills_capacity_is_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        // Capacity 9, five rows used, four copies land at 5..9 exactly.
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 9)], manual_opts()).unwrap();
+        for n in 0..5i64 {
+            db.insert(0, &[n as f32, 0.0], meta_row(n, "draft"))
+                .unwrap();
+        }
+
+        let matched: RoaringBitmap = [0u32, 1, 2, 3].into_iter().collect();
+        db.update_rows(0, &matched, &[(1, Value::Text("archived".into()))], None)
+            .expect("the copies fit exactly");
+
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![4, 5, 6, 7, 8]
+        );
+    }
+
+    /// Full replacement: the new embedding comes from the statement instead of
+    /// the old row, while every column the statement did not name still copies
+    /// across.
+    #[test]
+    fn update_rows_takes_a_replacement_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        seed_three(&db);
+
+        let matched: RoaringBitmap = [1u32].into_iter().collect();
+        db.update_rows(
+            0,
+            &matched,
+            &[(1, Value::Text("v2".into()))],
+            Some(&[9.0, 9.0]),
+        )
+        .unwrap();
+
+        let (values, vector) = row_at(&db, 3);
+        assert_eq!(vector, vec![9.0, 9.0], "the statement's embedding won");
+        assert_eq!(
+            values,
+            vec![Value::Int(2), Value::Text("v2".into())],
+            "the unnamed column still copied across"
+        );
+        assert_eq!(
+            db.live_snapshot(0).unwrap().iter().collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
+    }
+
+    /// The binder already checks this, so reaching it means a caller built the
+    /// record by hand — the same belt-and-braces `insert` keeps.
+    #[test]
+    fn a_replacement_vector_is_dimension_checked_before_logging() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
+        seed_three(&db);
+
+        let wal = dir.path().join("wal.log");
+        let before = std::fs::metadata(&wal).unwrap().len();
+        let matched: RoaringBitmap = [1u32].into_iter().collect();
+        match db.update_rows(0, &matched, &[], Some(&[9.0, 9.0, 9.0])) {
+            Err(Error::DimensionMismatch { expected, got }) => {
+                assert_eq!((expected, got), (2, 3));
+            }
+            other => panic!("expected DimensionMismatch, got {other:?}"),
+        }
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), before);
+        assert_eq!(db.live_snapshot(0).unwrap().len(), 3);
     }
 
     #[test]
@@ -1971,8 +3406,8 @@ mod tests {
     /// `tests/reconciliation.rs`'s `LogOnly`.
     struct LogOnly;
     impl Apply for LogOnly {
-        fn apply(&mut self, _lsn: Lsn, _record: &Record) -> io::Result<()> {
-            Ok(())
+        fn apply(&mut self, _lsn: Lsn, _record: &Record) -> io::Result<Outcome> {
+            Ok(Outcome::Applied)
         }
         fn checkpoint(&mut self) -> io::Result<Option<u64>> {
             Ok(None)
@@ -2090,6 +3525,33 @@ mod tests {
         db.close().unwrap();
     }
 
+    /// `id` used to be a reserved column name, because it collided with the
+    /// ordinal pseudo-column SEARCH returned. That pseudo-column is gone, so
+    /// `id` is an ordinary name — and the conventional one for a primary key,
+    /// which means reserving it would have forbidden the most natural schema a
+    /// caller can write.
+    #[test]
+    fn a_column_named_id_is_an_ordinary_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path(), &[], manual_opts()).unwrap();
+
+        let schema = Schema::from_columns(vec![
+            ColumnSpec::Vector {
+                name: "vector".into(),
+                dim: NonZeroUsize::new(2).unwrap(),
+            },
+            ColumnSpec::Key {
+                name: "id".into(),
+                ty: ColumnType::Int,
+            },
+        ])
+        .unwrap();
+        assert_eq!(schema.primary_key, Some(0));
+        db.create_collection("things", 8, schema)
+            .expect("`id` is a legal column name");
+        db.close().unwrap();
+    }
+
     #[test]
     fn invalid_create_is_rejected_before_the_wal_and_burns_no_id() {
         let dir = tempfile::tempdir().unwrap();
@@ -2102,25 +3564,6 @@ mod tests {
         assert!(matches!(
             db.create_collection("x", 0, vec_only(2)),
             Err(Error::InvalidCapacity)
-        ));
-        // The `id` pseudo-column collides with SEARCH's ordinal column.
-        assert!(matches!(
-            db.create_collection(
-                "x",
-                8,
-                Schema::from_columns(vec![
-                    ColumnSpec::Vector {
-                        name: "vector".into(),
-                        dim: NonZeroUsize::new(2).unwrap(),
-                    },
-                    ColumnSpec::Scalar {
-                        name: "id".into(),
-                        ty: ColumnType::Int,
-                    },
-                ])
-                .unwrap(),
-            ),
-            Err(Error::ReservedColumn(_))
         ));
         // A hand-built Schema bypassing the `Schema::from_columns` constructor
         // still gets caught — create_collection re-validates it.

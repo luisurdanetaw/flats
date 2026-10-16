@@ -44,6 +44,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
+use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
 use crate::metadata::common::{CollectionConfig, ColumnId, Value};
@@ -58,6 +59,65 @@ use crate::metadata::common::{CollectionConfig, ColumnId, Value};
 /// the highest LSN found in the log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Lsn(pub u64);
+
+/// A `RoaringBitmap` that can ride inside a `Record`.
+///
+/// `roaring` ships no serde impls (and we do not enable the feature — its
+/// encoding is a serde structural one, fatter than the format below), so the
+/// bridge is hand-written and delegates to roaring's own PORTABLE
+/// serialization — byte-for-byte the format `metadata.snap` already stores.
+///
+/// Why that matters here and not just for tidiness: a bulk `DELETE` retires a
+/// long contiguous run of ordinals. A structural encoding would spell out every
+/// ordinal, and this bitmap has to fit in one frame, one CRC, one fsync.
+///
+/// `RoaringBitmap::optimize` is NOT called here. `Serialize` takes `&self`, so
+/// doing it on the encode path would mean cloning the bitmap every time.
+/// `Db::mutate` calls it instead, once, on the bitmap it already owns before
+/// building the record. Un-optimized is already ~16 KiB per 100k contiguous
+/// ordinals (bitmap containers) against ~400 KiB structural, so this is a size
+/// lever, not a correctness one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bitmap(pub RoaringBitmap);
+
+impl Serialize for Bitmap {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut bytes = Vec::with_capacity(self.0.serialized_size());
+        // Writing into a Vec cannot fail; roaring's signature is io-shaped.
+        self.0
+            .serialize_into(&mut bytes)
+            .map_err(serde::ser::Error::custom)?;
+        s.serialize_bytes(&bytes)
+    }
+}
+
+impl<'de> Deserialize<'de> for Bitmap {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        // A corrupt/hostile payload reaches this from the recovery path, so a
+        // malformed bitmap must be an error, never a panic — the caller turns
+        // it into "stop at the torn tail".
+        let bytes = <Vec<u8>>::deserialize(d)?;
+        RoaringBitmap::deserialize_from(&bytes[..])
+            .map(Bitmap)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// One row installed by a `Record::Mutate`: the copy-on-write replacement an
+/// UPDATE writes, or a plain new row. Same payload as `Record::Insert` minus
+/// the collection, which the enclosing record carries once for the whole
+/// statement.
+///
+/// `ordinal` is assigned on the LOGGING side, like every other ordinal here —
+/// see the `Record` doc. Replay must place the row where the original run put
+/// it, not wherever the count happens to be.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Install {
+    pub ordinal: u64,
+    pub vector: Vec<f32>,
+    /// == `metadata::common::Row`, already validated against the schema.
+    pub metadata: Vec<(ColumnId, Value)>,
+}
 
 /// The LOGICAL mutation — the intent, not the plan, not the physical bytes.
 /// This is the *only* thing that goes durable. It must be replayable by a dumb
@@ -94,6 +154,30 @@ pub enum Record {
     /// materialize the collection with no catalog to consult. Apply is
     /// idempotent: if the id/name already exists, it's a no-op.
     CreateCollection { config: CollectionConfig },
+    /// ONE STATEMENT, ONE RECORD (Phase 7): everything a `DELETE` or `UPDATE`
+    /// changes, in a single frame with a single CRC behind a single fsync.
+    ///
+    /// This variant exists because the row-at-a-time records above cannot
+    /// express a multi-row statement atomically. `DELETE ... WHERE p` matching
+    /// N rows would be N frames and N commit points, so a crash halfway leaves
+    /// half a statement applied. UPDATE is worse: it is copy-on-write, so the
+    /// retire of the old ordinal and the install of the new one MUST land
+    /// together — a crash between them either loses the row (retired, never
+    /// installed) or duplicates it (installed, never retired).
+    ///
+    /// `retire` is a bitmap because that is the shape the predicate resolves to
+    /// on the logging side, and because a contiguous run of tens of thousands
+    /// of ordinals costs tens of bytes in it.
+    ///
+    /// APPLY IS ONE PUBLISH, not a loop of publishes: see `Apply` and the
+    /// engine's `apply_mutate`. Installed payload is capped (see
+    /// `Error::StatementTooLarge`) — a record must fit in memory on the commit
+    /// thread and on every future replay.
+    Mutate {
+        collection: u32,
+        retire: Bitmap,
+        install: Vec<Install>,
+    },
 }
 
 impl Record {
@@ -117,8 +201,68 @@ impl Record {
     }
 }
 
+/// What the applier DID with a record that was already made durable.
+///
+/// Distinct from `Err`, and the distinction matters since Phase 7: an `Err`
+/// from apply means the index could not absorb a committed record, which halts
+/// the database (`Poison`). A conflict is not that — it is a correct, expected
+/// decision that the record is stale and must not be applied, reached the same
+/// way on every replay. The caller retries; nothing is broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The record was folded into the index.
+    Applied,
+    /// The record was skipped as stale — the rows it was built from moved on
+    /// between the moment its writer read them and the moment it was applied.
+    ///
+    /// RETRYABLE: the caller re-reads and re-runs, and the second attempt
+    /// usually lands.
+    Conflicted,
+    /// The record was refused: applying it would break an invariant the index
+    /// enforces, and no amount of retrying changes that.
+    ///
+    /// NOT RETRYABLE, and that is the whole reason this is a separate variant
+    /// rather than another flavour of `Conflicted` — a retry loop that cannot
+    /// tell them apart would spin its full budget on a verdict that is final
+    /// from the first attempt, then report the wrong error.
+    Rejected(RejectReason),
+}
+
+/// Why the applier refused a durable record.
+///
+/// Fieldless on purpose: `Outcome` is `Copy`, and the human-readable detail
+/// (which column, which value) belongs to the error the caller finally sees,
+/// not to the verdict the WAL thread hands back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectReason {
+    /// The row carries a primary key some live row already holds.
+    DuplicateKey,
+}
+
+/// A durable record plus what became of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Committed {
+    /// The LSN assigned to the record. Assigned — and the frame fsynced —
+    /// whatever the outcome: a conflicted record is durable, it just does
+    /// nothing.
+    pub lsn: Lsn,
+    /// Applied, or skipped as stale.
+    pub outcome: Outcome,
+}
+
+impl Committed {
+    /// True when the record was folded in rather than skipped as stale.
+    pub fn applied(&self) -> bool {
+        self.outcome == Outcome::Applied
+    }
+}
+
 pub trait Apply {
-    fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<()>;
+    /// Fold one durable record into the index.
+    ///
+    /// Returns `Outcome::Conflicted` — NOT an error — for a record that is
+    /// stale by the time it arrives. See `Outcome`.
+    fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<Outcome>;
 
     /// Make all applied state durable and return the LSN through which the log
     /// may now be truncated (the minimum durable watermark), or `None` if there
@@ -158,14 +302,32 @@ pub trait Apply {
 
 const WAL_MAGIC: &[u8; 4] = b"FWAL";
 /// Version written to new logs. 2 = metadata-carrying Insert (Phase 4c);
-/// 3 = + CreateCollection (Phase 6).
-const WAL_VERSION: u32 = 3;
-/// Oldest version this build still reads. v2 logs are a strict subset of v3
-/// (CreateCollection was APPENDED to the Record enum — bincode's positional
-/// tags for the old variants are unchanged), so reading them is safe; an old
-/// build reading a v3 log is not, which is why the written version bumped.
-const WAL_MIN_VERSION: u32 = 2;
+/// 3 = + CreateCollection (Phase 6); 4 = + Mutate (Phase 7); 5 = `Schema`
+/// carries a PRIMARY KEY.
+const WAL_VERSION: u32 = 5;
+/// Oldest version this build still reads.
+///
+/// THE 5 BUMP IS THE FIRST THAT IS NOT AN APPEND. Every earlier one only added
+/// a variant to the Record enum, leaving the older variants' positional tags
+/// untouched — so an old log was a strict subset of a new one and replaying it
+/// was safe. Version 5 instead adds a FIELD inside `Schema`, which is embedded
+/// in `Record::CreateCollection`: the bytes of an existing variant change
+/// shape, so a v3 or v4 log carrying a create would decode into the wrong
+/// fields rather than fail. Nothing below 5 may be replayed, and recovery says
+/// so plainly instead of guessing.
+const WAL_MIN_VERSION: u32 = 5;
 const WAL_HEADER_BYTES: usize = 8;
+
+/// Ceiling on one frame's payload, enforced when READING.
+///
+/// The length field is read straight off disk and used to size a buffer, so
+/// without a bound a corrupt byte becomes a 4 GiB allocation on the recovery
+/// path. Nothing legal comes close: installed payload is capped at
+/// `MAX_INSTALL_BYTES` (256 MiB) on the logging side, and the rest of a record
+/// — the retire bitmap, framing, bincode overhead — is orders of magnitude
+/// smaller. A frame claiming more than this cannot have been written by any
+/// build of this code, so recovery treats it as the torn tail it is.
+const MAX_FRAME_BYTES: usize = 384 * 1024 * 1024;
 
 fn wal_header() -> [u8; WAL_HEADER_BYTES] {
     let mut h = [0u8; WAL_HEADER_BYTES];
@@ -220,7 +382,7 @@ enum Command {
     /// Append a record; reply with its durable LSN.
     Append {
         record: Record,
-        ack: Sender<io::Result<Lsn>>,
+        ack: Sender<io::Result<Committed>>,
     },
     /// Drop every frame with `lsn <= up_to` from the front of the log. Used by
     /// callers that manage durability themselves (e.g. tests).
@@ -246,7 +408,7 @@ impl WalHandle {
     /// Append a record and BLOCK until it is durable. Returns the assigned LSN.
     /// The caller acks the client only after this returns Ok — that ordering is
     /// the entire durability contract.
-    pub fn append(&self, record: Record) -> io::Result<Lsn> {
+    pub fn append(&self, record: Record) -> io::Result<Committed> {
         let (ack_tx, ack_rx) = mpsc::channel();
         self.tx
             .send(Command::Append {
@@ -451,7 +613,7 @@ impl Wal {
 const MAX_BATCH: usize = 1024;
 
 /// One queued append awaiting commit: the record and the waiter to ack.
-type Pending = (Record, Sender<io::Result<Lsn>>);
+type Pending = (Record, Sender<io::Result<Committed>>);
 
 /// A control op pulled off the command stream, deferred until the current append
 /// batch has been committed.
@@ -632,7 +794,7 @@ fn commit_batch<A: Apply>(
         return;
     }
 
-    // --- one write + ONE fsync for the whole batch (group commit) ---
+    // --- one write + ONE fsyncclaude for the whole batch (group commit) ---
     let durable: io::Result<()> = (|| {
         file.write_all(frame_buf)?;
         // fdatasync: we need the data + the file-size growth, not mtime.
@@ -662,8 +824,11 @@ fn commit_batch<A: Apply>(
             continue;
         }
         match applier.apply(lsn, &record) {
-            Ok(()) => {
-                let _ = ack.send(Ok(lsn)); // waiter gone == nobody to tell; fine
+            // Applied or judged stale — both are successful commits. Only an
+            // `Err` below means the index could not absorb a durable record,
+            // which is the condition that halts the log.
+            Ok(outcome) => {
+                let _ = ack.send(Ok(Committed { lsn, outcome })); // waiter gone == nobody to tell; fine
             }
             Err(e) => {
                 let _ = poison.set(Poison {
@@ -707,6 +872,9 @@ fn truncate_wal(file: &mut File, path: &Path, up_to: u64) -> io::Result<()> {
             }
             let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
             let lsn = u64::from_le_bytes(header[8..16].try_into().unwrap());
+            if len > MAX_FRAME_BYTES {
+                break; // impossible length: torn/corrupt tail, not an allocation
+            }
 
             let mut payload = vec![0u8; len];
             match read_exact_or_eof(&mut reader, &mut payload)? {
@@ -835,6 +1003,13 @@ fn recover<A: Apply>(path: &Path, applier: &mut A, skip_through: u64) -> io::Res
         let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
         let lsn = u64::from_le_bytes(header[8..16].try_into().unwrap());
 
+        // A length no writer could have produced is corruption, and sizing a
+        // buffer from it would turn one bad byte into a 4 GiB allocation.
+        // Stop here exactly as for any other malformed tail.
+        if len > MAX_FRAME_BYTES {
+            break;
+        }
+
         // Read the payload. Short read = torn tail, stop.
         let mut payload = vec![0u8; len];
         match read_exact_or_eof(&mut reader, &mut payload)? {
@@ -919,6 +1094,29 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
 
+    fn test_config() -> CollectionConfig {
+        CollectionConfig {
+            id: 4,
+            name: "docs".into(),
+            capacity: 1_000_000,
+            schema: crate::metadata::common::Schema::from_columns(vec![
+                crate::metadata::common::ColumnSpec::Vector {
+                    name: "vector".into(),
+                    dim: std::num::NonZeroUsize::new(768).unwrap(),
+                },
+                crate::metadata::common::ColumnSpec::Scalar {
+                    name: "author".into(),
+                    ty: crate::metadata::common::ColumnType::Text,
+                },
+                crate::metadata::common::ColumnSpec::Scalar {
+                    name: "year".into(),
+                    ty: crate::metadata::common::ColumnType::Int,
+                },
+            ])
+            .unwrap(),
+        }
+    }
+
     fn insert(collection: u32, ordinal: u64, vector: &[f32]) -> Record {
         Record::Insert {
             collection,
@@ -938,6 +1136,14 @@ mod tests {
         /// fsynced, so this models the single failure the WAL cannot ack
         /// honestly — durable, but not reflected in the index.
         fail_at: Option<u64>,
+        /// When set, `apply` reports this one LSN as stale rather than
+        /// applying it — the applier's verdict, not a failure.
+        conflict_at: Option<u64>,
+        /// When set, `apply` REFUSES this one LSN: the record is well-formed
+        /// and durable, but folding it in would break an invariant (a
+        /// duplicate primary key). Like a conflict it is a verdict rather than
+        /// a failure — but unlike a conflict, retrying cannot help.
+        reject_at: Option<u64>,
         /// How many times `checkpoint` was called. A poisoned log must never
         /// call it: checkpoint advances the durable watermark and truncates.
         checkpoints: Arc<AtomicUsize>,
@@ -948,7 +1154,17 @@ mod tests {
             CollectingApplier {
                 log: Arc::new(Mutex::new(Vec::new())),
                 fail_at: None,
+                conflict_at: None,
+                reject_at: None,
                 checkpoints: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        /// An applier that judges exactly `lsn` stale.
+        fn conflicting_at(lsn: u64) -> Self {
+            CollectingApplier {
+                conflict_at: Some(lsn),
+                ..CollectingApplier::new()
             }
         }
 
@@ -956,6 +1172,14 @@ mod tests {
         fn failing_at(lsn: u64) -> Self {
             CollectingApplier {
                 fail_at: Some(lsn),
+                ..CollectingApplier::new()
+            }
+        }
+
+        /// An applier that refuses exactly `lsn` as a duplicate key.
+        fn rejecting_at(lsn: u64) -> Self {
+            CollectingApplier {
+                reject_at: Some(lsn),
                 ..CollectingApplier::new()
             }
         }
@@ -970,15 +1194,21 @@ mod tests {
     }
 
     impl Apply for CollectingApplier {
-        fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<()> {
+        fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<Outcome> {
             if self.fail_at == Some(lsn.0) {
                 return Err(io::Error::other(format!("injected apply failure at {}", lsn.0)));
+            }
+            if self.conflict_at == Some(lsn.0) {
+                return Ok(Outcome::Conflicted);
+            }
+            if self.reject_at == Some(lsn.0) {
+                return Ok(Outcome::Rejected(RejectReason::DuplicateKey));
             }
             self.log
                 .lock()
                 .expect("lock not poisoned")
                 .push((lsn.0, record.clone()));
-            Ok(())
+            Ok(Outcome::Applied)
         }
         fn checkpoint(&mut self) -> io::Result<Option<u64>> {
             // These WAL tests never checkpoint; nothing to make durable. The
@@ -1017,6 +1247,99 @@ mod tests {
         // the index is missing rather than carrying on as if nothing happened.
         let poison = wal.poison().expect("a failed apply poisons the log");
         assert_eq!(poison.lsn, Lsn(2));
+
+        drop(handle);
+        wal.shutdown();
+    }
+
+    /// A stale record is NOT a failure. It was fsynced, the applier looked at
+    /// it and correctly declined to fold it in, and the database is perfectly
+    /// healthy — so the verdict must reach the waiter as success, the log must
+    /// not poison, and the next write must go through normally.
+    #[test]
+    fn a_conflicted_apply_is_reported_without_poisoning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+
+        let applier = CollectingApplier::conflicting_at(2);
+        let wal = Wal::start(&path, applier.clone(), 0).unwrap();
+        let handle = wal.handle();
+
+        let first = handle.append(insert(0, 0, &[1.0])).unwrap();
+        assert_eq!(first.outcome, Outcome::Applied);
+
+        let stale = handle
+            .append(insert(0, 1, &[2.0]))
+            .expect("a conflict is success, not an error");
+        assert_eq!(stale.lsn, Lsn(2));
+        assert_eq!(stale.outcome, Outcome::Conflicted);
+        assert!(!stale.applied());
+
+        assert!(wal.poison().is_none(), "a conflict must never halt the log");
+
+        // The log carries on: the conflicted record burned its LSN and its
+        // frame (it IS durable — it just did nothing), and the next write
+        // applies normally.
+        let next = handle.append(insert(0, 2, &[3.0])).unwrap();
+        assert_eq!(next.lsn, Lsn(3));
+        assert_eq!(next.outcome, Outcome::Applied);
+        assert_eq!(
+            applier.snapshot().iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            vec![1, 3],
+            "the stale record was never folded in"
+        );
+
+        drop(handle);
+        wal.shutdown();
+    }
+
+    /// A REFUSED record is a third thing, and the difference from a conflict is
+    /// not cosmetic: a conflict means "someone got there first, read again and
+    /// retry", while a refusal means "this record can never be applied". The
+    /// waiter must be able to tell them apart, because retrying a refusal is a
+    /// guaranteed waste — and, like a conflict, a refusal is a healthy verdict
+    /// that must never halt the log.
+    #[test]
+    fn a_rejected_apply_is_reported_without_poisoning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+
+        let applier = CollectingApplier::rejecting_at(2);
+        let wal = Wal::start(&path, applier.clone(), 0).unwrap();
+        let handle = wal.handle();
+
+        handle.append(insert(0, 0, &[1.0])).unwrap();
+
+        let refused = handle
+            .append(insert(0, 1, &[2.0]))
+            .expect("a refusal is success, not an error");
+        assert_eq!(refused.lsn, Lsn(2));
+        assert_eq!(
+            refused.outcome,
+            Outcome::Rejected(RejectReason::DuplicateKey)
+        );
+        assert!(!refused.applied());
+        assert_ne!(
+            refused.outcome,
+            Outcome::Conflicted,
+            "a refusal must not read as a conflict — one is retryable, the other never is"
+        );
+
+        assert!(wal.poison().is_none(), "a refusal must never halt the log");
+
+        // The log carries on, exactly as it does after a conflict.
+        let next = handle.append(insert(0, 2, &[3.0])).unwrap();
+        assert_eq!(next.lsn, Lsn(3));
+        assert_eq!(next.outcome, Outcome::Applied);
+        assert_eq!(
+            applier
+                .snapshot()
+                .iter()
+                .map(|(l, _)| *l)
+                .collect::<Vec<_>>(),
+            vec![1, 3],
+            "the refused record was never folded in"
+        );
 
         drop(handle);
         wal.shutdown();
@@ -1094,6 +1417,241 @@ mod tests {
 
         drop(handle);
         wal.shutdown();
+    }
+
+    /// The bitmap encoding is roaring's own portable format, not a serde
+    /// element-by-element fallback — the same format `metadata.snap` already
+    /// writes. That is not cosmetic: a bulk DELETE retires a long contiguous
+    /// run, and this bitmap has to fit in one frame behind one fsync.
+    ///
+    /// Two facts pinned here. First, the default encoding is already an order
+    /// of magnitude better than per-element: 100k contiguous ordinals span two
+    /// 64k blocks, so roaring stores two BITMAP containers — 8 KiB each,
+    /// ~16 KiB total, against the ~400 KiB a structural encoding would spend.
+    /// Second, `RoaringBitmap::optimize` collapses those runs into RUN containers and
+    /// buys another ~20x. It is deliberately NOT called in `Serialize` (that
+    /// takes `&self`, so it would mean cloning the bitmap on every encode) —
+    /// `Db::mutate` calls it on the bitmap it owns before logging.
+    #[test]
+    fn bitmap_round_trips_in_the_portable_roaring_encoding() {
+        let dense: RoaringBitmap = (0..100_000u32).collect();
+        let bitmap = Bitmap(dense.clone());
+
+        let encoded = bincode::serialize(&bitmap).expect("bitmap serializes");
+        assert!(
+            encoded.len() < 32 * 1024,
+            "100k ordinals must stay in bitmap containers, got {} bytes",
+            encoded.len()
+        );
+
+        // The lever step 4's DELETE path pulls: same set, run containers.
+        let mut optimized = dense.clone();
+        assert!(optimized.optimize(), "a contiguous run is run-compressible");
+        let opt_encoded = bincode::serialize(&Bitmap(optimized)).unwrap();
+        assert!(
+            opt_encoded.len() < 1024,
+            "run containers must collapse a contiguous run, got {} bytes",
+            opt_encoded.len()
+        );
+        assert_eq!(
+            bincode::deserialize::<Bitmap>(&opt_encoded).unwrap().0,
+            dense,
+            "run optimization is an encoding choice, never a change of contents"
+        );
+
+        let decoded: Bitmap = bincode::deserialize(&encoded).expect("bitmap deserializes");
+        assert_eq!(decoded.0, dense);
+
+        // Sparse and empty are the other two shapes the record carries.
+        for set in [RoaringBitmap::new(), (0..50_000u32).map(|i| i * 977).collect()] {
+            let round: Bitmap =
+                bincode::deserialize(&bincode::serialize(&Bitmap(set.clone())).unwrap()).unwrap();
+            assert_eq!(round.0, set);
+        }
+    }
+
+    /// bincode tags enum variants by POSITION, so the on-disk meaning of a tag
+    /// is decided by where a variant sits in the enum. `Mutate` was appended;
+    /// this pins that the three older variants kept tags 0/1/2, which is the
+    /// entire reason a v2/v3 log still decodes on this build. Inserting a
+    /// variant above them would silently reinterpret every existing log.
+    #[test]
+    fn appending_mutate_keeps_old_variant_tags_stable() {
+        let cases: [(Record, u32); 4] = [
+            (insert(0, 0, &[1.0]), 0),
+            (
+                Record::Delete {
+                    collection: 0,
+                    ordinal: 0,
+                },
+                1,
+            ),
+            (
+                Record::CreateCollection {
+                    config: test_config(),
+                },
+                2,
+            ),
+            (
+                Record::Mutate {
+                    collection: 0,
+                    retire: Bitmap(RoaringBitmap::new()),
+                    install: vec![],
+                },
+                3,
+            ),
+        ];
+        for (record, tag) in cases {
+            let mut buf = Vec::new();
+            record.encode(&mut buf);
+            // bincode writes the variant index as a u32 LE prefix.
+            assert_eq!(
+                u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+                tag,
+                "variant tag moved for {record:?} — every existing log just changed meaning"
+            );
+        }
+    }
+
+    /// Older logs are a strict SUBSET of the current format: every variant was
+    /// APPENDED, so a v2 or v3 writer's frames still decode to the same
+    /// variants here. Refusing them would strand every existing database on
+    /// upgrade; misdecoding them would be worse.
+    #[test]
+    fn v2_and_v3_logs_still_recover_on_this_build() {
+        let records = [
+            insert(0, 0, &[1.0, 2.0]),
+            Record::Delete {
+                collection: 0,
+                ordinal: 0,
+            },
+        ];
+
+        // Adding a variant means an OLD build must refuse a NEW log rather
+        // than misdecode it, and the header version is the only thing that can
+        // tell it to (CLAUDE.md §6). Pinned as a literal so appending a variant
+        // without bumping fails here rather than in production.
+        assert_eq!(
+            WAL_VERSION, 5,
+            "Schema gained a primary key; the written version must bump with it"
+        );
+        // And this bump, unlike every earlier one, is NOT backward-readable:
+        // `Schema` sits inside `Record::CreateCollection`, so adding a field to
+        // it re-shapes an existing variant's bytes.
+        assert_eq!(
+            WAL_MIN_VERSION, WAL_VERSION,
+            "a field added inside an existing variant breaks older logs"
+        );
+
+        // Every version this build claims to accept must actually replay.
+        for version in WAL_MIN_VERSION..=WAL_VERSION {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("wal.log");
+
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(WAL_MAGIC);
+            bytes.extend_from_slice(&version.to_le_bytes());
+            for (i, rec) in records.iter().enumerate() {
+                let mut payload = Vec::new();
+                rec.encode(&mut payload);
+                write_frame(&mut bytes, Lsn(i as u64 + 1), &payload).unwrap();
+            }
+            std::fs::write(&path, &bytes).unwrap();
+
+            let applier = CollectingApplier::new();
+            let wal = Wal::start(&path, applier.clone(), 0).unwrap();
+            assert_eq!(
+                applier.snapshot().len(),
+                records.len(),
+                "a v{version} log must replay on this build"
+            );
+            wal.shutdown();
+        }
+
+        // ...and the floor still bites: v1 predates the metadata-carrying
+        // Insert, so its frames would misdecode rather than fail.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(WAL_MAGIC);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            Wal::start(&path, CollectingApplier::new(), 0).is_err(),
+            "a v1 log must be refused, not misdecoded"
+        );
+    }
+
+    /// A frame's length is read straight off disk, so a corrupt one used to
+    /// become `vec![0u8; len]` — an allocation sized by a byte that a crash (or
+    /// a hostile file) chose, up to 4 GiB. A frame that cannot legally exist is
+    /// a torn tail, which is exactly how every other malformed tail is treated.
+    #[test]
+    fn recovery_treats_an_absurd_frame_length_as_a_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&wal_header());
+        // One good frame first, to prove recovery keeps everything before the
+        // garbage rather than discarding the whole log.
+        let mut payload = Vec::new();
+        insert(0, 0, &[1.0]).encode(&mut payload);
+        write_frame(&mut bytes, Lsn(1), &payload).unwrap();
+        // Then a header claiming a preposterous payload.
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // len
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // crc
+        bytes.extend_from_slice(&2u64.to_le_bytes()); // lsn
+        std::fs::write(&path, &bytes).unwrap();
+
+        let applier = CollectingApplier::new();
+        let wal = Wal::start(&path, applier.clone(), 0).unwrap();
+        let seen = applier.snapshot();
+        assert_eq!(seen.len(), 1, "the good frame survives the garbage that follows");
+        assert_eq!(seen[0].0, 1);
+        wal.shutdown();
+    }
+
+    #[test]
+    fn mutate_round_trips_through_encode_decode() {
+        for record in [
+            // The DELETE shape: retire many, install nothing.
+            Record::Mutate {
+                collection: 2,
+                retire: Bitmap((0..10_000u32).collect()),
+                install: vec![],
+            },
+            // The UPDATE shape: retire the old ordinals, install their
+            // copy-on-write replacements at fresh ones.
+            Record::Mutate {
+                collection: 7,
+                retire: Bitmap([3u32, 9, 27].into_iter().collect()),
+                install: vec![
+                    Install {
+                        ordinal: 100,
+                        vector: vec![1.0, -2.5, f32::MIN],
+                        metadata: vec![(0, Value::Int(-7)), (1, Value::Text("héllo".into()))],
+                    },
+                    Install {
+                        ordinal: 101,
+                        vector: vec![0.0, 0.0, 0.0],
+                        metadata: vec![(0, Value::Float(2.25))],
+                    },
+                ],
+            },
+            // Degenerate but legal on the wire: the engine refuses to LOG an
+            // empty mutate, but decode must not care.
+            Record::Mutate {
+                collection: 0,
+                retire: Bitmap(RoaringBitmap::new()),
+                install: vec![],
+            },
+        ] {
+            let mut buf = Vec::new();
+            record.encode(&mut buf);
+            let decoded = Record::decode(&buf).expect("decode clean payload");
+            assert_eq!(record, decoded);
+        }
     }
 
     #[test]
@@ -1174,8 +1732,12 @@ mod tests {
             let wal = Wal::start(&path, live.clone(), 0).unwrap();
             let handle = wal.handle();
             for (i, rec) in records.iter().enumerate() {
-                let lsn = handle.append(rec.clone()).unwrap();
-                assert_eq!(lsn.0, (i + 1) as u64, "LSNs are 1-based, monotonic, gap-free");
+                let committed = handle.append(rec.clone()).unwrap();
+                assert_eq!(
+                    committed.lsn.0,
+                    (i + 1) as u64,
+                    "LSNs are 1-based, monotonic, gap-free"
+                );
             }
             // Drop our handle clone BEFORE shutdown: the commit thread only
             // exits once every sender is gone, so a lingering clone would hang
@@ -1207,7 +1769,7 @@ mod tests {
 
             // Recovery resumes the counter past the highest LSN seen.
             let next = wal.handle().append(insert(0, 2, &[5.0, 6.0])).unwrap();
-            assert_eq!(next.0, records.len() as u64 + 1);
+            assert_eq!(next.lsn.0, records.len() as u64 + 1);
             wal.shutdown();
         }
     }
@@ -1306,7 +1868,7 @@ mod tests {
         let wal = Wal::start(&path, recovered.clone(), 0).unwrap();
         assert_eq!(recovered.snapshot().len(), 2);
         let next = wal.handle().append(insert(0, 2, &[3.0])).unwrap();
-        assert_eq!(next.0, 3);
+        assert_eq!(next.lsn.0, 3);
         wal.shutdown();
     }
 }

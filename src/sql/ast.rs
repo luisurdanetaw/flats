@@ -44,7 +44,49 @@ pub enum Statement {
     CreateCollection(CreateStmt),
     /// `SEARCH TOP … NEAREST TO … FROM …`
     Search(SearchStmt),
-    // EXTEND: Delete(DeleteStmt), Update(UpdateStmt).
+    /// `DELETE FROM … WHERE …`
+    Delete(DeleteStmt),
+    /// `UPDATE … SET … WHERE …`
+    Update(UpdateStmt),
+}
+
+/// `UPDATE ident SET col = literal, … WHERE expr`.
+///
+/// The predicate is REQUIRED, for the same reason a DELETE's is: V-SQL has no
+/// statement that rewrites a whole collection by leaving a clause out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateStmt {
+    /// The collection named after `UPDATE`.
+    pub collection: String,
+    /// The `SET` list, in source order. Names are unresolved and values
+    /// untyped — both are the binder's to check.
+    pub assignments: Vec<Assignment>,
+    /// Which rows to rewrite.
+    pub filter: Expr,
+}
+
+/// One `column = value` in a `SET` list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Assignment {
+    /// Target column name, as written.
+    pub column: String,
+    /// The new value. A literal, not an expression: V-SQL has no arithmetic,
+    /// so `SET n = n + 1` is not in the language.
+    pub value: Literal,
+}
+
+/// `DELETE FROM ident WHERE expr`.
+///
+/// The predicate is REQUIRED, not optional like `SELECT`'s: V-SQL has no
+/// statement that deletes a whole collection by leaving a clause out (CLAUDE.md
+/// §4). A missing `WHERE` is a parse error, so the dangerous form cannot be
+/// typed by accident.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteStmt {
+    /// The collection name after `FROM`.
+    pub from: String,
+    /// Which rows to delete.
+    pub filter: Expr,
 }
 
 /// `SELECT projection FROM ident [WHERE expr]`.
@@ -196,6 +238,12 @@ pub struct ColumnDef {
     pub name: String,
     /// Its declared type.
     pub ty: ColumnType,
+    /// Whether the declaration carried `PRIMARY KEY`.
+    ///
+    /// Syntax only: that exactly one column claims it, and that its type can
+    /// serve as an identity, are the binder's to enforce — the parser's job
+    /// ends at recording what was typed.
+    pub primary_key: bool,
 }
 
 /// A column's declared type. Distinct from the storage engine's

@@ -61,9 +61,11 @@
 use crate::compiler::bytecode::{Addr, Cursor, Op, Program, Reg};
 use crate::compiler::constants::{Const, ConstPool};
 use crate::compiler::schema::{SchemaError, to_metadata_schema};
-use crate::metadata::common::{ColumnId, ColumnLocation, DeclarationOrdinal, RangeOp, Schema};
+use crate::metadata::common::{
+    ColumnId, ColumnLocation, DeclarationOrdinal, RangeOp, Schema, Value,
+};
 use crate::sql::ast::{CompareOp, Literal};
-use crate::sql::bind::{BoundPredicate, Projected, Pseudo};
+use crate::sql::bind::{BoundPredicate, ColumnRef, Projected, Pseudo, TypedValue};
 use crate::sql::plan::LogicalPlan;
 use std::fmt;
 
@@ -415,7 +417,7 @@ impl<'a> Compiler<'a> {
 
     /// Emit `node`. WRAPPER nodes (`Scan`, `Knn`; later `Limit`) emit a loop top, then
     /// run `body` to fill the loop, then emit the loop bottom. LEAF nodes
-    /// (`Insert`, `CreateCollection`) emit directly and ignore `body`. `Project`
+    /// (`Insert`, `CreateCollection`, `Delete`) emit directly and ignore `body`. `Project`
     /// is the middle case: it owns no loop and hands its per-row code down to
     /// its child via `body`.
     ///
@@ -489,11 +491,6 @@ impl<'a> Compiler<'a> {
                         match item {
                             // A computed pseudo-column: no schema lookup, because
                             // there is nothing stored to look up.
-                            Projected::Pseudo(Pseudo::Id) => {
-                                let dst = c.alloc_reg();
-                                let cur = c.current_cursor();
-                                c.emit(Op::RowId { cur, dst });
-                            }
                             Projected::Pseudo(Pseudo::Score) => {
                                 let dst = c.alloc_reg();
                                 let cur = c.current_cursor();
@@ -588,7 +585,80 @@ impl<'a> Compiler<'a> {
                     capacity: create.capacity,
                 });
             }
+
+            LogicalPlan::Update(update) => {
+                // LEAF, exactly like `Delete`: the predicate's bitmap, then ONE
+                // Mutate over it — with the SET list attached, which is what
+                // turns "retire these" into "rewrite these". The rewrite is
+                // per STATEMENT, not per row, so the assignments are interned
+                // once rather than loaded into registers.
+                let retire = self.emit_predicate(&update.predicate, &update.collection);
+                let assignments = self.lower_assignments(&update.assignments);
+                let set = self.consts.add(Const::Assignments(assignments));
+                // The embedding is a large payload and there is exactly one of
+                // it per statement, so it is interned rather than loaded into a
+                // register — the same treatment a SEARCH's query vector gets.
+                let vector = update
+                    .vector
+                    .as_ref()
+                    .map(|v| self.consts.add(Const::Vector(v.clone())));
+                self.emit(Op::Mutate {
+                    collection: update.collection.clone(),
+                    retire,
+                    set: Some(set),
+                    vector,
+                });
+            }
+
+            LogicalPlan::Delete(delete) => {
+                // LEAF: the predicate's bitmap, then ONE Mutate over it. No
+                // cursor and no loop — the bitmap already IS the set of rows,
+                // and handing it to the engine whole is what makes the
+                // statement a single durable record.
+                let retire = self.emit_predicate(&delete.predicate, &delete.collection);
+                self.emit(Op::Mutate {
+                    collection: delete.collection.clone(),
+                    retire,
+                    // No SET list: a DELETE only retires.
+                    set: None,
+                    vector: None,
+                });
+            }
         }
+    }
+
+    /// Translate a bound SET list into storage terms: declaration ordinals
+    /// become `ColumnId`s through the catalog schema — the same translation a
+    /// projected column or a predicate's column goes through — and literals
+    /// become storage values.
+    ///
+    /// Source ORDER is preserved, because it is application order: `SET a = 1,
+    /// a = 2` means 2, and sorting or de-duplicating here would quietly change
+    /// what the statement means.
+    fn lower_assignments(&self, assignments: &[(ColumnRef, TypedValue)]) -> Vec<(ColumnId, Value)> {
+        let schema = match self.schema {
+            Some(schema) => schema,
+            None => unreachable!("an UPDATE compiled without a catalog schema"),
+        };
+        assignments
+            .iter()
+            .map(|(column, typed)| {
+                let id = match schema.locate(DeclarationOrdinal::new(column.ordinal)) {
+                    Some(ColumnLocation::Scalar(id)) => id,
+                    // The binder refuses `SET vector = ...` outright
+                    // (`BindError::CannotSetVector`), so a bound plan never
+                    // carries one.
+                    Some(ColumnLocation::Vector { .. }) => {
+                        unreachable!("the binder rejects assigning the vector column")
+                    }
+                    None => unreachable!("plan ordinal {} not in schema", column.ordinal),
+                };
+                let value = Value::try_from(&typed.value)
+                    // Scalars only: the vector arm is unreachable per above.
+                    .unwrap_or_else(|_| unreachable!("a scalar assignment lowers to a Value"));
+                (id, value)
+            })
+            .collect()
     }
 
     /// Finish the compile, moving the accumulated state into a [`Program`]. The
@@ -610,12 +680,13 @@ mod tests {
     use crate::compiler::constants::{Const, ConstId, ConstPool};
     use crate::metadata::common::{
         CollectionConfig, ColumnSpec, ColumnType as MetaColumnType, RangeOp, Schema,
+        Value as MetaValue,
     };
     use crate::sql::ast::{ColumnType, CompareOp, Literal};
     use crate::sql::bind::{
         BoundPredicate, ColumnRef, ColumnSchema, Projected, Schema as BindSchema, TypedValue,
     };
-    use crate::sql::plan::{CreateCollection, Insert, LogicalPlan, Project, Scan};
+    use crate::sql::plan::{CreateCollection, Delete, Insert, LogicalPlan, Project, Scan, Update};
     use std::num::NonZeroUsize;
 
     // ------------------------------------------------------------------------
@@ -643,6 +714,18 @@ mod tests {
             ty,
             ordinal,
             is_vector,
+            primary_key: false,
+        }
+    }
+
+    /// The same, for the column a fixture declares `PRIMARY KEY`.
+    fn bcol_key(name: &str, ty: ColumnType, ordinal: usize) -> ColumnSchema {
+        ColumnSchema {
+            name: name.to_string(),
+            ty,
+            ordinal,
+            is_vector: false,
+            primary_key: true,
         }
     }
 
@@ -652,7 +735,7 @@ mod tests {
         BindSchema {
             columns: vec![
                 bcol("vector", ColumnType::Vector(768), 0, true),
-                bcol("author", ColumnType::Text, 1, false),
+                bcol_key("author", ColumnType::Text, 1),
                 bcol("title", ColumnType::Text, 2, false),
                 bcol("published_at", ColumnType::Int, 3, false),
             ],
@@ -667,7 +750,7 @@ mod tests {
                 name: "vector".to_string(),
                 dim: NonZeroUsize::new(768).unwrap(),
             },
-            ColumnSpec::Scalar {
+            ColumnSpec::Key {
                 name: "author".to_string(),
                 ty: MetaColumnType::Text,
             },
@@ -774,6 +857,264 @@ mod tests {
                 ty: ColumnType::Int,
             },
         }
+    }
+
+    /// `UPDATE docs SET <col> = <value> WHERE <pred>`, compiled.
+    fn update_program(
+        assignments: Vec<(ColumnRef, TypedValue)>,
+        predicate: BoundPredicate,
+    ) -> Program {
+        let plan = LogicalPlan::Update(Update {
+            collection: "docs".to_string(),
+            schema: docs_bind_schema(),
+            assignments,
+            vector: None,
+            predicate,
+        });
+        compile(plan, Some(&docs_meta_schema())).expect("an UPDATE compiles")
+    }
+
+    /// `author = '<value>'` — equality on the fixture's PRIMARY KEY, which is
+    /// what a statement carrying a replacement embedding must be targeted by.
+    fn key_eq(value: &str) -> BoundPredicate {
+        BoundPredicate::Compare {
+            column: colref("author", 1),
+            op: CompareOp::Eq,
+            value: TypedValue {
+                value: Literal::Str(value.to_string()),
+                ty: ColumnType::Text,
+            },
+        }
+    }
+
+    fn text_assignment(name: &str, ordinal: usize, value: &str) -> (ColumnRef, TypedValue) {
+        (
+            colref(name, ordinal),
+            TypedValue {
+                value: Literal::Str(value.to_string()),
+                ty: ColumnType::Text,
+            },
+        )
+    }
+
+    #[test]
+    fn update_compiles_to_its_predicate_then_one_mutate_with_a_set_list() {
+        let program = update_program(
+            vec![text_assignment("author", 1, "bob")],
+            cmp_pred("published_at", 3, CompareOp::Lt, 2),
+        );
+
+        let set = match program.ops.as_slice() {
+            [
+                Op::Integer { value: 2, dst: d0 },
+                Op::BitmapRange { dst: d1, .. },
+                Op::Mutate {
+                    collection,
+                    retire,
+                    set: Some(set),
+                    vector: None,
+                },
+                Op::Halt,
+            ] => {
+                assert_eq!(*d0, Reg(0));
+                assert_eq!(collection, "docs");
+                assert_eq!(retire, d1, "Mutate retires what the predicate produced");
+                *set
+            }
+            other => panic!("unexpected program: {other:?}"),
+        };
+
+        // The SET list is interned, translated to STORAGE columns: `author` is
+        // declaration ordinal 1 and ColumnId 0.
+        assert_eq!(
+            program.consts.get(set),
+            Some(&Const::Assignments(vec![(
+                0,
+                MetaValue::Text("bob".into())
+            )]))
+        );
+        assert_eq!(program.n_cursors, 0, "an UPDATE walks no rows");
+        program.validate().expect("an UPDATE program validates");
+    }
+
+    #[test]
+    fn a_replacement_vector_is_interned_beside_the_set_list() {
+        let plan = LogicalPlan::Update(Update {
+            collection: "docs".to_string(),
+            schema: docs_bind_schema(),
+            assignments: vec![text_assignment("title", 2, "v2")],
+            vector: Some(vec![0.5; 768]),
+            predicate: key_eq("alice"),
+        });
+        let program = compile(plan, Some(&docs_meta_schema())).expect("an UPDATE compiles");
+
+        let (set, vector) = match program.ops.as_slice() {
+            [
+                Op::String { .. },
+                Op::BitmapEq { .. },
+                Op::Mutate {
+                    set: Some(set),
+                    vector: Some(vector),
+                    ..
+                },
+                Op::Halt,
+            ] => (*set, *vector),
+            other => panic!("unexpected program: {other:?}"),
+        };
+        assert_eq!(
+            program.consts.get(set),
+            Some(&Const::Assignments(vec![(1, MetaValue::Text("v2".into()))]))
+        );
+        assert_eq!(
+            program.consts.get(vector),
+            Some(&Const::Vector(vec![0.5; 768])),
+            "the embedding rides in the pool, not in the SET list"
+        );
+    }
+
+    #[test]
+    fn several_assignments_keep_source_order_in_the_pool() {
+        let program = update_program(
+            vec![
+                text_assignment("title", 2, "first"),
+                text_assignment("author", 1, "bob"),
+                text_assignment("title", 2, "last"),
+            ],
+            cmp_pred("published_at", 3, CompareOp::Lt, 2),
+        );
+        let set = program
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::Mutate { set, .. } => *set,
+                _ => None,
+            })
+            .expect("an UPDATE emits a SET list");
+        assert_eq!(
+            program.consts.get(set),
+            Some(&Const::Assignments(vec![
+                (1, MetaValue::Text("first".into())),
+                (0, MetaValue::Text("bob".into())),
+                (1, MetaValue::Text("last".into())),
+            ])),
+            "order is preserved, so the last assignment to a column wins"
+        );
+    }
+
+    /// `DELETE FROM docs WHERE <pred>`, compiled.
+    fn delete_program(predicate: BoundPredicate) -> Program {
+        let plan = LogicalPlan::Delete(Delete {
+            collection: "docs".to_string(),
+            schema: docs_bind_schema(),
+            predicate,
+        });
+        compile(plan, Some(&docs_meta_schema())).expect("a DELETE compiles")
+    }
+
+    #[test]
+    fn delete_compiles_to_its_predicate_then_one_mutate() {
+        let program = delete_program(cmp_pred("published_at", 3, CompareOp::Lt, 2));
+        assert_eq!(
+            program.ops,
+            vec![
+                Op::Integer {
+                    value: 2,
+                    dst: Reg(0)
+                },
+                Op::BitmapRange {
+                    collection: "docs".to_string(),
+                    col: 2,
+                    op: RangeOp::Lt,
+                    value: Reg(0),
+                    dst: Reg(1),
+                },
+                // The whole answer, handed over at once.
+                Op::Mutate {
+                    collection: "docs".to_string(),
+                    retire: Reg(1),
+                    set: None,
+                    vector: None,
+                },
+                Op::Halt,
+            ]
+        );
+        // No cursor: a DELETE never walks rows, so there is no loop to emit.
+        assert_eq!(program.n_cursors, 0);
+        program.validate().expect("a DELETE program validates");
+    }
+
+    #[test]
+    fn a_compound_delete_predicate_feeds_mutate_its_final_bitmap() {
+        let pred = BoundPredicate::Or(
+            Box::new(cmp_pred("published_at", 3, CompareOp::Lt, 2)),
+            Box::new(cmp_pred("published_at", 3, CompareOp::Gt, 9)),
+        );
+        let ops = delete_program(pred).ops;
+        let or_dst = ops
+            .iter()
+            .find_map(|op| match op {
+                Op::BitmapOr { dst, .. } => Some(*dst),
+                _ => None,
+            })
+            .expect("an OR predicate emits BitmapOr");
+        assert_eq!(
+            ops[ops.len() - 2],
+            Op::Mutate {
+                collection: "docs".to_string(),
+                retire: or_dst,
+                set: None,
+                vector: None,
+            },
+            "Mutate retires the combined bitmap, not either operand"
+        );
+    }
+
+    /// Naming a row by its KEY lowers to the same two ops any other equality
+    /// does — load the comparand, consult the index. There is no dedicated
+    /// opcode for identity any more, because identity is now just a column.
+    #[test]
+    fn a_key_predicate_emits_an_ordinary_equality_lookup() {
+        let ops = filtered_ops(key_eq("alice"));
+        assert!(
+            matches!(ops[0], Op::String { dst: Reg(0), .. }),
+            "got {:?}",
+            ops[0]
+        );
+        // `author` is declaration ordinal 1, ColumnId 0.
+        assert_eq!(
+            ops[1],
+            Op::BitmapEq {
+                collection: "docs".to_string(),
+                col: 0,
+                value: Reg(0),
+                dst: Reg(1),
+            }
+        );
+        assert_eq!(
+            ops[2],
+            Op::OpenRead {
+                cur: Cursor(0),
+                collection: "docs".to_string(),
+                filter: Some(Reg(1)),
+            }
+        );
+    }
+
+    #[test]
+    fn a_key_predicate_composes_with_the_index_ones() {
+        let ops = filtered_ops(BoundPredicate::And(
+            Box::new(key_eq("alice")),
+            Box::new(cmp_pred("published_at", 3, CompareOp::Lt, 2)),
+        ));
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, Op::BitmapEq { col: 0, .. })),
+            "the key half is an equality lookup on its column"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op, Op::BitmapAnd { .. })),
+            "and the two are intersected like any other AND"
+        );
     }
 
     #[test]
