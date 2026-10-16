@@ -63,6 +63,16 @@ pub enum ParseErrorKind {
     },
     /// A word in type position that names no known type (e.g. `BLOB`).
     UnknownType(String),
+    /// A construct V-SQL reserves but deliberately does not support.
+    ///
+    /// Reserved rather than left as an identifier so the refusal can NAME it:
+    /// `WHERE NOT x = 1` with `NOT` as an ordinary word parses the keyword as a
+    /// column and then complains about the token after it, which tells the
+    /// reader nothing about what is missing.
+    Unsupported {
+        /// What was written, and what to reach for instead.
+        what: String,
+    },
     /// Input remained after a complete statement + its `;`.
     TrailingTokens,
     /// Input ended while a rule still expected more tokens.
@@ -83,6 +93,9 @@ impl fmt::Display for ParseError {
             ),
             ParseErrorKind::UnknownType(t) => {
                 write!(f, "unknown type {t:?} at byte {}", self.span.start)
+            }
+            ParseErrorKind::Unsupported { what } => {
+                write!(f, "{what} is not supported at byte {}", self.span.start)
             }
             ParseErrorKind::TrailingTokens => {
                 write!(f, "unexpected trailing tokens at byte {}", self.span.start)
@@ -368,6 +381,13 @@ impl Parser {
             Token::Ge => CompareOp::Ge,
             Token::Eq => CompareOp::Eq,
             Token::Ne => CompareOp::Ne,
+            // `IN` sits exactly where an operator goes, so it is caught here
+            // rather than falling through and surfacing as a stray token.
+            Token::In => {
+                return Err(self.error(ParseErrorKind::Unsupported {
+                    what: "`IN` (write the alternatives as `a = x OR a = y`)".to_string(),
+                }));
+            }
             _ => return Ok(left),
         };
         self.advance();
@@ -392,6 +412,11 @@ impl Parser {
                 Ok(inner)
             }
             Token::Ident(_) => Ok(Expr::Column(self.expect_ident()?)),
+            // Refused HERE, where the word was written, rather than left to
+            // confuse the next rule. V-SQL has no negation operator.
+            Token::Not => Err(self.error(ParseErrorKind::Unsupported {
+                what: "`NOT` (use `!=` for inequality, or rewrite with `AND`/`OR`)".to_string(),
+            })),
             // Every literal form the rest of the grammar knows, including
             // vectors — which no predicate can usefully compare, but rejecting
             // that HERE would mean the parser knowing what a comparison means.

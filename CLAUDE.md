@@ -112,7 +112,12 @@ SELECT * FROM docs; -- NOTE: DOES NOT RETURN EMBEDDING BY DEFAULT!
 SELECT vector FROM docs; -- NAME the vector column to get the embedding back.
                          -- Opt-in, never part of `*` — same as Pinecone's
                          -- include_values / Qdrant's with_vector.
-SELECT x, y FROM docs WHERE a < 4 AND a = 2; -- NOTE: we will support < > <= >= != =  AND OR and thats it... maybe IN with range/set stuff if easy...
+SELECT x, y FROM docs WHERE a < 4 AND a = 2; -- NOTE: we support < > <= >= != =
+                                             -- AND OR and that is it.
+-- CUT from v1: `IN` and `NOT`. Both are reserved words and both are refused BY
+-- NAME with a message pointing at the alternative — an `IN` list is an `OR`
+-- chain, and `!=` covers negated equality. Reserved rather than ignored so the
+-- refusal says what is missing instead of failing on the next token.
 
 
 -- INSERT (every column, including the key — V-SQL has no NULLs and no defaults)

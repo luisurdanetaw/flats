@@ -83,6 +83,12 @@ pub enum Token {
     Update,
     /// `SET`
     Set,
+    /// `NOT` — reserved so it can be refused by name; V-SQL has no negation
+    /// operator (use `!=`, or rewrite with `AND`/`OR`).
+    Not,
+    /// `IN` — reserved so it can be refused by name; not in V-SQL for v1 (an
+    /// `IN` list is an `OR` chain).
+    In,
     /// `PRIMARY`
     Primary,
     /// `KEY`
@@ -252,6 +258,8 @@ fn keyword(word: &str) -> Option<Token> {
         "delete" => Some(Token::Delete),
         "update" => Some(Token::Update),
         "set" => Some(Token::Set),
+        "not" => Some(Token::Not),
+        "in" => Some(Token::In),
         "primary" => Some(Token::Primary),
         "key" => Some(Token::Key),
         // EXTEND: future reserved keywords here.
