@@ -446,6 +446,17 @@ pub enum BindError {
         /// The supplied literal's length.
         found: usize,
     },
+    /// An `INSERT` named the same column more than once.
+    ///
+    /// Refused rather than resolved to "last one wins", because the statement
+    /// cannot mean what it says: a row has one value per column, so a second
+    /// value for one column means a column somewhere else has none. Accepting
+    /// it silently shifted every later value by one and wrote the displaced
+    /// one into a column the statement never mentioned.
+    DuplicateInsertColumn {
+        /// The column named more than once.
+        column: String,
+    },
     /// A `CREATE COLLECTION` schema did not have exactly one vector column.
     VectorColumnCount {
         /// How many vector columns were declared (valid schemas have exactly 1).
@@ -538,6 +549,10 @@ impl fmt::Display for BindError {
             } => write!(
                 f,
                 "vector dimension mismatch for column {column:?}: expected {expected}, found {found}"
+            ),
+            BindError::DuplicateInsertColumn { column } => write!(
+                f,
+                "column {column:?} is named twice; a row has one value per column"
             ),
             BindError::VectorColumnCount { found } => write!(
                 f,
@@ -912,6 +927,14 @@ fn bind_insert(stmt: InsertStmt, catalog: &impl Catalog) -> Result<BoundInsert, 
         let col = schema
             .column(&name)
             .ok_or_else(|| BindError::ColumnNotFound(name.clone()))?;
+        // One value per column, checked BEFORE the value is placed. A repeat
+        // used to shift every later value by one ordinal while leaving the
+        // count intact, so the record split downstream saw a well-formed row
+        // and wrote the displaced value into a column nobody named — see
+        // `BindError::DuplicateInsertColumn`.
+        if placed.iter().any(|(ordinal, _)| *ordinal == col.ordinal) {
+            return Err(BindError::DuplicateInsertColumn { column: name });
+        }
         let typed = typecheck(col, literal)?;
         placed.push((col.ordinal, typed));
     }
