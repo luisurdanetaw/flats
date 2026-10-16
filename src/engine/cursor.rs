@@ -416,6 +416,43 @@ mod tests {
         db.close().unwrap();
     }
 
+    /// The embedding is reachable FROM THE CURSOR, not from the `Db`.
+    ///
+    /// That is the whole shape of `SELECT vector`: a read stream detaches from
+    /// the `Db` once its cursors are open and keeps yielding rows, so anything
+    /// a row needs must already be in the cursor's hand. The flat reader rides
+    /// along exactly as the tuple reader does.
+    #[test]
+    fn vector_is_the_rows_own_embedding() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path());
+        insert_n(&db, 3);
+
+        let mut cursor = db.scan(0).unwrap();
+        // Never valid before the first row — same contract as `column`.
+        assert!(cursor.vector().is_none(), "no row, no embedding");
+
+        let mut seen = 0u64;
+        let mut has_row = cursor.seek_first().unwrap();
+        while has_row {
+            let ordinal = cursor.ordinal().expect("parked on a row").0 as u64;
+            assert_eq!(
+                cursor.vector(),
+                Some(vector_for(ordinal).as_slice()),
+                "row {ordinal} must report ITS OWN embedding"
+            );
+            seen += 1;
+            has_row = cursor.next().unwrap();
+        }
+        assert_eq!(seen, 3);
+        assert!(
+            cursor.vector().is_none(),
+            "exhausted cursor has no embedding either"
+        );
+
+        db.close().unwrap();
+    }
+
     #[test]
     fn single_row_reads_back() {
         let dir = tempfile::tempdir().unwrap();
