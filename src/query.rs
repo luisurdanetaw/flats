@@ -538,9 +538,9 @@ mod tests {
     fn a_partial_insert_names_the_missing_columns() {
         let (_dir, db) = docs_db();
 
-        let err = match db.execute(
-            "INSERT INTO docs (author, vector) VALUES ('alice', [0.1, 0.2, 0.3, 0.4]);",
-        ) {
+        let err = match db
+            .execute("INSERT INTO docs (author, vector) VALUES ('alice', [0.1, 0.2, 0.3, 0.4]);")
+        {
             Err(e) => e,
             Ok(_) => panic!("a partial row must be refused"),
         };

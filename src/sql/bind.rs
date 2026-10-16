@@ -446,6 +446,17 @@ pub enum BindError {
         /// The supplied literal's length.
         found: usize,
     },
+    /// An `INSERT` did not give a value for every column.
+    ///
+    /// Required, not a limitation to lift later: V-SQL has no NULLs and no
+    /// defaults (see [`ColumnType`]), so an omitted column has nothing it
+    /// could hold. The columns are named so the caller can see what they
+    /// forgot — this used to reach the VM's record splitter and come back
+    /// describing value counts instead of the statement.
+    MissingColumns {
+        /// The unnamed columns, in schema declaration order.
+        columns: Vec<String>,
+    },
     /// An `INSERT` named the same column more than once.
     ///
     /// Refused rather than resolved to "last one wins", because the statement
@@ -549,6 +560,12 @@ impl fmt::Display for BindError {
             } => write!(
                 f,
                 "vector dimension mismatch for column {column:?}: expected {expected}, found {found}"
+            ),
+            BindError::MissingColumns { columns } => write!(
+                f,
+                "INSERT must give a value for every column; missing {} \
+                 (V-SQL has no NULLs and no defaults)",
+                columns.join(", ")
             ),
             BindError::DuplicateInsertColumn { column } => write!(
                 f,
@@ -939,7 +956,22 @@ fn bind_insert(stmt: InsertStmt, catalog: &impl Catalog) -> Result<BoundInsert, 
         placed.push((col.ordinal, typed));
     }
 
-    // 5. Reorder into schema (canonical) order.
+    // 5. COVERAGE: every column must have been named. Checked after the loop,
+    //    so an unknown or repeated name is reported as the mistake it is
+    //    rather than as the hole it leaves behind.
+    if placed.len() != schema.columns.len() {
+        let named: Vec<usize> = placed.iter().map(|(ordinal, _)| *ordinal).collect();
+        return Err(BindError::MissingColumns {
+            columns: schema
+                .columns
+                .iter()
+                .filter(|c| !named.contains(&c.ordinal))
+                .map(|c| c.name.clone())
+                .collect(),
+        });
+    }
+
+    // 6. Reorder into schema (canonical) order.
     placed.sort_by_key(|(ordinal, _)| *ordinal);
     let row = placed.into_iter().map(|(_, tv)| tv).collect();
 
@@ -2024,7 +2056,10 @@ mod tests {
 
         // Several, reported in DECLARATION order rather than the order the
         // statement happened to leave them out.
-        let src = format!("INSERT INTO docs (title, vector) VALUES ('My doc', {});", vec_lit(768));
+        let src = format!(
+            "INSERT INTO docs (title, vector) VALUES ('My doc', {});",
+            vec_lit(768)
+        );
         assert_eq!(
             analyze_err(&src, &cat),
             BindError::MissingColumns {
