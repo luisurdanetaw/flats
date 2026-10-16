@@ -597,6 +597,57 @@ mod tests {
         db.close().unwrap();
     }
 
+    /// A ranked read can return the embeddings too — which is the form that
+    /// actually matters. Fetching by key is the rare case; the common one is
+    /// "find me the nearest rows AND give me their vectors", which is exactly
+    /// what Pinecone's `include_values` and Qdrant's `with_vector` are for.
+    #[test]
+    fn search_can_return_the_embedding() {
+        let (_dir, db) = docs_db();
+        seed_ranked(&db); // far=[1,0,0,0], near=[3,0,0,0], mid=[2,0,0,0]
+
+        let stream = db
+            .execute("SEARCH TOP 2 NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM docs RETURNING title, vector, score;")
+            .expect("a ranked read can project the embedding");
+        assert_eq!(stream.labels(), ["title", "vector", "score"]);
+
+        let rows = collect(stream);
+        assert_eq!(rows.len(), 2);
+        // Nearest first, and each row carries ITS OWN embedding — paired with
+        // its own score, so a fetch one row out of step would show up here.
+        for (row, (title, x)) in rows.iter().zip([("near", 3.0f32), ("mid", 2.0)]) {
+            assert!(matches!(&row[0], RegValue::Str(t) if t == title), "{row:?}");
+            match &row[1] {
+                RegValue::Vector(v) => assert_eq!(&v[..], &[x, 0.0, 0.0, 0.0]),
+                other => panic!("expected an embedding, got {other:?}"),
+            }
+            assert!(
+                matches!(&row[2], RegValue::Real(s) if *s == x as f64),
+                "score must belong to the same row as the embedding: {row:?}"
+            );
+        }
+        db.close().unwrap();
+    }
+
+    /// A bare `SEARCH` still returns only the stored scalars — the embedding is
+    /// opt-in on a ranked read exactly as it is on a `SELECT`.
+    #[test]
+    fn bare_search_still_omits_the_embedding() {
+        let (_dir, db) = docs_db();
+        seed_ranked(&db);
+
+        let stream = db
+            .execute("SEARCH TOP 1 NEAREST TO [1.0, 0.0, 0.0, 0.0] FROM docs;")
+            .expect("the search runs");
+        assert_eq!(stream.labels(), ["author", "title", "published_at"]);
+        assert!(
+            collect(stream)[0]
+                .iter()
+                .all(|v| !matches!(v, RegValue::Vector(_)))
+        );
+        db.close().unwrap();
+    }
+
     // -- the key is unique ---------------------------------------------------
 
     /// Every live row's `title`, from a projection of that column alone.
