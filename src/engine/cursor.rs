@@ -938,6 +938,14 @@ mod tests {
             // scan reaches the frontier long after the window shuts, so
             // without this role the skip path would go essentially unexercised.
             let full_scan = role == 0;
+            // A COVERAGE FLOOR, enforced by the loop condition below rather
+            // than asserted at the end: whether a reader thread gets CPU is a
+            // property of the machine, and this test runs alongside hundreds of
+            // siblings. A starved run must come out slower, never red.
+            //
+            // Per role, because the two cost wildly different amounts: a full
+            // scan drains and verifies every live row, a probe touches one.
+            let min_iters: u64 = if full_scan { 20 } else { 350 };
             let db = Arc::clone(&db);
             let stop = Arc::clone(&stop);
             let scans = Arc::clone(&scans);
@@ -947,7 +955,11 @@ mod tests {
                 let tuples = db.tuple_reader(0).expect("tuple reader");
                 let vectors = db.reader(0).expect("vector reader");
                 let meta = db.metadata_reader(0).expect("metadata reader");
-                while !stop.load(Ordering::Relaxed) {
+                let mut seen = 0u64;
+                // Runs for as long as the writer does — that is where the race
+                // lives — then keeps going until this reader has met its floor.
+                while !stop.load(Ordering::Relaxed) || seen < min_iters {
+                    seen += 1;
                     if full_scan {
                         let mut cursor = db.scan(0).expect("scan");
                         // `drain` verifies every row's values against its
@@ -1045,10 +1057,19 @@ mod tests {
             "the one liveness authority must match the writer's live set"
         );
 
-        // A run where the readers never got going would prove nothing.
-        assert!(scans.load(Ordering::Relaxed) > 1_000, "readers barely ran");
+        // A run where the readers never got going would prove nothing, so the
+        // floors above guarantee they did. STRUCTURAL: these hold by the loop
+        // condition, and are kept so an edit that weakens it fails here instead
+        // of quietly making the test vacuous.
+        let floor: u64 = 20 + (threads as u64 - 1) * 350;
         assert!(
-            rows_read.load(Ordering::Relaxed) > 1_000,
+            scans.load(Ordering::Relaxed) >= floor,
+            "every reader must meet its coverage floor (expected >= {floor})"
+        );
+        assert!(
+            // Each full scan drains the whole live set, which never drops below
+            // the seeded rows, so 20 of them alone clear this.
+            rows_read.load(Ordering::Relaxed) >= 20 * seed_rows,
             "readers saw almost no rows"
         );
         assert!(frontier > seed_rows, "writer made no progress");
