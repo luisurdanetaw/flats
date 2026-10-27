@@ -34,6 +34,7 @@
 //! row); the stores themselves are never imported here.
 
 
+use std::any::Any;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -274,6 +275,31 @@ pub trait Apply {
     /// happen here, not on a separate flusher thread that would need a second
     /// mutator. The commit thread truncates the WAL up to the returned LSN.
     fn checkpoint(&mut self) -> io::Result<Option<u64>>;
+
+    /// Run an applier-specific job on the commit thread, between batches,
+    /// exactly where a checkpoint would run — so it sees a log that is durable
+    /// and fully applied, and no record applies while it runs. Returns the LSN
+    /// through which the log may be truncated afterwards, like `checkpoint`.
+    ///
+    /// The job is opaque here (`Any`): the log does not know what it is, only
+    /// that it must run on the thread that owns the writers. The engine uses it
+    /// for compaction's generation flip. An applier with no jobs refuses.
+    fn control(&mut self, job: Box<dyn Any + Send>) -> io::Result<Option<u64>> {
+        let _ = job;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this applier runs no control jobs",
+        ))
+    }
+
+    /// `Some(cause)` once the applier can no longer be trusted to absorb
+    /// records — checked after every control job. The log halts on it exactly
+    /// as on an apply failure (see `Poison`), BEFORE any further frame is
+    /// written, which is the point: a refusal from `apply` would come too late,
+    /// after its record was already durable.
+    fn halted(&self) -> Option<String> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +422,12 @@ enum Command {
     Checkpoint {
         ack: Sender<io::Result<()>>,
     },
+    /// Run `Apply::control` on the commit thread, then truncate the log up to
+    /// the watermark it returns.
+    Control {
+        job: Box<dyn Any + Send>,
+        ack: Sender<io::Result<()>>,
+    },
 }
 
 /// Cloneable handle the engine hands to writer threads.
@@ -451,6 +483,18 @@ impl WalHandle {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wal thread dropped ack"))?
     }
 
+    /// Run `job` through `Apply::control` on the commit thread, between
+    /// batches, and BLOCK until done (truncation included).
+    pub fn control(&self, job: Box<dyn Any + Send>) -> io::Result<()> {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        self.tx
+            .send(Command::Control { job, ack: ack_tx })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wal thread gone"))?;
+        ack_rx
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wal thread dropped ack"))?
+    }
+
     // TODO: an async variant that returns a future instead of blocking, for the
     // engine's async front door.
 }
@@ -478,7 +522,9 @@ impl WalHandle {
 /// the index is a derived cache, and you re-derive rather than repair in place.
 #[derive(Clone, Debug)]
 pub struct Poison {
-    /// The durable record the index never absorbed.
+    /// The durable record the index never absorbed — or, for a halt raised by
+    /// a control job (`Apply::halted`), the last committed LSN: there is no
+    /// missing record then, only an applier that must be reopened.
     pub lsn: Lsn,
     /// The apply error, rendered where it happened.
     pub cause: String,
@@ -625,15 +671,20 @@ enum Control {
     Checkpoint {
         ack: Sender<io::Result<()>>,
     },
+    Job {
+        job: Box<dyn Any + Send>,
+        ack: Sender<io::Result<()>>,
+    },
 }
 
 impl Control {
-    /// Both variants ack the same way; a poisoned log refuses either without
-    /// caring which it was.
+    /// Every variant acks the same way; a poisoned log refuses any of them
+    /// without caring which it was.
     fn into_ack(self) -> Sender<io::Result<()>> {
         match self {
             Control::Truncate { ack, .. } => ack,
             Control::Checkpoint { ack } => ack,
+            Control::Job { ack, .. } => ack,
         }
     }
 }
@@ -670,6 +721,7 @@ fn commit_loop<A: Apply>(
                 pending_control = Some(Control::Truncate { up_to, ack })
             }
             Command::Checkpoint { ack } => pending_control = Some(Control::Checkpoint { ack }),
+            Command::Control { job, ack } => pending_control = Some(Control::Job { job, ack }),
         }
         if pending_control.is_none() {
             while batch.len() < MAX_BATCH {
@@ -681,6 +733,10 @@ fn commit_loop<A: Apply>(
                     }
                     Ok(Command::Checkpoint { ack }) => {
                         pending_control = Some(Control::Checkpoint { ack });
+                        break;
+                    }
+                    Ok(Command::Control { job, ack }) => {
+                        pending_control = Some(Control::Job { job, ack });
                         break;
                     }
                     Err(_) => break, // empty or disconnected; flush what we have
@@ -748,6 +804,24 @@ fn commit_loop<A: Apply>(
                     Ok(None) => Ok(()),
                     Err(e) => Err(e),
                 };
+                let _ = ack.send(res);
+            }
+            Some(Control::Job { job, ack }) => {
+                let res = match applier.control(job) {
+                    Ok(Some(up_to)) => truncate_wal(&mut file, &path, up_to),
+                    Ok(None) => Ok(()),
+                    Err(e) => Err(e),
+                };
+                // Halt BEFORE the next batch is drained: that batch's frames
+                // would otherwise be written and fsynced on top of an applier
+                // that cannot absorb them. No record is unapplied here, so the
+                // poison names the last committed LSN rather than a hole.
+                if let Some(cause) = applier.halted() {
+                    let _ = poison.set(Poison {
+                        lsn: Lsn(next_lsn.saturating_sub(1)),
+                        cause,
+                    });
+                }
                 let _ = ack.send(res);
             }
             None => {}

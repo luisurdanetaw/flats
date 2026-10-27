@@ -310,6 +310,13 @@ impl Db {
             // snapshot, since which rows match may have changed — so a fresh
             // `Vm` runs the same compiled program. Callers never see the
             // conflict, only the applied result.
+            //
+            // The write gate is held across the WHOLE statement, not just the
+            // `Db` call that logs it: a DELETE or UPDATE resolves its ordinals
+            // from a snapshot first, and a compaction that renumbered them in
+            // between would point the record at different rows. See
+            // `engine::compact`.
+            let _gate = self.write_gate();
             for attempt in 1..=MAX_WRITE_ATTEMPTS {
                 match (|| -> Result<(), Error> {
                     while vm.step(self)?.is_some() {}
@@ -336,8 +343,22 @@ impl Db {
         } else {
             // LAZY: open the cursors, then detach. Everything after this pulls
             // without a `Db`.
-            vm.open_cursors(self)?;
-            Ok(RowStream::over(labels, vm))
+            //
+            // Opening resolves several handles per collection — the live set,
+            // the metadata reader, the flat reader — one at a time. If a
+            // compaction published a new generation between two of them, they
+            // disagree about what an ordinal means, so start again; a read has
+            // done nothing it needs to undo. Once open, the cursors hold one
+            // generation's handles and need no further care.
+            loop {
+                let seen = self.epoch().begin();
+                let opened = vm.open_cursors(self);
+                if self.epoch().unchanged(seen) {
+                    opened?;
+                    return Ok(RowStream::over(labels, vm));
+                }
+                vm = Vm::new(program.clone())?;
+            }
         }
     }
 }

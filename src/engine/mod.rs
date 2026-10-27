@@ -52,8 +52,11 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+mod compact;
 pub mod cursor;
 
+pub use crate::engine::compact::CompactionOptions;
+use crate::engine::compact::{Compactor, Epoch, GateGuard, Shared, WriteGate};
 use crate::engine::cursor::Cursor;
 use crate::error::{Error, Result};
 use crate::index::index::{FlatIndex, Ordinal, Reader, SearchResult, Writer};
@@ -97,12 +100,16 @@ pub struct DbOptions {
     /// How often the background flusher runs a checkpoint. Set very large to
     /// effectively disable it and drive checkpoints manually via `checkpoint`.
     pub checkpoint_interval: Duration,
+    /// When the background compactor rebuilds a collection. It wakes on
+    /// `checkpoint_interval` too. See [`CompactionOptions`].
+    pub compaction: CompactionOptions,
 }
 
 impl Default for DbOptions {
     fn default() -> Self {
         DbOptions {
             checkpoint_interval: Duration::from_secs(5),
+            compaction: CompactionOptions::default(),
         }
     }
 }
@@ -228,7 +235,16 @@ fn collection_dir(dir: &Path, id: u32) -> PathBuf {
 /// collection from a crash is absorbed. Returns the writers, the read-side
 /// `Collection`, and the min durable watermark across the three stores.
 fn open_collection(dir: &Path, cfg: &CollectionConfig) -> Result<(CollectionWriters, Collection, u64)> {
-    let cdir = collection_dir(dir, cfg.id);
+    // An interrupted compaction can leave the directory mid-swap; resolve that
+    // first. A no-op otherwise.
+    compact::settle(dir, cfg.id)?;
+    open_collection_in(&collection_dir(dir, cfg.id), cfg)
+}
+
+/// `open_collection` against an explicit directory — the canonical one, or a
+/// compaction's staging copy.
+fn open_collection_in(cdir: &Path, cfg: &CollectionConfig) -> Result<(CollectionWriters, Collection, u64)> {
+    let cdir = cdir.to_path_buf();
     std::fs::create_dir_all(&cdir)?;
 
     let idx_path = cdir.join("vectors.idx");
@@ -285,6 +301,34 @@ struct CollectionWriters {
     live: Arc<meta::LiveHandle>,
 }
 
+impl CollectionWriters {
+    /// Make all three stores durable, returning the lowest watermark among
+    /// them.
+    ///
+    /// Flat-index order (a → b → c) is the crash-safety argument — do not
+    /// reorder:
+    ///   a. `sync_data`       — vector + tombstone pages durable
+    ///   b. `stage_watermark` — write `(count, last_lsn)` into the spare slot
+    ///   c. `sync_header`     — that slot's page durable, then it becomes active
+    /// The metadata stores use serialize-and-rename snapshots (their own
+    /// crash-safe protocol).
+    fn checkpoint(&mut self) -> io::Result<u64> {
+        // Snapshot BEFORE syncing so we never persist a watermark/count that
+        // covers bytes the sync didn't flush.
+        let (count, flat_lsn) = self.flat.begin_checkpoint();
+        self.flat.sync_data().map_err(to_io)?; // a
+        self.flat.stage_watermark(count, flat_lsn).map_err(to_io)?; // b
+        self.flat.sync_header().map_err(to_io)?; // c
+
+        let meta_lsn = self.meta.applied_lsn();
+        self.meta.checkpoint(meta_lsn).map_err(to_io)?;
+        let tuple_lsn = self.tuple.applied_lsn();
+        self.tuple.checkpoint(tuple_lsn).map_err(to_io)?;
+
+        Ok(flat_lsn.min(meta_lsn.0).min(tuple_lsn.0))
+    }
+}
+
 /// Owns every collection's writers. Lives entirely on the WAL commit thread,
 /// which is what upholds the single-writer invariant: only this thread, via
 /// these uniquely-owned writers, ever mutates an index. (The Mutex inside the
@@ -319,6 +363,33 @@ struct IndexApplier {
     /// unlike an insert, so without it the invariant would rest entirely on a
     /// guarantee made two modules away.
     failed_create: Option<u64>,
+    /// Per collection, the lowest durable watermark among its stores at open
+    /// (and after a compaction, the flip's LSN). A data record at or below it
+    /// is already reflected in every store of that collection, so `apply`
+    /// skips it.
+    ///
+    /// For a collection that was never compacted this only saves work — the
+    /// apply would have been an idempotent no-op. After a compaction it is
+    /// load-bearing: a record from before the flip names an OLD ordinal, which
+    /// in the new generation is a different row, and the WAL may still hold it
+    /// (truncation is the global minimum). See `compact`.
+    floors: HashMap<u32, u64>,
+    /// Bumped around every compaction publish; see `compact::Epoch`.
+    epoch: Arc<Epoch>,
+    /// Set when a compaction left memory and disk disagreeing about which
+    /// generation a collection is. Every later apply and checkpoint refuses,
+    /// and the log halts (`Apply::halted`) before writing another frame.
+    halted: Option<String>,
+}
+
+/// The collection a data record writes to; `None` for DDL.
+fn data_collection(record: &Record) -> Option<u32> {
+    match record {
+        Record::Insert { collection, .. }
+        | Record::Delete { collection, .. }
+        | Record::Mutate { collection, .. } => Some(*collection),
+        Record::CreateCollection { .. } => None,
+    }
 }
 
 impl Apply for IndexApplier {
@@ -350,6 +421,16 @@ impl Apply for IndexApplier {
     /// deletes publish it first. Do not reorder — `concurrent_stores.rs`
     /// asserts the resulting property directly.
     fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<Outcome> {
+        if let Some(cause) = &self.halted {
+            return Err(io::Error::other(cause.clone()));
+        }
+        // Already reflected in every store of its collection — see `floors`.
+        if let Some(collection) = data_collection(record)
+            && lsn.0 <= self.floors.get(&collection).copied().unwrap_or(0)
+        {
+            self.last_applied = self.last_applied.max(lsn.0);
+            return Ok(Outcome::Applied);
+        }
         match record {
             Record::Insert {
                 collection,
@@ -501,21 +582,12 @@ impl Apply for IndexApplier {
     /// persisted watermark is still in the min — erroring out keeps that
     /// trivially true.
     fn checkpoint(&mut self) -> io::Result<Option<u64>> {
+        if let Some(cause) = &self.halted {
+            return Err(io::Error::other(cause.clone()));
+        }
         let mut min_durable = u64::MAX;
         for w in self.writers.values_mut() {
-            // Snapshot BEFORE syncing so we never persist a watermark/count that
-            // covers bytes the sync didn't flush.
-            let (count, flat_lsn) = w.flat.begin_checkpoint();
-            w.flat.sync_data().map_err(to_io)?; // a
-            w.flat.stage_watermark(count, flat_lsn).map_err(to_io)?; // b
-            w.flat.sync_header().map_err(to_io)?; // c
-
-            let meta_lsn = w.meta.applied_lsn();
-            w.meta.checkpoint(meta_lsn).map_err(to_io)?;
-            let tuple_lsn = w.tuple.applied_lsn();
-            w.tuple.checkpoint(tuple_lsn).map_err(to_io)?;
-
-            min_durable = min_durable.min(flat_lsn).min(meta_lsn.0).min(tuple_lsn.0);
+            min_durable = min_durable.min(w.checkpoint()?);
         }
 
         // The catalog is the FOURTH store: persist the registry stamped with
@@ -531,6 +603,17 @@ impl Apply for IndexApplier {
         } else {
             Some(min_durable)
         })
+    }
+
+    fn control(&mut self, job: Box<dyn std::any::Any + Send>) -> io::Result<Option<u64>> {
+        if let Some(cause) = &self.halted {
+            return Err(io::Error::other(cause.clone()));
+        }
+        self.run_control(job)
+    }
+
+    fn halted(&self) -> Option<String> {
+        self.halted.clone()
     }
 }
 
@@ -613,7 +696,8 @@ impl IndexApplier {
         }
 
         let materialized = (|| -> Result<(CollectionWriters, Collection)> {
-            let (writers, collection, _watermark) = open_collection(&self.dir, config)?;
+            let (writers, collection, watermark) = open_collection(&self.dir, config)?;
+            self.floors.insert(config.id, watermark);
             // The new collection-{id}/ entry itself must survive a crash: the
             // stores fsync'd their own files, but the parent dir entry is
             // separate. (Replay would heal it anyway; this just makes the
@@ -816,6 +900,16 @@ pub struct Db {
     ddl: Mutex<()>,
     wal: Option<Wal>,
     flusher: Option<Flusher>,
+    /// Held shared by every write while it is in flight, so a compaction's
+    /// flip can wait them out. See `compact::WriteGate`.
+    gate: Arc<WriteGate>,
+    /// Bumped around every compaction publish, so a query can tell it straddled
+    /// one. See `compact::Epoch`.
+    epoch: Arc<Epoch>,
+    /// What a compaction needs; shared with the background compactor.
+    compaction: Arc<Shared>,
+    /// The background compactor, unless `CompactionOptions::enabled` is off.
+    compactor: Option<Compactor>,
 }
 
 impl Db {
@@ -877,9 +971,11 @@ impl Db {
         // Conservative global minimum watermark across every store of every
         // collection (see the recovery note below).
         let mut min_watermark = u64::MAX;
+        let mut floors: HashMap<u32, u64> = HashMap::with_capacity(registry.len());
         for cfg in &registry {
             let (collection_writers, collection, watermark) = open_collection(dir, cfg)?;
             min_watermark = min_watermark.min(watermark);
+            floors.insert(cfg.id, watermark);
             map.insert(cfg.id, Arc::new(collection));
             writers.insert(cfg.id, collection_writers);
         }
@@ -914,6 +1010,7 @@ impl Db {
         //    applier owns). The catalog's readers observe the same inners; a
         //    replayed CreateCollection publishes straight into the shared map.
         let wal_path = Self::wal_path(dir);
+        let epoch = Arc::new(Epoch::new());
         let applier = IndexApplier {
             dir: dir.to_path_buf(),
             writers,
@@ -921,6 +1018,9 @@ impl Db {
             catalog: catalog.clone(),
             last_applied: skip_through,
             failed_create: None,
+            floors,
+            epoch: Arc::clone(&epoch),
+            halted: None,
         };
         let wal = Wal::start(&wal_path, applier, skip_through)?;
 
@@ -935,19 +1035,41 @@ impl Db {
         // 5. Background checkpoints (the flusher just pokes the commit thread).
         let flusher = Flusher::spawn(wal.handle(), opts.checkpoint_interval);
 
+        // 6. Background compaction, on the same cadence.
+        let gate = Arc::new(WriteGate::new());
+        let compaction = Arc::new(Shared {
+            dir: dir.to_path_buf(),
+            catalog: catalog.clone(),
+            gate: Arc::clone(&gate),
+            opts: opts.compaction,
+            running: Mutex::new(()),
+            stop: std::sync::atomic::AtomicBool::new(false),
+        });
+        let compactor = opts.compaction.enabled.then(|| {
+            Compactor::spawn(Arc::clone(&compaction), wal.handle(), opts.checkpoint_interval)
+        });
+
         Ok(Db {
             catalog,
             ddl: Mutex::new(()),
             wal: Some(wal),
             flusher: Some(flusher),
+            gate,
+            epoch,
+            compaction,
+            compactor,
         })
     }
 
     /// Insert `vector` plus its metadata `row` into `collection` as ONE
     /// durable record. Blocks until durable. Returns the vector's ordinal
-    /// (its stable id within the collection, shared by all three indexes).
+    /// (its position within the collection, shared by all three indexes).
     /// Vector-only collections (empty schema) pass an empty row.
+    ///
+    /// The ordinal is stable only until the collection is next compacted,
+    /// which renumbers every row; a row's lasting identity is its primary key.
     pub fn insert(&self, collection: u32, vector: &[f32], row: Row) -> Result<Ordinal> {
+        let _gate = self.gate.enter();
         let coll = self.collection(collection)?;
         // Validate dim AND row BEFORE we log: a record that can't apply must
         // never reach the durable WAL, or it would fail apply forever on every
@@ -977,6 +1099,7 @@ impl Db {
         // the file costs the collection a slot of its capacity for nothing.
         self.check_poison()?;
         let ordinal = coll.alloc_ordinal()?;
+        self.allocated(&coll, ordinal, ordinal + 1);
         // The row is moved into the record below, so capture the two strings
         // an error would need WHILE the row is still here. A collection with
         // no key cannot be refused, hence the `Option`.
@@ -1053,7 +1176,11 @@ impl Db {
     }
 
     /// Tombstone `ordinal` in `collection`. Blocks until durable. Idempotent.
+    ///
+    /// Ordinals are renumbered by compaction, so `ordinal` must come from the
+    /// collection's current generation.
     pub fn delete(&self, collection: u32, ordinal: u64) -> Result<()> {
+        let _gate = self.gate.enter();
         // Validate the collection exists before logging.
         let _ = self.collection(collection)?;
         self.check_poison()?;
@@ -1089,6 +1216,7 @@ impl Db {
         mut retire: RoaringBitmap,
         install: Vec<Install>,
     ) -> Result<Outcome> {
+        let _gate = self.gate.enter();
         let coll = self.collection(collection)?;
         if retire.is_empty() && install.is_empty() {
             return Ok(Outcome::Applied);
@@ -1171,6 +1299,7 @@ impl Db {
         set: &[(ColumnId, Value)],
         vector: Option<&[f32]>,
     ) -> Result<Outcome> {
+        let _gate = self.gate.enter();
         let coll = self.collection(collection)?;
         // A predicate matching no rows is a successful no-op, like a DELETE's:
         // nothing to copy, nothing to log, no fsync spent.
@@ -1262,6 +1391,7 @@ impl Db {
         // 2. CLAIM the ordinals for the copies — one reservation, capacity
         //    checked, before any record exists.
         let start = coll.alloc_ordinals(copies.len() as u64)?;
+        self.allocated(&coll, start, start + copies.len() as u64);
         let install: Vec<Install> = copies
             .into_iter()
             .enumerate()
@@ -1522,6 +1652,7 @@ impl Db {
     /// Graceful shutdown: stop the flusher, take one final checkpoint so reopen
     /// is fast and the WAL is trimmed, then drain and join the WAL thread.
     pub fn close(mut self) -> Result<()> {
+        self.stop_compactor();
         if let Some(flusher) = self.flusher.take() {
             flusher.stop();
         }
@@ -1633,6 +1764,54 @@ impl Db {
     fn wal_path(dir: &Path) -> PathBuf {
         dir.join("wal.log")
     }
+
+    /// Compact `collection` now: rebuild its live rows densely and flip to
+    /// them, reclaiming every dead ordinal. Blocks until done. `Ok(false)` when
+    /// nothing was dead, so nothing happened.
+    ///
+    /// The background compactor does this on its own when a trigger fires;
+    /// this is the same operation on demand. Concurrent reads are never
+    /// blocked; writes pause only for the flip itself.
+    pub fn compact_now(&self, collection: u32) -> Result<bool> {
+        self.check_poison()?;
+        let wal = self.wal_handle()?;
+        self.compaction
+            .compact(&wal, collection)
+            .map_err(|e| match e {
+                Error::Io(io) => self.wal_err(io),
+                other => other,
+            })
+    }
+
+    /// Enter the write gate for a whole statement (see `compact::WriteGate`).
+    /// The `Db` write methods take it themselves; this is for a caller whose
+    /// statement resolves ordinals BEFORE reaching them — `execute`.
+    pub(crate) fn write_gate(&self) -> GateGuard<'_> {
+        self.gate.enter()
+    }
+
+    /// The compaction epoch, for a reader that resolves several handles and
+    /// must know they came from one generation (see `compact::Epoch`).
+    pub(crate) fn epoch(&self) -> &Epoch {
+        &self.epoch
+    }
+
+    /// A write just allocated ordinals `[from, to)`: let the compactor know if
+    /// that crossed its headroom line.
+    fn allocated(&self, coll: &Collection, from: u64, to: u64) {
+        if let Some(compactor) = &self.compactor {
+            compactor.allocated(coll.config.id, coll.config.capacity, from, to);
+        }
+    }
+
+    /// Abandon any build in progress and join the compactor. Before the
+    /// flusher and the WAL, because a flip needs the commit thread.
+    fn stop_compactor(&mut self) {
+        self.compaction.stop.store(true, Ordering::Relaxed);
+        if let Some(compactor) = self.compactor.take() {
+            compactor.stop();
+        }
+    }
 }
 
 impl Drop for Db {
@@ -1640,6 +1819,7 @@ impl Drop for Db {
         // If the caller didn't `close()`, still tear down cleanly: stop the
         // flusher and join the WAL thread. We skip the final checkpoint here —
         // the WAL is durable, so the next open just replays a longer tail.
+        self.stop_compactor();
         if let Some(flusher) = self.flusher.take() {
             flusher.stop();
         }
@@ -1807,6 +1987,7 @@ mod tests {
     fn manual_opts() -> DbOptions {
         DbOptions {
             checkpoint_interval: Duration::from_secs(3600),
+            ..DbOptions::default()
         }
     }
 

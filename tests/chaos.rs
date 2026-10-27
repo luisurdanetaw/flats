@@ -151,8 +151,14 @@ fn cfgs() -> Vec<CollectionConfig> {
 
 fn opts() -> DbOptions {
     // Drive checkpoints explicitly from the op stream; no background timer.
+    // No background compaction either: the model tracks rows BY ORDINAL, and
+    // compaction renumbers them. `tests/compaction.rs` covers that instead.
     DbOptions {
         checkpoint_interval: std::time::Duration::from_secs(3600),
+        compaction: flats::engine::CompactionOptions {
+            enabled: false,
+            ..Default::default()
+        },
     }
 }
 

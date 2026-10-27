@@ -21,7 +21,7 @@ pub mod compiler;
 pub mod query;
 
 pub use crate::engine::cursor::Cursor;
-pub use crate::engine::{CollectionConfig, Db, DbOptions};
+pub use crate::engine::{CollectionConfig, CompactionOptions, Db, DbOptions};
 pub use crate::error::{Error, Result};
 // The query pipeline's boundary types. `query::Error` is deliberately NOT
 // re-exported unqualified — `Error` above is the ENGINE's, and two types with

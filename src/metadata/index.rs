@@ -608,6 +608,14 @@ impl Writer {
         self.lock().applied_lsn
     }
 
+    /// Point future checkpoints at `dir`, after the directory holding
+    /// `metadata.snap` was renamed. Compaction builds a store in a staging
+    /// directory and renames it into place; this keeps the in-memory store
+    /// rather than reloading it from the file it just wrote.
+    pub fn relocate(&mut self, dir: &Path) {
+        self.dir = dir.to_path_buf();
+    }
+
     /// Persist the whole state as `metadata.snap`, claiming durability
     /// through `last_lsn`. Crash-safe at every step (see module doc).
     ///
