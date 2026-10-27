@@ -205,6 +205,7 @@ fn cfgs() -> Vec<CollectionConfig> {
 fn opts() -> DbOptions {
     DbOptions {
         checkpoint_interval: Duration::from_secs(3600),
+        ..DbOptions::default()
     }
 }
 

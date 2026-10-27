@@ -258,6 +258,14 @@ impl Writer {
         self.lock().applied_lsn
     }
 
+    /// Point future checkpoints at `dir`, after the directory holding
+    /// `tuples.snap` was renamed. Compaction builds a store in a staging
+    /// directory and renames it into place; this keeps the in-memory store
+    /// rather than reloading it from the file it just wrote.
+    pub fn relocate(&mut self, dir: &Path) {
+        self.dir = dir.to_path_buf();
+    }
+
     /// Same crash-safe dance as 4a — encode under lock, IO outside it:
     /// write tmp → tmp.sync_all() → rename → fsync dir.
     pub fn checkpoint(&mut self, last_lsn: Lsn) -> Result<()> {

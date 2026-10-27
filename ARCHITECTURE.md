@@ -325,6 +325,79 @@ asymmetry disappears when CREATE COLLECTION becomes a WAL record (next phase).
 
 ---
 
+## 6. Compaction (`engine/compact.rs`) — reclaiming dead rows
+
+Retiring a row clears one bit and destroys nothing, and ordinals are never
+reused, so a collection only ever fills. Compaction copies the **live** rows
+into fresh stores at ordinals `0..n` and swaps them in. It runs in the
+background (or on demand via `Db::compact_now`) and keeps the three
+invariants intact: liveness still has one owner (dead = complement of `live`),
+the new flat index's `count` is append-only from zero, and readers never wait.
+
+### Build, then flip
+
+```text
+compactor thread                      commit thread
+────────────────                      ─────────────
+live_x = snapshot
+copy live_x → collection-{id}.compact      (writes keep landing in the old gen)
+close the WRITE GATE  ── waits out in-flight writes
+send Flip ───────────────────────────► catch up: retire live_x \ live_now at rank-1,
+                                                  append live_now \ live_x
+                                        make the copy durable @ last_applied
+                                        rename collection-{id} → .old
+                                        rename .compact → collection-{id}  ◄ COMMIT
+                                        point the copy at the renamed dir, swap
+                                        writers, publish (epoch bump)
+open the gate ◄───────────────────────  ack (+ the old generation)
+free the old generation
+```
+
+- **Write gate.** Every write holds an `RwLock` shared from the moment it
+  resolves an ordinal until the WAL acks it — `Db::insert`/`delete`/`mutate`/
+  `update_rows`, and `execute` across a whole write statement (a DELETE
+  resolves its bitmap before it logs). The flip takes it exclusively, so no
+  record naming an old ordinal can be in flight across the renumbering. That is
+  why the WAL records needed no generation tag. Reentrant per thread.
+- **Readers stay lock-free.** A query that resolves several handles in
+  `execute` checks a seqlock-style epoch before and after; a flip in between
+  means it starts over. Once open, a cursor holds `Arc`s to one generation, and
+  the old files stay mapped until the last one drops — the cursor drain is
+  free.
+- **Pre-flip records in the WAL.** Truncation is a global minimum, so the log
+  can still hold records from before the flip, naming old ordinals. `apply`
+  skips any data record at or below its collection's own durable watermark
+  (`IndexApplier::floors`), and the new generation is stamped with the flip's
+  LSN — so replay never lands them on the new generation.
+- **Crashes.** `settle` runs before every collection opens: a stray `.compact`
+  next to the canonical dir is discarded; `.old` with no canonical dir (crashed
+  between the renames) rolls back; `.old` next to the canonical dir (crashed
+  after the commit) is deleted. Rolling back is always safe: the old
+  generation is not checkpointed at the flip, but its watermark is in the
+  global truncation minimum, so the log still holds every record above it at
+  the old ordinals it needs, and nothing was logged after the flip.
+- **Failure.** Anything before the second rename just discards the copy. A
+  failure that leaves memory and disk disagreeing (an undo rename or the
+  reopen failing) halts the log (`Apply::halted`) before another frame is
+  written; reopening resolves it.
+
+### Triggers (`CompactionOptions`)
+
+- **Waste**: dead / allocated ≥ 30% and dead ≥ 10k — checked on the
+  checkpoint interval by the compactor thread.
+- **Headroom**: allocated ≥ 90% of capacity and dead ≥ 5% of capacity —
+  checked when an insert crosses the 90% line (a non-blocking nudge, sent once
+  per crossing) and on the interval.
+
+Refusing inserts at capacity remains the backstop. Costs: the build holds a
+second copy of the metadata and tuple stores in memory and one extra collection
+directory on disk; writes (not reads) pause while the gate drains in-flight
+writes and the flip runs. The pause is the catch-up plus making the copy
+durable; freeing the old generation, the slowest step, happens after the gate
+reopens.
+
+---
+
 ## What is and isn't guaranteed
 
 | Guaranteed | How |
@@ -337,6 +410,7 @@ asymmetry disappears when CREATE COLLECTION becomes a WAL record (next phase).
 | **Idempotent recovery** | positional records; `write_at`/`insert_row`/`write_row`/deletes all no-op on re-application |
 | **Gap-free monotonic LSNs** | assigned only by the single commit thread; reclaimed on failure |
 | **Catalog survives restarts** | `catalog.snap`, atomic-rename; conflicts refused loudly |
+| **Compaction is crash-safe and invisible to readers** | build off-thread, write gate + one-thread flip, rename commit point, `settle` on open, per-collection replay floors, epoch-checked reads (§6) |
 
 **Not** guaranteed:
 
@@ -344,14 +418,16 @@ asymmetry disappears when CREATE COLLECTION becomes a WAL record (next phase).
   `commit_batch`).
 - The transient-failure phantom-ordinal hole (documented as deferred in
   `Db::insert`).
-- Per-collection recovery precision — currently the conservative global-min; a
-  real per-frame watermark is the documented future fix.
+- Per-collection truncation precision — the WAL still truncates at the
+  conservative global min. Replay, though, now skips each collection's records
+  at or below that collection's own watermark (§6).
 - Snapshot bit-rot *after* the WAL truncated past its data (outside the crash
   model; see §4).
 - Catalog rebuild from the WAL — registration isn't logged yet; corrupt
   `catalog.snap` is a refusal, not a recovery (see §5).
-- Anything in `CLAUDE.md` §2 non-goals (the SEARCH..WHERE executor, ANN,
-  compaction are later phases).
+- Anything in `CLAUDE.md` §2 non-goals (ANN and the rest).
+- Ordinal stability across compaction — compaction renumbers every row. A
+  row's lasting identity is its primary key.
 
 The one mental model to keep: **the WAL is the database. A single thread owns
 the log file, every store's writer, apply, and checkpoint; the three stores per
