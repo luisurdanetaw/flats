@@ -823,3 +823,60 @@ fn cursor_errors_are_reported() {
         flats_cursor_free(ptr::null_mut());
     }
 }
+
+// -- handle lifetimes ----------------------------------------------------------
+
+#[test]
+fn a_batch_outliving_its_database_reports_an_error_instead_of_crashing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let b = Batch::new(&db, "docs").unwrap();
+    b.row("a", 1);
+    let raw = db.0;
+    std::mem::forget(db);
+    // SAFETY: released exactly once (the wrapper was forgotten).
+    assert_eq!(unsafe { flats_close(raw) }, FLATS_OK);
+    // Every batch call after its database closed is a clean refusal.
+    let (rc, n) = b.commit();
+    assert_eq!(rc, FLATS_ERR_INVALID_ARGUMENT);
+    assert_eq!(n, 0);
+    assert!(
+        last_error().unwrap().contains("closed"),
+        "{:?}",
+        last_error()
+    );
+    // Building rows needs no database, and still works; freeing is fine.
+    b.row("b", 2);
+    assert_eq!(b.commit().0, FLATS_ERR_INVALID_ARGUMENT);
+}
+
+#[test]
+fn a_batch_keeps_working_while_other_threads_use_the_same_database() {
+    struct Shared(*mut flats_db);
+    // SAFETY: a flats_db may be shared across threads (header).
+    unsafe impl Sync for Shared {}
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let shared = Shared(db.0);
+    std::thread::scope(|s| {
+        for t in 0..4 {
+            let shared = &shared;
+            s.spawn(move || {
+                let name = c("docs");
+                let mut b = ptr::null_mut();
+                // SAFETY: live shared handle; this thread's own batch.
+                unsafe {
+                    assert_eq!(flats_batch_new(shared.0, name.as_ptr(), &mut b), FLATS_OK);
+                    let batch = Batch(b);
+                    for i in 0..50 {
+                        batch.row(&format!("t{t}-{i}"), i);
+                    }
+                    assert_eq!(batch.commit(), (FLATS_OK, 50));
+                }
+            });
+        }
+    });
+    assert_eq!(db.query("SELECT id FROM docs;").rows().len(), 200);
+}

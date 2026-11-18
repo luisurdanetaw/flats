@@ -27,6 +27,7 @@ use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::ptr;
+use std::sync::{Arc, RwLock};
 
 use flats::{
     ColumnId, ColumnType, Db, DbOptions, OutputRow, Param, QueryError, RegValue, Row, RowStream,
@@ -201,9 +202,28 @@ pub extern "C" fn flats_last_error() -> *const c_char {
 // Database
 // ---------------------------------------------------------------------------
 
+/// The engine handle, shared by a `flats_db` and every batch made from it.
+///
+/// `None` once `flats_close` has run. Every call that uses the database holds
+/// the read side for its whole duration, so `flats_close` (which takes the
+/// write side) waits for calls already in flight instead of freeing the
+/// engine under them — and a batch that outlives its database finds `None`
+/// and refuses cleanly rather than touching freed memory.
+type SharedDb = Arc<RwLock<Option<Db>>>;
+
 /// An open database.
 pub struct flats_db {
-    db: Db,
+    db: SharedDb,
+}
+
+/// Run `f` against the open database behind `shared`, or refuse if it has
+/// been closed.
+fn with_db<T>(shared: &SharedDb, f: impl FnOnce(&Db) -> Result<T, Fail>) -> Result<T, Fail> {
+    let guard = shared.read().unwrap_or_else(|e| e.into_inner());
+    match guard.as_ref() {
+        Some(db) => f(db),
+        None => Err(Fail::invalid("the database is closed")),
+    }
 }
 
 /// `int flats_open(const char *path, flats_db **out)`
@@ -219,7 +239,9 @@ pub unsafe extern "C" fn flats_open(path: *const c_char, out: *mut *mut flats_db
         // SAFETY: forwarded from this function's own contract.
         let path = unsafe { arg_str(path, "path") }?;
         let db = Db::open(Path::new(path), &[], DbOptions::default()).map_err(Fail::engine)?;
-        let handle = Box::into_raw(Box::new(flats_db { db }));
+        let handle = Box::into_raw(Box::new(flats_db {
+            db: Arc::new(RwLock::new(Some(db))),
+        }));
         // SAFETY: `out` is non-NULL and writable by contract.
         unsafe { *out = handle };
         Ok(())
@@ -238,7 +260,12 @@ pub unsafe extern "C" fn flats_close(db: *mut flats_db) -> i32 {
         }
         // SAFETY: a live handle from `flats_open` (a `Box`), released once.
         let handle = unsafe { Box::from_raw(db) };
-        handle.db.close().map_err(Fail::engine)
+        // Waits for calls in flight; batches still holding the cell see None.
+        let engine = handle.db.write().unwrap_or_else(|e| e.into_inner()).take();
+        match engine {
+            Some(engine) => engine.close().map_err(Fail::engine),
+            None => Ok(()),
+        }
     })
 }
 
@@ -258,7 +285,7 @@ pub unsafe extern "C" fn flats_execute(
         let handle = unsafe { arg_ref(db, "db") }?;
         // SAFETY: as above.
         let sql = unsafe { arg_str(sql, "sql") }?;
-        let result = collect(&handle.db, sql, &[])?;
+        let result = with_db(&handle.db, |db| collect(db, sql, &[]))?;
         if !out.is_null() {
             // SAFETY: non-NULL and writable by contract.
             unsafe { *out = Box::into_raw(Box::new(result)) };
@@ -367,7 +394,7 @@ pub unsafe extern "C" fn flats_execute_params(
         let sql = unsafe { arg_str(sql, "sql") }?;
         // SAFETY: as above.
         let params = unsafe { read_params(params, n) }?;
-        let result = collect(&handle.db, sql, &params)?;
+        let result = with_db(&handle.db, |db| collect(db, sql, &params))?;
         if !out.is_null() {
             // SAFETY: non-NULL and writable by contract.
             unsafe { *out = Box::into_raw(Box::new(result)) };
@@ -413,7 +440,9 @@ pub unsafe extern "C" fn flats_query(
         let sql = unsafe { arg_str(sql, "sql") }?;
         // SAFETY: as above.
         let params = unsafe { read_params(params, n) }?;
-        let stream = handle.db.execute_with(sql, &params).map_err(Fail::query)?;
+        let stream = with_db(&handle.db, |db| {
+            db.execute_with(sql, &params).map_err(Fail::query)
+        })?;
         let columns = labels_of(&stream)?;
         let cursor = Box::into_raw(Box::new(flats_cursor { stream, columns }));
         // SAFETY: non-NULL and writable by contract.
@@ -472,7 +501,7 @@ pub unsafe extern "C" fn flats_backup(db: *const flats_db, dest: *const c_char) 
         let handle = unsafe { arg_ref(db, "db") }?;
         // SAFETY: as above.
         let dest = unsafe { arg_str(dest, "dest") }?;
-        handle.db.backup(dest).map_err(Fail::engine)
+        with_db(&handle.db, |db| db.backup(dest).map_err(Fail::engine))
     })
 }
 
@@ -706,9 +735,9 @@ pub unsafe extern "C" fn flats_result_free(res: *mut flats_result) {
 
 /// Rows being built for one `Db::insert_many`.
 pub struct flats_batch {
-    /// The database the batch commits to. The header requires batches to be
-    /// freed before their database is closed.
-    db: *const flats_db,
+    /// The database the batch commits to — the same shared cell its
+    /// `flats_db` holds, so a commit after `flats_close` is a clean refusal.
+    db: SharedDb,
     collection: u32,
     dim: usize,
     /// The vector column's name, so `flats_batch_column_type` can answer it.
@@ -743,13 +772,15 @@ pub unsafe extern "C" fn flats_batch_new(
         let handle = unsafe { arg_ref(db, "db") }?;
         // SAFETY: as above.
         let name = unsafe { arg_str(collection, "collection") }?;
-        let id = handle.db.collection_id(name).map_err(Fail::engine)?;
-        let config = handle
-            .db
-            .collections()
-            .into_iter()
-            .find(|c| c.id == id)
-            .ok_or_else(|| Fail::engine(flats::Error::UnknownCollection { id }))?;
+        let (id, config) = with_db(&handle.db, |db| {
+            let id = db.collection_id(name).map_err(Fail::engine)?;
+            let config = db
+                .collections()
+                .into_iter()
+                .find(|c| c.id == id)
+                .ok_or_else(|| Fail::engine(flats::Error::UnknownCollection { id }))?;
+            Ok((id, config))
+        })?;
         let schema = &config.schema;
         let columns = schema
             .columns
@@ -758,7 +789,7 @@ pub unsafe extern "C" fn flats_batch_new(
             .collect();
         let names = schema.columns.iter().map(|c| c.name.clone()).collect();
         let batch = flats_batch {
-            db,
+            db: Arc::clone(&handle.db),
             collection: id,
             dim: schema.vector().dim.get(),
             vector_name: schema.vector().name.clone(),
@@ -991,12 +1022,10 @@ pub unsafe extern "C" fn flats_batch_commit(b: *mut flats_batch, inserted: *mut 
         let batch = unsafe { arg_mut(b, "batch") }?;
         let rows = std::mem::take(&mut batch.rows);
         let count = rows.len();
-        // SAFETY: the header requires a batch's database to outlive it.
-        let handle = unsafe { arg_ref(batch.db, "the batch's database") }?;
-        handle
-            .db
-            .insert_many(batch.collection, rows)
-            .map_err(Fail::engine)?;
+        let collection = batch.collection;
+        with_db(&batch.db, |db| {
+            db.insert_many(collection, rows).map_err(Fail::engine)
+        })?;
         if !inserted.is_null() {
             // SAFETY: non-NULL and writable by contract.
             unsafe { *inserted = count };

@@ -106,8 +106,10 @@ so copy it if you need it later.
 | `flats_result *` | `flats_execute` | `flats_result_free` |
 | `flats_batch *` | `flats_batch_new` | `flats_batch_free` |
 
-Releasing `NULL` is a no-op. Free a database's batches before you close the
-database. Results don't depend on the database once you have them.
+Releasing `NULL` is a no-op. `flats_close` waits for any calls still running
+on that database. Results and cursors don't depend on the database once you
+have them. A batch whose database has been closed refuses to commit with
+`FLATS_ERR_INVALID_ARGUMENT` instead of crashing.
 
 **Strings** you pass in are NUL-terminated UTF-8, except the value passed to
 `flats_batch_text`, which takes an explicit length. Strings you get back

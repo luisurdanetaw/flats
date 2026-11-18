@@ -22,9 +22,12 @@
  *             taking one is safe to call concurrently. A flats_result and a
  *             flats_batch belong to one thread at a time. Each handle is
  *             released by its own *_free / flats_close; passing NULL to those
- *             is a no-op. Using a handle after releasing it is undefined,
- *             and a flats_batch must be freed before its flats_db is closed
- *             (results are independent of the database once returned).
+ *             is a no-op. Using a handle after releasing it is undefined.
+ *             flats_close waits for calls already running on that database
+ *             to finish. Results and cursors don't depend on the database
+ *             once you have them. A batch whose database has been closed
+ *             refuses commits with FLATS_ERR_INVALID_ARGUMENT rather than
+ *             crashing; free it as usual.
  *
  *   Memory.   Pointers returned INTO a result (column names, text, vectors)
  *             are owned by that result and live until flats_result_free.
