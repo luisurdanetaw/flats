@@ -154,3 +154,31 @@ jobs:
         run: python3 -m unittest discover -s sdk/python/tests -t sdk/python -v
       - name: Node.js
         run: node --test sdk/node/test/
+
+  # ── Sanitizers: AddressSanitizer over the unsafe-heavy suites ─────────────
+  sanitizers:
+    name: AddressSanitizer
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      RUSTFLAGS: -Zsanitizer=address
+      ASAN_OPTIONS: detect_leaks=1
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --component rust-src && rustup default nightly
+      - run: cargo test --target x86_64-unknown-linux-gnu --lib
+      - run: cargo test --target x86_64-unknown-linux-gnu --test simd_parity --test swmr --test concurrent_stores --test index --test lock --test limits --test fuzz
+      - run: cargo test --target x86_64-unknown-linux-gnu -p flats-c --test abi
+
+  # ── Miri over the pure-Rust unit tests (no mmap / FFI) ───────────────────
+  # Not yet verified locally; non-blocking until it has run green once.
+  miri:
+    name: Miri (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --component miri && rustup default nightly
+      - run: cargo miri test --lib -- simd:: sql:: metadata::common
+
