@@ -43,7 +43,8 @@ with flats.Database("./my-db") as db:
     ])
 
     hits = db.search("articles", [1, 0, 0, 0], k=2,
-                     where="lang = 'en'", returning=["id", "score", "year"])
+                     where="lang = ?", params=["en"],
+                     returning=["id", "score", "year"])
     for row in hits.dicts():
         print(row)
     # {'id': 'a1', 'score': 0.8999999761581421, 'year': 2023}
@@ -123,14 +124,16 @@ vec = array.array("f", embedding)     # or: numpy.asarray(embedding, dtype=numpy
 
 ```python
 hits = db.search("docs", query_vector, k=10,
-                 where="source = 'wiki' AND published >= 2020",
+                 where="source = ? AND published >= ?", params=[source, 2020],
                  returning=["doc_id", "score", "quality"])
 ```
 
 - `k` — how many rows to return (default 10). Results come nearest first.
 - `where` — a V-SQL predicate, applied *before* ranking, so you get `k`
   matching rows whenever `k` exist. Comparisons `= != < <= > >=` with
-  `AND`/`OR`; see the [guide](../../docs/guide.md#where-clauses).
+  `AND`/`OR`; see the [guide](../../docs/guide.md#where-clauses). Write each
+  value as `?` and pass it in `params` — see
+  [Passing values](#passing-values-always-use-parameters).
 - `returning` — the columns to return. `score` is the similarity (dot
   product, higher is closer); `vector` returns the stored embedding. Without
   it you get every scalar column and no score.
@@ -155,27 +158,47 @@ res.dicts()          # [{'doc_id': 'd17', 'published': 2021}, ...]
 Cells are `int`, `float`, `str`, or `list[float]` for a vector. Write
 statements return an empty `Result`.
 
-## Updating and deleting
+## Passing values: always use parameters
 
-Plain V-SQL through `execute`:
+Never build a statement by pasting values into the SQL string. Write `?`
+where each value goes and pass the values, in order, as `params`:
 
 ```python
-db.execute("UPDATE docs SET quality = 0.1 WHERE source = 'spam';")
-db.execute(f"UPDATE docs SET vector = {flats_vector(new_emb)} WHERE doc_id = 'd17';")
-db.execute("DELETE FROM docs WHERE published < 2000;")
+# NO — user_lang can rewrite the statement:  "en' OR '1'='1"
+db.execute(f"SELECT doc_id FROM docs WHERE source = '{user_lang}';")
+
+# YES — user_lang is only ever a value
+db.execute("SELECT doc_id FROM docs WHERE source = ?;", [user_lang])
+```
+
+A parameter is substituted after the statement is parsed into tokens, as a
+value. Nothing inside it — quotes, `;`, keywords — can change what the
+statement does. Parameters work anywhere a literal can go: `WHERE`
+comparands, `INSERT` values, `SET` values, `NEAREST TO ?`, `TOP ?`.
+
+| Python value | V-SQL type |
+|---|---|
+| `int` | INT (also accepted for FLOAT columns) |
+| `float` | FLOAT (must be finite) |
+| `str` | TEXT |
+| list / tuple / `array.array` / NumPy array of numbers | VECTOR, passed as binary floats |
+
+`bool` and `None` are refused. A parameter can't stand for a collection or
+column name; `search` and `insert` check the names you pass and refuse
+anything that isn't a plain identifier.
+
+## Updating and deleting
+
+V-SQL through `execute`, with values as parameters:
+
+```python
+db.execute("UPDATE docs SET quality = ? WHERE source = ?;", [0.1, "spam"])
+db.execute("UPDATE docs SET vector = ? WHERE doc_id = ?;", [new_embedding, "d17"])
+db.execute("DELETE FROM docs WHERE published < ?;", [2000])
 ```
 
 Both need a `WHERE`. The primary key can't be changed, and a new vector can
-only be set on one row at a time, named by its key. There is no vector
-helper in the package; format one with `repr`, which V-SQL accepts exactly:
-
-```python
-def flats_vector(v):
-    return "[" + ", ".join(repr(float(x)) for x in v) + "]"
-```
-
-Building SQL from strings? Quote text values by doubling single quotes:
-`"'" + s.replace("'", "''") + "'"`.
+only be set on one row at a time, named by its key.
 
 ## Backups
 
@@ -193,7 +216,7 @@ Every error is a `flats.FlatsError`; catch the subclass you care about:
 
 | Exception | When |
 |---|---|
-| `flats.QueryError` | Bad or unsupported V-SQL, an unknown collection or column, a missing column in an INSERT |
+| `flats.QueryError` | Bad or unsupported V-SQL, an unknown collection or column, a missing column in an INSERT, a `?` count that doesn't match `params` |
 | `flats.EngineError` | Duplicate primary key, collection full, backup target not empty, I/O failure |
 | `flats.InvalidArgumentError` | Wrong vector length, a value of the wrong type for its column, NaN or infinity, unknown column in `insert` |
 | `flats.InternalError` | A bug in Flats |
@@ -206,8 +229,8 @@ except flats.EngineError as e:
 ```
 
 `e.code` holds the numeric status from the C library. Passing a non-`str`
-where text is expected raises `TypeError`; a non-finite query vector in
-`search` raises `ValueError`.
+where text is expected raises `TypeError`. A non-finite query vector, or a
+collection or column name that isn't a plain identifier, raises `ValueError`.
 
 ## Threads
 

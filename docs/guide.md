@@ -44,9 +44,11 @@ SEARCH TOP 10 NEAREST TO [0.02, -0.05, ...] FROM articles
     RETURNING id, score, rating;
 ```
 
-In practice you rarely write `INSERT` text yourself: every SDK has an
-`insert` call that sends vectors as binary, which is several times faster
-(see [Loading data](#loading-data)).
+That is V-SQL as written by hand — at a shell, say. From code, never put
+values into the text: write `?` and pass them as parameters (see
+[Parameters](#parameters-how-values-get-in)), and load rows through your
+SDK's `insert` call, which sends vectors as binary and is several times
+faster (see [Loading data](#loading-data)).
 
 ## V-SQL
 
@@ -62,10 +64,39 @@ Keywords are case-insensitive.
 | `TEXT` | `'hello'`, `'it''s'` | UTF-8; double a quote to escape it |
 | `VECTOR(n)` | `[0.1, -2, 3e-7]` | `n` 32-bit floats; ints are fine |
 
-Scientific notation is accepted everywhere, so a float formatted by
-Python's `repr`, JavaScript's `String` or Rust's `{:?}` can be pasted in
-as-is. A value too large for its type (`1e999`, or a vector component past
-`3.4e38`) is an error, never a silent infinity.
+Scientific notation is accepted everywhere. A value too large for its type
+(`1e999`, or a vector component past `3.4e38`) is an error, never a silent
+infinity.
+
+### Parameters: how values get in
+
+From a program, **every value goes in as a parameter**. Write `?` where the
+value goes and pass the values in order (`execute(sql, params)` in every
+SDK, `flats_execute_params` in C):
+
+```sql
+SEARCH TOP 10 NEAREST TO ? FROM articles WHERE lang = ? AND year >= ? RETURNING id, score;
+--                      params: [query_vector, "en", 2023]
+```
+
+A parameter is substituted after the statement has been split into tokens,
+as a value. It is never statement text, so nothing inside it — a quote, a
+`;`, a keyword — can change what the statement does. That makes injection
+impossible, not merely unlikely, and it is why you should never assemble
+V-SQL by pasting strings together.
+
+- A `?` can go anywhere a literal can: `WHERE` comparands, `INSERT` and
+  `SET` values, `NEAREST TO ?`, `TOP ?`.
+- It cannot stand for a name — `FROM ?` or `SELECT ?` is a syntax error —
+  so collection and column names stay in the statement text. The SDKs check
+  the names you pass to `search` and `insert` and refuse anything that
+  is not a plain identifier.
+- The number of `?` must equal the number of parameters.
+- A parameter is checked exactly like the literal it stands for: an INT
+  parameter is fine for a FLOAT column, a TEXT one against an INT column is a
+  type error. Floats must be finite.
+- A vector parameter is passed as binary 32-bit floats: exact, and cheaper
+  than formatting hundreds of numbers into text.
 
 ### Statements
 

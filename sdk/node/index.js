@@ -97,17 +97,17 @@ class Result {
   }
 }
 
-// -- formatting values into V-SQL ---------------------------------------------
+// -- names --------------------------------------------------------------------
 
-function floatSql(x) {
-  const n = Number(x);
-  if (!Number.isFinite(n)) throw new RangeError(`vector components must be finite, got ${x}`);
-  // String() is the shortest exact spelling, exponent included ('1e-7').
-  return String(n);
-}
+const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-function vectorSql(vector) {
-  return `[${Array.from(vector, floatSql).join(', ')}]`;
+/** A collection or column name, checked: names are statement text, so they
+ * must be plain identifiers — values go in parameters. */
+function ident(name, what) {
+  if (typeof name !== 'string' || !IDENT.test(name)) {
+    throw new TypeError(`${what} must be a plain identifier, got ${JSON.stringify(name)}`);
+  }
+  return name;
 }
 
 // -- the database -------------------------------------------------------------
@@ -138,23 +138,38 @@ class Database {
     return this._db;
   }
 
-  /** Run one V-SQL statement and return its Result. */
-  execute(sql) {
+  /**
+   * Run one V-SQL statement and return its Result.
+   *
+   * Write `?` wherever a value goes and pass the values in `params`, in
+   * order. Always pass outside values this way: a parameter is a value, never
+   * statement text, so nothing in it can change what the statement does.
+   */
+  execute(sql, params = []) {
     if (typeof sql !== 'string') throw new TypeError('sql must be a string');
-    const [columns, rows] = call(native.execute, this._handle(), sql);
+    if (!Array.isArray(params)) throw new TypeError('params must be an array');
+    const [columns, rows] = call(native.execute, this._handle(), sql, params);
     return new Result(columns, rows);
   }
 
   /**
    * Top-k rows of `collection` nearest `vector` (dot product).
-   * Options: `k` (default 10), `where` (a V-SQL predicate), `returning`
-   * (column names; `score` and `vector` included).
+   * Options: `k` (default 10); `where`, a V-SQL predicate whose values are
+   * `?` placeholders filled from `params`; `returning`, column names
+   * (`score` and `vector` included). The vector is passed as a binary
+   * parameter, exactly.
    */
-  search(collection, vector, { k = 10, where, returning } = {}) {
-    let sql = `SEARCH TOP ${Math.trunc(k)} NEAREST TO ${vectorSql(vector)} FROM ${collection}`;
+  search(collection, vector, { k = 10, where, params = [], returning } = {}) {
+    if (!Number.isInteger(k)) throw new TypeError('k must be an integer');
+    for (const x of vector) {
+      if (!Number.isFinite(x)) throw new RangeError(`vector components must be finite, got ${x}`);
+    }
+    let sql = `SEARCH TOP ${k} NEAREST TO ? FROM ${ident(collection, 'collection')}`;
     if (where) sql += ` WHERE ${where}`;
-    if (returning && returning.length) sql += ` RETURNING ${returning.join(', ')}`;
-    return this.execute(`${sql};`);
+    if (returning && returning.length) {
+      sql += ` RETURNING ${returning.map((c) => ident(c, 'column')).join(', ')}`;
+    }
+    return this.execute(`${sql};`, [vector, ...params]);
   }
 
   /**
@@ -164,7 +179,7 @@ class Database {
    * in batches of BATCH_ROWS, each all-or-nothing.
    */
   insert(collection, rows) {
-    const batch = call(native.batchNew, this._handle(), collection);
+    const batch = call(native.batchNew, this._handle(), ident(collection, 'collection'));
     let total = 0;
     try {
       for (const row of rows) {

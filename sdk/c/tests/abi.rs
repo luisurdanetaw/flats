@@ -510,3 +510,155 @@ fn a_batch_reports_each_columns_type() {
         0
     );
 }
+
+// -- parameters -----------------------------------------------------------
+
+fn p_int(v: i64) -> flats_param {
+    flats_param {
+        kind: FLATS_TYPE_INT,
+        int_value: v,
+        ..flats_param::default()
+    }
+}
+
+fn p_float(v: f64) -> flats_param {
+    flats_param {
+        kind: FLATS_TYPE_FLOAT,
+        float_value: v,
+        ..flats_param::default()
+    }
+}
+
+fn p_text(s: &str) -> flats_param {
+    flats_param {
+        kind: FLATS_TYPE_TEXT,
+        text: s.as_ptr().cast(),
+        text_len: s.len(),
+        ..flats_param::default()
+    }
+}
+
+fn p_vec(v: &[f32]) -> flats_param {
+    flats_param {
+        kind: FLATS_TYPE_VECTOR,
+        vector: v.as_ptr(),
+        vector_len: v.len(),
+        ..flats_param::default()
+    }
+}
+
+impl Db {
+    fn exec_params(&self, sql: &str, params: &[flats_param]) -> (i32, Option<Res>) {
+        let sql = c(sql);
+        let mut res = ptr::null_mut();
+        // SAFETY: live handle, valid string, `params` valid for its length,
+        // and every pointer inside a param outlives the call.
+        let rc = unsafe {
+            flats_execute_params(
+                self.0,
+                sql.as_ptr(),
+                params.as_ptr(),
+                params.len(),
+                &mut res,
+            )
+        };
+        (rc, (rc == FLATS_OK).then_some(Res(res)))
+    }
+}
+
+#[test]
+fn parameters_fill_placeholders_as_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let payload = "x'); DROP COLLECTION docs; --";
+    let v = [1.0f32, 1e-7, 0.0];
+    let (rc, _) = db.exec_params(
+        "INSERT INTO docs (id, vector, year, score) VALUES (?, ?, ?, ?);",
+        &[p_text(payload), p_vec(&v), p_int(2024), p_float(0.25)],
+    );
+    assert_eq!(rc, FLATS_OK, "{:?}", last_error());
+    let (rc, res) = db.exec_params(
+        "SEARCH TOP 1 NEAREST TO ? FROM docs WHERE id = ? RETURNING id, year, score, vector;",
+        &[p_vec(&[1.0, 0.0, 0.0]), p_text(payload)],
+    );
+    assert_eq!(rc, FLATS_OK, "{:?}", last_error());
+    let rows = res.unwrap().rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Cell::Text(payload.into()));
+    assert_eq!(rows[0][1], Cell::Int(2024));
+    assert_eq!(rows[0][3], Cell::Vector(v.to_vec()));
+}
+
+#[test]
+fn text_parameters_take_an_explicit_length() {
+    // Not NUL-terminated, and may contain a NUL.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let raw = b"a\0b-and-more";
+    let p = flats_param {
+        kind: FLATS_TYPE_TEXT,
+        text: raw.as_ptr().cast(),
+        text_len: 3,
+        ..flats_param::default()
+    };
+    let (rc, _) = db.exec_params(
+        "INSERT INTO docs (id, vector, year, score) VALUES (?, [1, 0, 0], 1, 1.0);",
+        &[p],
+    );
+    assert_eq!(rc, FLATS_OK, "{:?}", last_error());
+    let res = db.query("SELECT id FROM docs;");
+    assert_eq!(res.rows(), vec![vec![Cell::Text("a\0b".into())]]);
+}
+
+#[test]
+fn bad_parameters_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let sql = "SELECT id FROM docs WHERE year = ?;";
+    let bad_kind = flats_param {
+        kind: 99,
+        ..flats_param::default()
+    };
+    assert_eq!(
+        db.exec_params(sql, &[bad_kind]).0,
+        FLATS_ERR_INVALID_ARGUMENT
+    );
+    let null_text = flats_param {
+        kind: FLATS_TYPE_TEXT,
+        text_len: 4,
+        ..flats_param::default()
+    };
+    assert_eq!(
+        db.exec_params(sql, &[null_text]).0,
+        FLATS_ERR_INVALID_ARGUMENT
+    );
+    let bad_utf8 = [0xFFu8, 0xFE];
+    let p = flats_param {
+        kind: FLATS_TYPE_TEXT,
+        text: bad_utf8.as_ptr().cast(),
+        text_len: 2,
+        ..flats_param::default()
+    };
+    assert_eq!(db.exec_params(sql, &[p]).0, FLATS_ERR_INVALID_ARGUMENT);
+    assert!(last_error().unwrap().contains("UTF-8"));
+    // Count and value checks are the engine's, reported as query errors.
+    assert_eq!(db.exec_params(sql, &[]).0, FLATS_ERR_QUERY);
+    assert_eq!(
+        db.exec_params(sql, &[p_int(1), p_int(2)]).0,
+        FLATS_ERR_QUERY
+    );
+    assert_eq!(db.exec_params(sql, &[p_float(f64::NAN)]).0, FLATS_ERR_QUERY);
+    // NULL params with a nonzero count.
+    let s = c(sql);
+    // SAFETY: NULL with n > 0 is the case under test.
+    let rc = unsafe { flats_execute_params(db.0, s.as_ptr(), ptr::null(), 1, ptr::null_mut()) };
+    assert_eq!(rc, FLATS_ERR_INVALID_ARGUMENT);
+    // NULL params with n == 0 is simply no parameters.
+    let s = c("SELECT id FROM docs;");
+    // SAFETY: as above.
+    let rc = unsafe { flats_execute_params(db.0, s.as_ptr(), ptr::null(), 0, ptr::null_mut()) };
+    assert_eq!(rc, FLATS_OK);
+}

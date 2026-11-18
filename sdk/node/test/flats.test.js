@@ -267,3 +267,88 @@ describe('lifecycle', () => {
     assert.equal(flats.version(), '0.1.0');
   });
 });
+
+describe('parameters', () => {
+  let dir, db;
+  beforeEach(() => {
+    dir = tmpdir();
+    db = new flats.Database(path.join(dir, 'db'));
+    db.execute(SCHEMA);
+  });
+  afterEach(() => {
+    db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const PAYLOADS = [
+    "x'); DROP COLLECTION docs; --",
+    "' OR '1'='1",
+    "a' OR year > 0 OR id = 'b",
+    '?',
+    "'",
+    'ñ 🦤\n;',
+  ];
+
+  test('execute fills placeholders', () => {
+    db.execute('INSERT INTO docs (id, vector, year, score) VALUES (?, ?, ?, ?);', ['a', [1, 0, 0], 2024, 0.5]);
+    assert.deepEqual(db.execute('SELECT id, year, score FROM docs WHERE year = ? AND id != ?;', [2024, 'z']).rows, [
+      ['a', 2024, 0.5],
+    ]);
+  });
+
+  test('injection payloads are plain values', () => {
+    PAYLOADS.forEach((p, i) =>
+      db.execute('INSERT INTO docs (id, vector, year, score) VALUES (?, ?, ?, ?);', [p, [1, 0, 0], i, 0]),
+    );
+    assert.equal(db.execute('SELECT id FROM docs;').length, PAYLOADS.length);
+    for (const p of PAYLOADS) {
+      assert.deepEqual(db.execute('SELECT id FROM docs WHERE id = ?;', [p]).rows, [[p]]);
+      const hits = db.search('docs', [1, 0, 0], { k: 10, where: 'id = ?', params: [p], returning: ['id'] });
+      assert.deepEqual(hits.rows, [[p]], p);
+    }
+  });
+
+  test('a whole number is an INT, a fraction a FLOAT, a BigInt an exact INT', () => {
+    db.execute('INSERT INTO docs (id, vector, year, score) VALUES (?, ?, ?, ?);', [
+      'a',
+      new Float32Array([1, 0, 0]),
+      9007199254740993n,
+      3, // a whole number into a FLOAT column: coerced, as a literal 3 would be
+    ]);
+    assert.deepEqual(db.execute('SELECT year, score FROM docs WHERE year = ?;', [9007199254740993n]).rows, [
+      [9007199254740993n, 3],
+    ]);
+    assert.throws(() => db.execute('SELECT id FROM docs WHERE year = ?;', [1.5]), flats.QueryError);
+  });
+
+  test('search passes the query vector as a parameter', () => {
+    const v = [1e-7, -2.5e-30, 3.4e38];
+    db.insert('docs', [{ id: 'tiny', vector: v, year: 0, score: 0 }]);
+    const hits = db.search('docs', new Float32Array(v), { k: 1, returning: ['id', 'vector'] });
+    assert.deepEqual(hits.rows[0], ['tiny', v.map(f32)]);
+  });
+
+  test('search where with parameters', () => {
+    db.insert('docs', Array.from({ length: 20 }, (_, i) => ({ id: `d${i}`, vector: [i, 1, 0], year: 2000 + i, score: 0 })));
+    const hits = db.search('docs', [1, 0, 0], { k: 3, where: 'year < ? AND id != ?', params: [2010, 'd9'], returning: ['id'] });
+    assert.deepEqual(hits.rows.map((r) => r[0]), ['d8', 'd7', 'd6']);
+  });
+
+  test('count mismatches and bad values', () => {
+    assert.throws(() => db.execute('SELECT id FROM docs WHERE year = ?;'), flats.QueryError);
+    assert.throws(() => db.execute('SELECT id FROM docs WHERE year = ?;', [1, 2]), flats.QueryError);
+    assert.throws(() => db.execute('SELECT id FROM docs WHERE year = ?;', [NaN]), flats.QueryError);
+    for (const bad of [true, null, undefined, {}, () => 1]) {
+      assert.throws(() => db.execute('SELECT id FROM docs WHERE year = ?;', [bad]), flats.InvalidArgumentError, String(bad));
+    }
+    assert.throws(() => db.execute('SELECT id FROM docs;', 'not an array'), TypeError);
+  });
+
+  test('names cannot be injected through search or insert', () => {
+    for (const bad of ['docs; DROP COLLECTION docs', 'docs WHERE 1', '', '1docs']) {
+      assert.throws(() => db.search(bad, [1, 0, 0]), TypeError, bad);
+    }
+    assert.throws(() => db.search('docs', [1, 0, 0], { returning: ['id, vector FROM docs; --'] }), TypeError);
+    assert.equal(db.execute('SELECT id FROM docs;').length, 0);
+  });
+});

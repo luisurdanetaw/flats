@@ -85,6 +85,11 @@ NOTE: V1 IS LINUX ONLY
 V-SQL: SUBSET OF SQL DEDICATED TO FLATS
 
 -- Types: only VECTOR(dim), TEXT, INT, FLOAT... thats it!
+-- Parameters: `?` stands for any literal (WHERE comparand, INSERT/SET value,
+-- NEAREST TO ?, TOP ?), filled from Db::execute_with(sql, &[Param]) AFTER
+-- lexing — a value is never source text, so it cannot inject syntax, and it
+-- can never stand for a name. SDKs must document parameters, never string
+-- formatting.
 -- Float literals take an exponent (1e-5, 2.5E+10, Python's 1e-05) so a client
 -- can format with its language's own printer. Overflow (1e999, or a vector
 -- element past f32::MAX) is refused, never stored as infinity.

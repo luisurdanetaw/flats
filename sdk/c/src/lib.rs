@@ -28,7 +28,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::ptr;
 
-use flats::{ColumnId, ColumnType, Db, DbOptions, QueryError, RegValue, Row, Value};
+use flats::{ColumnId, ColumnType, Db, DbOptions, Param, QueryError, RegValue, Row, Value};
 
 // ---------------------------------------------------------------------------
 // Status codes and cell types — mirror flats.h exactly.
@@ -255,7 +255,116 @@ pub unsafe extern "C" fn flats_execute(
         let handle = unsafe { arg_ref(db, "db") }?;
         // SAFETY: as above.
         let sql = unsafe { arg_str(sql, "sql") }?;
-        let result = collect(&handle.db, sql)?;
+        let result = collect(&handle.db, sql, &[])?;
+        if !out.is_null() {
+            // SAFETY: non-NULL and writable by contract.
+            unsafe { *out = Box::into_raw(Box::new(result)) };
+        }
+        Ok(())
+    })
+}
+
+/// One value for one `?` placeholder — `flats_param` in the header. A tagged
+/// struct rather than a union, so every FFI layer can mirror it plainly.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct flats_param {
+    /// `FLATS_TYPE_INT`, `_FLOAT`, `_TEXT` or `_VECTOR` (`type` in C).
+    pub kind: i32,
+    /// The value when `kind` is INT.
+    pub int_value: i64,
+    /// The value when `kind` is FLOAT.
+    pub float_value: f64,
+    /// UTF-8 bytes when `kind` is TEXT; need not be NUL-terminated.
+    pub text: *const c_char,
+    /// Byte length of `text`.
+    pub text_len: usize,
+    /// Components when `kind` is VECTOR.
+    pub vector: *const f32,
+    /// Component count of `vector`.
+    pub vector_len: usize,
+}
+
+impl Default for flats_param {
+    fn default() -> Self {
+        flats_param {
+            kind: 0,
+            int_value: 0,
+            float_value: 0.0,
+            text: ptr::null(),
+            text_len: 0,
+            vector: ptr::null(),
+            vector_len: 0,
+        }
+    }
+}
+
+/// Copy C parameters into engine ones.
+///
+/// # Safety
+/// `params` is NULL with `n == 0`, or valid for `n` elements whose `text` /
+/// `vector` pointers are valid for their lengths.
+unsafe fn read_params(params: *const flats_param, n: usize) -> Result<Vec<Param>, Fail> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    if params.is_null() {
+        return Err(Fail::invalid(format!("params is NULL but n = {n}")));
+    }
+    // SAFETY: non-NULL and valid for `n` elements by contract.
+    let params = unsafe { std::slice::from_raw_parts(params, n) };
+    params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| match p.kind {
+            FLATS_TYPE_INT => Ok(Param::Int(p.int_value)),
+            FLATS_TYPE_FLOAT => Ok(Param::Float(p.float_value)),
+            FLATS_TYPE_TEXT => {
+                if p.text.is_null() {
+                    return Err(Fail::invalid(format!("parameter {i}: text is NULL")));
+                }
+                // SAFETY: non-NULL and valid for `text_len` bytes by contract.
+                let bytes = unsafe { std::slice::from_raw_parts(p.text.cast::<u8>(), p.text_len) };
+                std::str::from_utf8(bytes)
+                    .map(|s| Param::Text(s.to_string()))
+                    .map_err(|_| Fail::invalid(format!("parameter {i}: text is not valid UTF-8")))
+            }
+            FLATS_TYPE_VECTOR => {
+                if p.vector.is_null() {
+                    return Err(Fail::invalid(format!("parameter {i}: vector is NULL")));
+                }
+                // SAFETY: non-NULL and valid for `vector_len` floats by contract.
+                let v = unsafe { std::slice::from_raw_parts(p.vector, p.vector_len) };
+                Ok(Param::Vector(v.to_vec()))
+            }
+            other => Err(Fail::invalid(format!(
+                "parameter {i}: unknown type {other}"
+            ))),
+        })
+        .collect()
+}
+
+/// `int flats_execute_params(flats_db *db, const char *sql, const flats_param *params, size_t n, flats_result **out)`
+///
+/// # Safety
+/// As `flats_execute`, plus `params` is NULL with `n == 0`, or valid for `n`
+/// elements whose pointers are valid for their lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flats_execute_params(
+    db: *const flats_db,
+    sql: *const c_char,
+    params: *const flats_param,
+    n: usize,
+    out: *mut *mut flats_result,
+) -> i32 {
+    guard(|| {
+        // SAFETY: forwarded from this function's own contract.
+        let handle = unsafe { arg_ref(db, "db") }?;
+        // SAFETY: as above.
+        let sql = unsafe { arg_str(sql, "sql") }?;
+        // SAFETY: as above.
+        let params = unsafe { read_params(params, n) }?;
+        let result = collect(&handle.db, sql, &params)?;
         if !out.is_null() {
             // SAFETY: non-NULL and writable by contract.
             unsafe { *out = Box::into_raw(Box::new(result)) };
@@ -298,8 +407,8 @@ pub struct flats_result {
     rows: Vec<Vec<Cell>>,
 }
 
-fn collect(db: &Db, sql: &str) -> Result<flats_result, Fail> {
-    let stream = db.execute(sql).map_err(Fail::query)?;
+fn collect(db: &Db, sql: &str, params: &[Param]) -> Result<flats_result, Fail> {
+    let stream = db.execute_with(sql, params).map_err(Fail::query)?;
     let columns = stream
         .labels()
         .iter()

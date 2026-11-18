@@ -620,15 +620,133 @@ unsafe extern "C" fn js_execute(env: napi_env, info: napi_callback_info) -> napi
     // SAFETY: see the section note.
     unsafe {
         run(env, || {
-            let [h, sql] = args::<2>(env, info)?;
+            let [h, sql, params] = args::<3>(env, info)?;
             let db = db_of(env, h)?;
             let sql = get_cstring(env, sql, "sql")?;
+            // Owned values first, then the C structs that point into them;
+            // both live until the call returns.
+            let owned = get_params(env, params)?;
+            let c_params: Vec<flats_param> = owned.iter().map(OwnedParam::as_c).collect();
             let mut res = ptr::null_mut();
-            check(flats_execute(db, sql.as_ptr(), &mut res))?;
+            check(flats_execute_params(
+                db,
+                sql.as_ptr(),
+                c_params.as_ptr(),
+                c_params.len(),
+                &mut res,
+            ))?;
             let out = result_to_js(env, res);
             flats_result_free(res);
             out
         })
+    }
+}
+
+/// One parameter converted from JavaScript, owning what its `flats_param`
+/// points into.
+enum OwnedParam {
+    Int(i64),
+    Float(f64),
+    Text(Vec<u8>),
+    Vector(Vec<f32>),
+}
+
+impl OwnedParam {
+    fn as_c(&self) -> flats_param {
+        match self {
+            OwnedParam::Int(n) => flats_param {
+                kind: FLATS_TYPE_INT,
+                int_value: *n,
+                ..flats_param::default()
+            },
+            OwnedParam::Float(x) => flats_param {
+                kind: FLATS_TYPE_FLOAT,
+                float_value: *x,
+                ..flats_param::default()
+            },
+            OwnedParam::Text(b) => flats_param {
+                kind: FLATS_TYPE_TEXT,
+                text: b.as_ptr().cast::<c_char>(),
+                text_len: b.len(),
+                ..flats_param::default()
+            },
+            OwnedParam::Vector(v) => flats_param {
+                kind: FLATS_TYPE_VECTOR,
+                vector: v.as_ptr(),
+                vector_len: v.len(),
+                ..flats_param::default()
+            },
+        }
+    }
+}
+
+/// The parameter array of an `execute` call: `undefined` means none.
+///
+/// A Number is an INT when it is a safe integer and a FLOAT otherwise —
+/// exactly how the same value would read if written as a literal; a BigInt is
+/// an exact INT; a string is TEXT; an Array or Float32/64Array a VECTOR.
+///
+/// # Safety
+/// See the section note.
+unsafe fn get_params(env: napi_env, v: napi_value) -> Js<Vec<OwnedParam>> {
+    // SAFETY: see the section note, for every N-API call below.
+    unsafe {
+        let ty = type_of(env, v)?;
+        if ty == 0 {
+            return Ok(Vec::new()); // undefined
+        }
+        let mut is_array = false;
+        napi(napi_is_array(env, v, &mut is_array), "napi_is_array")?;
+        if !is_array {
+            return Err(Throw::Type("params must be an array".into()));
+        }
+        let mut len = 0u32;
+        napi(
+            napi_get_array_length(env, v, &mut len),
+            "napi_get_array_length",
+        )?;
+        let mut out = Vec::with_capacity(len as usize);
+        for i in 0..len {
+            let mut el = ptr::null_mut();
+            napi(napi_get_element(env, v, i, &mut el), "napi_get_element")?;
+            let bad = || {
+                Throw::Flats(
+                    FLATS_ERR_INVALID_ARGUMENT,
+                    format!("parameter {i}: not a V-SQL value (number, bigint, string or vector)"),
+                )
+            };
+            out.push(match type_of(env, el)? {
+                NAPI_NUMBER => {
+                    let x = get_f64(env, el)?;
+                    if x.fract() == 0.0 && x.abs() <= 9_007_199_254_740_991.0 {
+                        OwnedParam::Int(x as i64)
+                    } else {
+                        OwnedParam::Float(x)
+                    }
+                }
+                NAPI_BIGINT => {
+                    let (mut n, mut lossless) = (0i64, false);
+                    napi(
+                        napi_get_value_bigint_int64(env, el, &mut n, &mut lossless),
+                        "napi_get_value_bigint_int64",
+                    )?;
+                    if !lossless {
+                        return Err(Throw::Flats(
+                            FLATS_ERR_INVALID_ARGUMENT,
+                            format!("parameter {i}: BigInt does not fit in 64 bits"),
+                        ));
+                    }
+                    OwnedParam::Int(n)
+                }
+                NAPI_STRING => OwnedParam::Text(get_cstring(env, el, "parameter")?.into_bytes()),
+                NAPI_OBJECT => match get_vector(env, el) {
+                    Ok(vector) => OwnedParam::Vector(vector),
+                    Err(_) => return Err(bad()),
+                },
+                _ => return Err(bad()),
+            });
+        }
+        Ok(out)
     }
 }
 

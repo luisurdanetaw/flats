@@ -7,6 +7,8 @@ a server: open a directory and query it from the same process. CPU only.
 
 - **Exact results.** Every search scans every live vector with a SIMD dot
   product (AVX2 or NEON, with a scalar fallback). Recall is 1.0.
+- **Parameterized queries.** Values go in as `?` parameters, never as SQL
+  text, so injection is impossible, and query vectors travel as binary.
 - **Filters that keep `k`.** `WHERE` runs *before* ranking, so `TOP 10 … WHERE
   lang = 'en'` returns ten English rows whenever ten exist.
 - **Durable.** A write is fsynced to the WAL before it is acknowledged; a
@@ -30,7 +32,7 @@ a server: open a directory and query it from the same process. CPU only.
 ### Rust
 
 ```rust
-use flats::{Db, DbOptions};
+use flats::{Db, DbOptions, Param};
 
 let db = Db::open("./my-db", &[], DbOptions::default())?;
 db.execute(
@@ -42,8 +44,10 @@ db.execute(
          ('a', [0.1, 0.9, 0.0], 2023),
          ('b', [0.8, 0.1, 1e-5], 2024);",
 )?;
-for row in db.execute(
-    "SEARCH TOP 5 NEAREST TO [1, 0, 0] FROM docs WHERE year >= 2024 RETURNING id, score;",
+// Values go in as `?` parameters, never pasted into the text.
+for row in db.execute_with(
+    "SEARCH TOP 5 NEAREST TO ? FROM docs WHERE year >= ? RETURNING id, score;",
+    &[vec![1.0f32, 0.0, 0.0].into(), Param::Int(2024)],
 )? {
     println!("{:?}", row?.0);
 }
@@ -63,7 +67,9 @@ with flats.Database("./my-db") as db:
     db.execute("CREATE COLLECTION docs (id TEXT PRIMARY KEY, vector VECTOR(3)) "
                "WITH (capacity = 10000);")
     db.insert("docs", [{"id": "a", "vector": [0.1, 0.9, 0.0]}])
-    print(db.search("docs", [1, 0, 0], k=5, returning=["id", "score"]).dicts())
+    hits = db.search("docs", [1, 0, 0], k=5, where="id != ?", params=["b"],
+                     returning=["id", "score"])
+    print(hits.dicts())
 ```
 
 ctypes over the C ABI, no third-party packages. See [`sdk/python`](sdk/python).

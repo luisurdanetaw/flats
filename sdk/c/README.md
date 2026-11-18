@@ -124,6 +124,30 @@ for the result if you don't want it.
 
 A write is durable when `flats_execute` returns `FLATS_OK`.
 
+## Parameters
+
+Values from outside your program go in as parameters, never pasted into the
+SQL text. Write `?` for each value and pass a `flats_param` array:
+
+```c
+flats_param p[3];
+memset(p, 0, sizeof p);
+p[0].type = FLATS_TYPE_VECTOR; p[0].vector = query;  p[0].vector_len = 768;
+p[1].type = FLATS_TYPE_TEXT;   p[1].text = lang;     p[1].text_len = strlen(lang);
+p[2].type = FLATS_TYPE_INT;    p[2].int_value = 2023;
+
+flats_execute_params(db,
+    "SEARCH TOP 10 NEAREST TO ? FROM docs WHERE lang = ? AND year >= ? RETURNING id, score;",
+    p, 3, &res);
+```
+
+A parameter is a value, never statement text, so a hostile string can't
+change what the statement does. Set `type` plus the matching field.
+`text` takes an explicit length and need not be NUL-terminated. A vector
+parameter is passed as raw floats, so it's exact and fast. The `?` count must
+match `n` (`FLATS_ERR_QUERY` otherwise). The semantics are in the
+[guide](../../docs/guide.md#parameters-how-values-get-in).
+
 ## Reading results
 
 ```c

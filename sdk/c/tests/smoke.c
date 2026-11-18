@@ -63,6 +63,30 @@ int main(int argc, char **argv) {
     CHECK(flats_execute(db, "SELEC", NULL) == FLATS_ERR_QUERY, "bad sql is a query error");
     CHECK(flats_last_error() != NULL, "with a message");
 
+    /* Parameters: a hostile string is just a value. */
+    flats_param params[2];
+    memset(params, 0, sizeof params);
+    float q[4] = {9.0f, 1.0f, 0.0f, 0.5f};
+    params[0].type = FLATS_TYPE_VECTOR;
+    params[0].vector = q;
+    params[0].vector_len = 4;
+    const char *evil = "doc 9' OR title != '";
+    params[1].type = FLATS_TYPE_TEXT;
+    params[1].text = evil;
+    params[1].text_len = strlen(evil);
+    CHECK(flats_execute_params(db,
+              "SEARCH TOP 5 NEAREST TO ? FROM docs WHERE title = ? RETURNING id;",
+              params, 2, &res) == FLATS_OK, "parameterized search");
+    CHECK(flats_result_row_count(res) == 0, "the payload matched nothing");
+    flats_result_free(res);
+    params[1].text = "doc 9";
+    params[1].text_len = 5;
+    CHECK(flats_execute_params(db,
+              "SEARCH TOP 5 NEAREST TO ? FROM docs WHERE title = ? RETURNING id;",
+              params, 2, &res) == FLATS_OK, "parameterized search, real title");
+    CHECK(flats_result_row_count(res) == 1 && flats_result_int(res, 0, 0) == 9, "exactly doc 9");
+    flats_result_free(res);
+
     CHECK(flats_backup(db, argv[2]) == FLATS_OK, "backup");
     CHECK(flats_close(db) == FLATS_OK, "close");
 

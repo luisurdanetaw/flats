@@ -45,7 +45,8 @@ db.insert('articles', [
 
 const hits = db.search('articles', [1, 0, 0, 0], {
   k: 2,
-  where: "lang = 'en'",
+  where: 'lang = ?',
+  params: ['en'],
   returning: ['id', 'score', 'year'],
 });
 console.log(hits.toObjects());
@@ -119,7 +120,8 @@ rows/s at 768 dimensions.
 ```js
 const hits = db.search('docs', queryVector, {
   k: 10,
-  where: "source = 'wiki' AND published >= 2020",
+  where: 'source = ? AND published >= ?',
+  params: [source, 2020],
   returning: ['doc_id', 'score', 'quality'],
 });
 ```
@@ -127,7 +129,9 @@ const hits = db.search('docs', queryVector, {
 - `k` — how many rows (default 10). Results come nearest first.
 - `where` — a V-SQL predicate applied *before* ranking, so you get `k`
   matching rows whenever `k` exist. See the
-  [guide](../../docs/guide.md#where-clauses).
+  [guide](../../docs/guide.md#where-clauses). Write each value as `?` and
+  pass it in `params` — see
+  [Passing values](#passing-values-always-use-parameters).
 - `returning` — the columns to return. `score` is the similarity (dot
   product, higher is closer); `vector` returns the stored embedding. Without
   it you get every scalar column and no score.
@@ -152,22 +156,48 @@ Cells are numbers, strings, arrays of numbers (vectors), or `BigInt` for an
 INT too large to be a JS number exactly. Write statements return an empty
 `Result`.
 
-## Updating and deleting
+## Passing values: always use parameters
 
-Plain V-SQL through `execute`:
+Never build a statement by pasting values into the SQL string. Write `?`
+where each value goes and pass the values, in order:
 
 ```js
-const vec = (v) => `[${Array.from(v, String).join(', ')}]`;
+// NO — userLang can rewrite the statement:  "en' OR '1'='1"
+db.execute(`SELECT doc_id FROM docs WHERE source = '${userLang}';`);
 
-db.execute("UPDATE docs SET quality = 0.1 WHERE source = 'spam';");
-db.execute(`UPDATE docs SET vector = ${vec(newEmbedding)} WHERE doc_id = 'd17';`);
-db.execute('DELETE FROM docs WHERE published < 2000;');
+// YES — userLang is only ever a value
+db.execute('SELECT doc_id FROM docs WHERE source = ?;', [userLang]);
+```
+
+A parameter is substituted after the statement is parsed into tokens, as a
+value. Nothing inside it — quotes, `;`, keywords — can change what the
+statement does. Parameters work anywhere a literal can go: `WHERE`
+comparands, `INSERT` values, `SET` values, `NEAREST TO ?`, `TOP ?`.
+
+| JS value | V-SQL type |
+|---|---|
+| a whole `number` (safe integer) | INT (also accepted for FLOAT columns) |
+| any other finite `number` | FLOAT |
+| `bigint` | INT, exactly |
+| `string` | TEXT |
+| `Array`, `Float32Array`, `Float64Array` of numbers | VECTOR, passed as binary floats |
+
+Booleans, `null`, `undefined` and objects are refused. A parameter can't
+stand for a collection or column name; `search` and `insert` check the names
+you pass and refuse anything that isn't a plain identifier.
+
+## Updating and deleting
+
+V-SQL through `execute`, with values as parameters:
+
+```js
+db.execute('UPDATE docs SET quality = ? WHERE source = ?;', [0.1, 'spam']);
+db.execute('UPDATE docs SET vector = ? WHERE doc_id = ?;', [newEmbedding, 'd17']);
+db.execute('DELETE FROM docs WHERE published < ?;', [2000]);
 ```
 
 Both need a `WHERE`. The primary key can't be changed, and a new vector can
-only be set on one row at a time, named by its key. `String(x)` is a safe
-way to format floats; V-SQL accepts its exponent form (`1e-7`). When building
-SQL from strings, quote text by doubling single quotes: `` `'${s.replaceAll("'", "''")}'` ``.
+only be set on one row at a time, named by its key.
 
 ## Backups
 
@@ -185,7 +215,7 @@ Every error is a `flats.FlatsError`; check the subclass:
 
 | Class | When |
 |---|---|
-| `flats.QueryError` | Bad or unsupported V-SQL, an unknown collection or column, a missing column in an INSERT |
+| `flats.QueryError` | Bad or unsupported V-SQL, an unknown collection or column, a missing column in an INSERT, a `?` count that doesn't match `params` |
 | `flats.EngineError` | Duplicate primary key, collection full, backup target not empty, I/O failure |
 | `flats.InvalidArgumentError` | Wrong vector length, a value of the wrong type for its column, NaN or infinity, unknown column in `insert` |
 | `flats.InternalError` | A bug in Flats |
@@ -200,8 +230,9 @@ try {
 ```
 
 `e.code` holds the numeric status from the C library. Wrong argument types
-(a number for the SQL string, say) throw `TypeError`; a non-finite query
-vector in `search` throws `RangeError`.
+(a number for the SQL string, say), or a collection or column name that isn't
+a plain identifier, throw `TypeError`; a non-finite query vector in `search`
+throws `RangeError`.
 
 ## Blocking and threads
 

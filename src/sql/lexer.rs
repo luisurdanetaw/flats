@@ -129,6 +129,9 @@ pub enum Token {
     Eq,
     /// `-` (a standalone token; sign is a parser concern — decision (2)).
     Minus,
+    /// `?` — a parameter placeholder, filled from the statement's parameter
+    /// list before parsing (see `parser::parse_with_params`).
+    Param,
     /// `*` — the `SELECT *` wildcard. Core V-SQL, so it is a real token even
     /// though none of the three bootstrap statements use it.
     Star,
@@ -334,6 +337,7 @@ impl<'a> Lexer<'a> {
             // parser's job (design decision 2).
             b'-' => Ok(self.single(Token::Minus, start)),
             b'*' => Ok(self.single(Token::Star, start)),
+            b'?' => Ok(self.single(Token::Param, start)),
             // Comparison operators, longest match FIRST. `<=` must not lex as
             // `<` then `=` — the parser would see a comparison followed by a
             // stray `=` and report a baffling error at the wrong position.
@@ -1054,5 +1058,23 @@ mod tests {
     fn drop_is_a_keyword() {
         assert_eq!(lex("drop"), vec![Token::Drop]);
         assert_eq!(lex("DROP COLLECTION"), vec![Token::Drop, Token::Collection]);
+    }
+
+    #[test]
+    fn a_question_mark_is_a_placeholder() {
+        assert_eq!(
+            lex("a = ? AND b < ?"),
+            vec![
+                ident("a"),
+                Token::Eq,
+                Token::Param,
+                Token::And,
+                ident("b"),
+                Token::Lt,
+                Token::Param,
+            ]
+        );
+        // Inside a string it is just a character.
+        assert_eq!(lex("'?'"), vec![Token::StrLit("?".into())]);
     }
 }

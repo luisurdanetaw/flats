@@ -22,6 +22,7 @@ package directory, then a Flats checkout's ``target/release`` and
 import ctypes
 import math
 import os
+import re
 from collections.abc import Mapping, Sequence
 
 __all__ = [
@@ -120,6 +121,20 @@ class _Batch(ctypes.Structure):
     pass
 
 
+class _Param(ctypes.Structure):
+    """flats_param, field for field."""
+
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("int_value", ctypes.c_int64),
+        ("float_value", ctypes.c_double),
+        ("text", ctypes.c_char_p),
+        ("text_len", ctypes.c_size_t),
+        ("vector", ctypes.POINTER(ctypes.c_float)),
+        ("vector_len", ctypes.c_size_t),
+    ]
+
+
 def _declare(lib):
     c_int, c_size, c_char_p = ctypes.c_int, ctypes.c_size_t, ctypes.c_char_p
     db_p, res_p, batch_p = (ctypes.POINTER(t) for t in (_Db, _Result, _Batch))
@@ -130,6 +145,10 @@ def _declare(lib):
         "flats_open": (c_int, [c_char_p, ctypes.POINTER(db_p)]),
         "flats_close": (c_int, [db_p]),
         "flats_execute": (c_int, [db_p, c_char_p, ctypes.POINTER(res_p)]),
+        "flats_execute_params": (
+            c_int,
+            [db_p, c_char_p, ctypes.POINTER(_Param), c_size, ctypes.POINTER(res_p)],
+        ),
         "flats_backup": (c_int, [db_p, c_char_p]),
         "flats_result_column_count": (c_size, [res_p]),
         "flats_result_column_name": (c_char_p, [res_p, c_size]),
@@ -237,21 +256,45 @@ def _collect(res):
 
 
 # ---------------------------------------------------------------------------
-# Formatting values into V-SQL
+# Parameters and names
 # ---------------------------------------------------------------------------
 
-
-def _float_sql(x):
-    x = float(x)
-    if not math.isfinite(x):
-        raise ValueError(f"vector components must be finite, got {x!r}")
-    # repr() is the shortest exact spelling, exponent included ('1e-07');
-    # V-SQL takes it as written.
-    return repr(x)
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
-def _vector_sql(vector):
-    return "[" + ", ".join(_float_sql(x) for x in vector) + "]"
+def _ident(name, what):
+    """A collection or column name, checked: names are statement text, so
+    they must be plain identifiers — values go in parameters."""
+    if not isinstance(name, str) or not _IDENT.match(name):
+        raise ValueError(f"{what} must be a plain identifier, got {name!r}")
+    return name
+
+
+def _params(values):
+    """Python values as a ctypes flats_param array, plus the buffers it points
+    into (which must stay alive for the call)."""
+    values = list(values)
+    arr = (_Param * len(values))()
+    keep = []
+    for i, v in enumerate(values):
+        p = arr[i]
+        if isinstance(v, bool) or v is None:
+            raise InvalidArgumentError(f"parameter {i}: {v!r} is not a V-SQL value")
+        if isinstance(v, int):
+            p.type, p.int_value = _INT, v
+        elif isinstance(v, float):
+            p.type, p.float_value = _FLOAT, v
+        elif isinstance(v, str):
+            data = v.encode("utf-8")
+            keep.append(data)
+            p.type, p.text, p.text_len = _TEXT, data, len(data)
+        elif _is_vector(v):
+            buf = _float32_buffer(v)
+            keep.append(buf)
+            p.type, p.vector, p.vector_len = _VECTOR, buf, len(buf)
+        else:
+            raise InvalidArgumentError(f"parameter {i}: {type(v).__name__} is not a V-SQL value")
+    return arr, keep
 
 
 def _float32_buffer(value):
@@ -324,27 +367,47 @@ class Database:
 
     # -- statements -------------------------------------------------------
 
-    def execute(self, sql):
-        """Run one V-SQL statement and return its :class:`Result`."""
+    def execute(self, sql, params=()):
+        """Run one V-SQL statement and return its :class:`Result`.
+
+        Write ``?`` wherever a value goes and pass the values in ``params``, in
+        order. **Always pass outside values this way**: a parameter is a value,
+        never statement text, so nothing in it can change what the statement
+        does. ``int``, ``float``, ``str`` and float sequences (vectors) are
+        accepted.
+        """
+        arr, keep = _params(params)
         res = ctypes.POINTER(_Result)()
-        _check(_lib.flats_execute(self._handle(), _utf8(sql, "sql"), ctypes.byref(res)))
+        _check(
+            _lib.flats_execute_params(
+                self._handle(), _utf8(sql, "sql"), arr, len(arr), ctypes.byref(res)
+            )
+        )
+        del keep
         try:
             return _collect(res)
         finally:
             _lib.flats_result_free(res)
 
-    def search(self, collection, vector, k=10, *, where=None, returning=None):
+    def search(self, collection, vector, k=10, *, where=None, params=(), returning=None):
         """Top-``k`` rows of ``collection`` nearest ``vector`` (dot product).
 
-        ``where`` is a V-SQL predicate (``"year > 2020 AND lang = 'en'"``);
-        ``returning`` a list of columns, ``score`` and ``vector`` included.
+        ``where`` is a V-SQL predicate whose values are ``?`` placeholders
+        filled from ``params``: ``where="lang = ? AND year > ?",
+        params=["en", 2020]``. ``returning`` is a list of column names,
+        ``score`` and ``vector`` included. The query vector is passed as a
+        binary parameter, exactly.
         """
-        sql = f"SEARCH TOP {int(k)} NEAREST TO {_vector_sql(vector)} FROM {collection}"
+        if isinstance(k, bool) or not isinstance(k, int):
+            raise TypeError("k must be an int")
+        if not all(math.isfinite(x) for x in vector):
+            raise ValueError("vector components must be finite")
+        sql = f"SEARCH TOP {k} NEAREST TO ? FROM {_ident(collection, 'collection')}"
         if where:
             sql += f" WHERE {where}"
         if returning:
-            sql += " RETURNING " + ", ".join(returning)
-        return self.execute(sql + ";")
+            sql += " RETURNING " + ", ".join(_ident(c, "column") for c in returning)
+        return self.execute(sql + ";", [vector, *params])
 
     def insert(self, collection, rows):
         """Insert ``rows`` — mappings of column name to value — and return the
@@ -352,6 +415,7 @@ class Database:
         or ``array.array``); every other column takes ``int``, ``float`` or
         ``str``. Rows go in batches of :attr:`BATCH_ROWS`, each all-or-nothing.
         """
+        _ident(collection, "collection")
         batch = ctypes.POINTER(_Batch)()
         _check(_lib.flats_batch_new(self._handle(), _utf8(collection, "collection"), ctypes.byref(batch)))
         total = 0

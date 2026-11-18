@@ -8,7 +8,7 @@
 //! # Quickstart
 //!
 //! ```
-//! use flats::{Db, DbOptions, RegValue};
+//! use flats::{Db, DbOptions, Param, RegValue};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! # let tmp = tempfile::tempdir()?;
@@ -31,8 +31,11 @@
 //! )?;
 //!
 //! // Top-k by dot product, filtered before ranking, so `k` counts matches.
-//! let hits = db.execute(
-//!     "SEARCH TOP 1 NEAREST TO [1, 0, 0] FROM docs WHERE year >= 2024 RETURNING id, score;",
+//! // Values from outside the program go in as `?` parameters — never pasted
+//! // into the statement text.
+//! let hits = db.execute_with(
+//!     "SEARCH TOP 1 NEAREST TO ? FROM docs WHERE year >= ? RETURNING id, score;",
+//!     &[vec![1.0f32, 0.0, 0.0].into(), Param::Int(2024)],
 //! )?;
 //! let rows = hits.collect::<Result<Vec<_>, _>>()?;
 //! assert_eq!(rows.len(), 1);
@@ -119,6 +122,8 @@ pub use crate::metadata::{ColumnSpec, ColumnType, RangeOp, Row, Schema, Value};
 // that name at the crate root would be exactly the confusion the stage-local
 // error split exists to prevent (CLAUDE.md §5).
 pub use crate::query::{Error as QueryError, RowStream};
+// A value for a `?` placeholder: see `Db::execute_with`.
+pub use crate::sql::Param;
 // One row of a `RowStream`, and its cells.
 pub use crate::vm::exec::{OutputRow, RegValue};
 pub use simd::dot;

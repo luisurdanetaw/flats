@@ -12,9 +12,14 @@ export class Result implements Iterable<Cell[]> {
 
 export type Row = Record<string, number | bigint | string | number[] | Float32Array | Float64Array>;
 
+/** A value for a `?` placeholder. */
+export type Param = number | bigint | string | ArrayLike<number>;
+
 export interface SearchOptions {
   k?: number;
+  /** A V-SQL predicate; put values in `params` as `?`. */
   where?: string;
+  params?: Param[];
   returning?: string[];
 }
 
@@ -22,7 +27,7 @@ export class Database {
   constructor(path: string);
   readonly closed: boolean;
   close(): void;
-  execute(sql: string): Result;
+  execute(sql: string, params?: Param[]): Result;
   search(collection: string, vector: ArrayLike<number>, options?: SearchOptions): Result;
   insert(collection: string, rows: Iterable<Row>): number;
   backup(dest: string): void;

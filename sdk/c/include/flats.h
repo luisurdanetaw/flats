@@ -92,6 +92,42 @@ int flats_close(flats_db *db);
  * FLATS_OK. */
 int flats_execute(flats_db *db, const char *sql, flats_result **out);
 
+/* ---- parameters --------------------------------------------------------
+ *
+ * The SAFE way to put values into a statement. Write `?` wherever a literal
+ * would go, and pass the values here, in order. A parameter is a VALUE, never
+ * statement text: nothing inside a string parameter — quotes, `;`, keywords —
+ * can change what the statement does. Parameters stand only where literals
+ * can, never for a collection or column name. Never build V-SQL by pasting
+ * untrusted strings into it; use parameters.
+ *
+ *   flats_param p[2] = {0};
+ *   p[0].type = FLATS_TYPE_VECTOR; p[0].vector = emb;  p[0].vector_len = 768;
+ *   p[1].type = FLATS_TYPE_TEXT;   p[1].text = lang;   p[1].text_len = strlen(lang);
+ *   flats_execute_params(db,
+ *       "SEARCH TOP 10 NEAREST TO ? FROM docs WHERE lang = ? RETURNING id, score;",
+ *       p, 2, &res);
+ *
+ * Set `type` and the field(s) for it; the others are ignored. Text need not be
+ * NUL-terminated. A vector parameter is exact — no float formatting — and is
+ * the fast way to pass a query embedding.
+ */
+typedef struct flats_param {
+    int type;            /* FLATS_TYPE_INT / _FLOAT / _TEXT / _VECTOR */
+    int64_t int_value;   /* INT                                        */
+    double float_value;  /* FLOAT (must be finite)                     */
+    const char *text;    /* TEXT: UTF-8 bytes ...                      */
+    size_t text_len;     /*       ... and their length                 */
+    const float *vector; /* VECTOR: components ...                     */
+    size_t vector_len;   /*         ... and their count                */
+} flats_param;
+
+/* flats_execute with `?` placeholders filled from params[0..n]. The count
+ * must match the placeholders (FLATS_ERR_QUERY otherwise). params may be NULL
+ * when n is 0. */
+int flats_execute_params(flats_db *db, const char *sql, const flats_param *params, size_t n,
+                         flats_result **out);
+
 /* Write a consistent copy of the database into directory `dest`, which must
  * not exist or must be empty. Restore by opening `dest`. */
 int flats_backup(flats_db *db, const char *dest);

@@ -247,5 +247,78 @@ class TestLifecycle(unittest.TestCase):
         self.assertEqual(flats.version(), "0.1.0")
 
 
+class TestParams(Base):
+    """Parameters are values, never syntax."""
+
+    PAYLOADS = [
+        "x'); DROP COLLECTION docs; --",
+        "' OR '1'='1",
+        "a' OR year > 0 OR id = 'b",
+        "?",
+        "'",
+        "ñ 🦤\n;",
+    ]
+
+    def test_execute_fills_placeholders(self):
+        self.db.execute(
+            "INSERT INTO docs (id, vector, year, score) VALUES (?, ?, ?, ?);",
+            ["a", [1, 0, 0], 2024, 0.5],
+        )
+        res = self.db.execute("SELECT id, year, score FROM docs WHERE year = ? AND id != ?;", [2024, "z"])
+        self.assertEqual(list(res), [("a", 2024, 0.5)])
+
+    def test_injection_payloads_are_plain_values(self):
+        for i, p in enumerate(self.PAYLOADS):
+            self.db.execute(
+                "INSERT INTO docs (id, vector, year, score) VALUES (?, ?, ?, ?);",
+                [p, [1, 0, 0], i, 0.0],
+            )
+        self.assertEqual(len(self.db.execute("SELECT id FROM docs;")), len(self.PAYLOADS))
+        for p in self.PAYLOADS:
+            self.assertEqual(list(self.db.execute("SELECT id FROM docs WHERE id = ?;", [p])), [(p,)])
+            hits = self.db.search("docs", [1, 0, 0], k=10, where="id = ?", params=[p], returning=["id"])
+            self.assertEqual(list(hits), [(p,)], p)
+
+    def test_search_passes_the_query_vector_as_a_parameter(self):
+        v = [1e-7, -2.5e-30, 3.4e38]
+        self.db.insert("docs", [{"id": "tiny", "vector": v, "year": 0, "score": 0.0}])
+        hits = self.db.search("docs", array.array("f", v), k=1, returning=["id", "vector"])
+        self.assertEqual(hits[0], ("tiny", [f32(x) for x in v]))
+
+    def test_search_where_with_parameters(self):
+        self.db.insert(
+            "docs",
+            [{"id": f"d{i}", "vector": [float(i), 1.0, 0.0], "year": 2000 + i, "score": 0.0} for i in range(20)],
+        )
+        hits = self.db.search("docs", [1, 0, 0], k=3, where="year < ? AND id != ?", params=[2010, "d9"],
+                              returning=["id"])
+        self.assertEqual([h[0] for h in hits], ["d8", "d7", "d6"])
+
+    def test_a_count_mismatch_raises_a_query_error(self):
+        with self.assertRaises(flats.QueryError):
+            self.db.execute("SELECT id FROM docs WHERE year = ?;")
+        with self.assertRaises(flats.QueryError):
+            self.db.execute("SELECT id FROM docs WHERE year = ?;", [1, 2])
+
+    def test_parameter_types(self):
+        with self.assertRaises(flats.InvalidArgumentError):
+            self.db.execute("SELECT id FROM docs WHERE year = ?;", [True])
+        with self.assertRaises(flats.InvalidArgumentError):
+            self.db.execute("SELECT id FROM docs WHERE year = ?;", [None])
+        with self.assertRaises(flats.QueryError) as cm:  # NaN is no literal
+            self.db.execute("SELECT id FROM docs WHERE year = ?;", [float("nan")])
+        self.assertIn("finite", str(cm.exception))
+        with self.assertRaises(flats.QueryError):  # TEXT against INT
+            self.db.execute("SELECT id FROM docs WHERE year = ?;", ["2024"])
+
+    def test_names_cannot_be_injected_through_search(self):
+        for bad in ["docs; DROP COLLECTION docs", "docs WHERE 1", "", "1docs"]:
+            with self.assertRaises(ValueError, msg=bad):
+                self.db.search(bad, [1, 0, 0])
+        with self.assertRaises(ValueError):
+            self.db.search("docs", [1, 0, 0], returning=["id, vector FROM docs; --"])
+        self.assertEqual(len(self.db.execute("SELECT id FROM docs;")), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

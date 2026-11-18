@@ -33,6 +33,7 @@ use crate::sql::ast::{
     DropStmt, Expr, InsertManyStmt, InsertStmt, Literal, Projection, SearchStmt, SelectStmt, Statement, UpdateStmt,
 };
 use crate::sql::lexer::{LexError, Lexer, Span, SpannedToken, Token};
+use crate::sql::params::Param;
 
 /// A recursive-descent parser over a lexed token stream. Construct via the
 /// free [`parse`] function rather than directly — it wires the lexer in.
@@ -80,6 +81,21 @@ pub enum ParseErrorKind {
         /// The element as written, sign applied.
         value: f64,
     },
+    /// The statement's `?` placeholders and its parameters differ in number.
+    ParamCount {
+        /// How many `?` the statement has.
+        placeholders: usize,
+        /// How many parameters were supplied.
+        given: usize,
+    },
+    /// A parameter that no literal could spell: a non-finite float, or an
+    /// empty or non-finite vector.
+    InvalidParam {
+        /// Its position in the parameter list, from 0.
+        index: usize,
+        /// What is wrong with it.
+        reason: String,
+    },
     /// Input remained after a complete statement + its `;`.
     TrailingTokens,
     /// Input ended while a rule still expected more tokens.
@@ -109,6 +125,19 @@ impl fmt::Display for ParseError {
                 "vector element {value:e} at byte {} is outside the f32 range",
                 self.span.start
             ),
+            ParseErrorKind::ParamCount {
+                placeholders,
+                given,
+            } => write!(
+                f,
+                "the statement has {placeholders} placeholder{} but {given} parameter{} {} given",
+                if *placeholders == 1 { "" } else { "s" },
+                if *given == 1 { "" } else { "s" },
+                if *given == 1 { "was" } else { "were" },
+            ),
+            ParseErrorKind::InvalidParam { index, reason } => {
+                write!(f, "parameter {} (for `?` #{}) {reason}", index, index + 1)
+            }
             ParseErrorKind::TrailingTokens => {
                 write!(f, "unexpected trailing tokens at byte {}", self.span.start)
             }
@@ -124,6 +153,23 @@ impl std::error::Error for ParseError {}
 /// so callers never touch the lexer directly. Exactly one statement is
 /// expected; anything after its `;` is a [`ParseErrorKind::TrailingTokens`].
 pub fn parse(src: &str) -> Result<Statement, ParseError> {
+    parse_with_params(src, &[])
+}
+
+/// [`parse`], with each `?` placeholder filled from `params`, in order.
+///
+/// Substitution happens on TOKENS, between lexing and parsing: a placeholder
+/// becomes the literal tokens of its value — one string, one number, or a
+/// bracketed vector — carrying the placeholder's span. A value is therefore
+/// never source text. A string parameter arrives as an already-decoded string
+/// token, so its quotes, semicolons and keywords are characters, never syntax;
+/// and because only value tokens are produced, a parameter can stand only
+/// where a literal can — never for a name, an operator or a clause.
+///
+/// The number of placeholders must equal `params.len()`
+/// ([`ParseErrorKind::ParamCount`]); a float must be finite and a vector
+/// non-empty and finite ([`ParseErrorKind::InvalidParam`]).
+pub fn parse_with_params(src: &str, params: &[Param]) -> Result<Statement, ParseError> {
     let tokens = Lexer::new(src).tokenize().map_err(|e| ParseError {
         span: Span {
             start: e.pos,
@@ -131,6 +177,7 @@ pub fn parse(src: &str) -> Result<Statement, ParseError> {
         },
         kind: ParseErrorKind::Lex(e),
     })?;
+    let tokens = substitute(tokens, params)?;
     let mut parser = Parser { tokens, pos: 0 };
     let statement = parser.parse_statement()?;
     // `parse_statement` consumes the trailing ';' (per the grammar); only Eof
@@ -144,6 +191,82 @@ pub fn parse(src: &str) -> Result<Statement, ParseError> {
         });
     }
     Ok(statement)
+}
+
+/// Replace every `Token::Param` with the literal tokens of its parameter.
+fn substitute(tokens: Vec<SpannedToken>, params: &[Param]) -> Result<Vec<SpannedToken>, ParseError> {
+    let placeholders: Vec<Span> = tokens
+        .iter()
+        .filter(|t| t.token == Token::Param)
+        .map(|t| t.span)
+        .collect();
+    if placeholders.len() != params.len() {
+        // Point at the first `?` left unfilled, or — with too many
+        // parameters — at the end of the statement.
+        let span = placeholders
+            .get(params.len())
+            .copied()
+            .or_else(|| tokens.last().map(|t| t.span))
+            .unwrap_or(Span { start: 0, end: 0 });
+        return Err(ParseError {
+            kind: ParseErrorKind::ParamCount {
+                placeholders: placeholders.len(),
+                given: params.len(),
+            },
+            span,
+        });
+    }
+    if params.is_empty() {
+        return Ok(tokens);
+    }
+    let mut out = Vec::with_capacity(tokens.len() + params.len());
+    let mut next = 0;
+    for st in tokens {
+        if st.token != Token::Param {
+            out.push(st);
+            continue;
+        }
+        let index = next;
+        next += 1;
+        let span = st.span;
+        let invalid = |reason: &str| ParseError {
+            kind: ParseErrorKind::InvalidParam {
+                index,
+                reason: reason.to_string(),
+            },
+            span,
+        };
+        let at = |token| SpannedToken { token, span };
+        match &params[index] {
+            Param::Int(n) => out.push(at(Token::IntLit(*n))),
+            Param::Float(x) => {
+                if !x.is_finite() {
+                    return Err(invalid("is not a finite number"));
+                }
+                out.push(at(Token::FloatLit(*x)));
+            }
+            Param::Text(s) => out.push(at(Token::StrLit(s.clone()))),
+            Param::Vector(v) => {
+                if v.is_empty() {
+                    return Err(invalid("is an empty vector"));
+                }
+                if v.iter().any(|x| !x.is_finite()) {
+                    return Err(invalid("has a component that is not a finite number"));
+                }
+                out.push(at(Token::LBracket));
+                for (i, x) in v.iter().enumerate() {
+                    if i > 0 {
+                        out.push(at(Token::Comma));
+                    }
+                    // f32 -> f64 is exact, and the parser narrows back
+                    // exactly, so the stored bits are the given bits.
+                    out.push(at(Token::FloatLit(f64::from(*x))));
+                }
+                out.push(at(Token::RBracket));
+            }
+        }
+    }
+    Ok(out)
 }
 
 impl Parser {
@@ -1772,5 +1895,165 @@ mod tests {
         ] {
             err(src);
         }
+    }
+
+    // -- parameters -----------------------------------------------------------
+    //
+    // `?` placeholders are filled from a parameter list AFTER lexing: each one
+    // becomes the literal tokens of its value. A value is never source text, so
+    // nothing in it can be read as syntax — that is the injection guarantee.
+
+    use crate::sql::params::Param;
+
+    fn with(src: &str, params: &[Param]) -> Statement {
+        parse_with_params(src, params).expect("expected a successful parse")
+    }
+
+    fn with_err(src: &str, params: &[Param]) -> ParseError {
+        match parse_with_params(src, params) {
+            Ok(s) => panic!("expected an error, got {s:?}"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn a_placeholder_takes_the_value_of_its_parameter() {
+        let got = with(
+            "SELECT id FROM docs WHERE a = ? AND b < ?;",
+            &[Param::Text("x".into()), Param::Int(-3)],
+        );
+        assert_eq!(got, ok("SELECT id FROM docs WHERE a = 'x' AND b < -3;"));
+    }
+
+    #[test]
+    fn every_kind_of_parameter_lands_where_a_literal_would() {
+        let v = vec![0.5f32, -1e-7, 3.0];
+        assert_eq!(
+            with(
+                "INSERT INTO docs (id, vector, w, t) VALUES (?, ?, ?, ?);",
+                &[Param::Int(7), Param::Vector(v.clone()), Param::Float(-2.5), Param::Text("hi".into())],
+            ),
+            ok("INSERT INTO docs (id, vector, w, t) VALUES (7, [0.5, -1e-7, 3.0], -2.5, 'hi');")
+        );
+        // The query vector of a SEARCH, and its TOP count.
+        assert_eq!(
+            with("SEARCH TOP ? NEAREST TO ? FROM docs;", &[Param::Int(5), Param::Vector(v.clone())]),
+            ok("SEARCH TOP 5 NEAREST TO [0.5, -1e-7, 3.0] FROM docs;")
+        );
+        // SET values and a multi-row INSERT.
+        assert_eq!(
+            with("UPDATE docs SET t = ?, vector = ? WHERE id = ?;", &[
+                Param::Text("v2".into()),
+                Param::Vector(v.clone()),
+                Param::Int(1),
+            ]),
+            ok("UPDATE docs SET t = 'v2', vector = [0.5, -1e-7, 3.0] WHERE id = 1;")
+        );
+        assert_eq!(
+            with("INSERT INTO docs (id) VALUES (?), (?);", &[Param::Int(1), Param::Int(2)]),
+            ok("INSERT INTO docs (id) VALUES (1), (2);")
+        );
+    }
+
+    #[test]
+    fn a_vector_parameter_is_exact() {
+        // Not formatted and re-parsed: the f32 that goes in is the f32 that is
+        // stored, bit for bit, whatever its magnitude.
+        let v = vec![f32::MIN_POSITIVE, 1.0e-45, f32::MAX, -0.0, 0.1];
+        match with("SEARCH TOP 1 NEAREST TO ? FROM docs;", &[Param::Vector(v.clone())]) {
+            Statement::Search(s) => match s.query {
+                Literal::Vector(got) => {
+                    let bits = |x: &[f32]| x.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(bits(&got), bits(&v));
+                }
+                other => panic!("expected a vector, got {other:?}"),
+            },
+            other => panic!("expected a search, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_extreme_integers_survive() {
+        assert_eq!(
+            with("SELECT id FROM docs WHERE n = ? OR n = ?;", &[Param::Int(i64::MIN), Param::Int(i64::MAX)]),
+            {
+                let mut s = ok("SELECT id FROM docs WHERE n = 0 OR n = 0;");
+                if let Statement::Select(sel) = &mut s
+                    && let Some(Expr::Or(l, r)) = &mut sel.filter
+                    && let (Expr::Compare { right: lr, .. }, Expr::Compare { right: rr, .. }) =
+                        (l.as_mut(), r.as_mut())
+                {
+                    **lr = Expr::Literal(Literal::Int(i64::MIN));
+                    **rr = Expr::Literal(Literal::Int(i64::MAX));
+                }
+                s
+            }
+        );
+    }
+
+    #[test]
+    fn text_parameters_cannot_become_syntax() {
+        for payload in [
+            "x'; DROP COLLECTION docs; --",
+            "' OR 1=1 OR a = '",
+            "?",
+            "it's",
+            "\\'; --",
+            "\n;\n",
+        ] {
+            match with("SELECT id FROM docs WHERE a = ?;", &[Param::Text(payload.into())]) {
+                Statement::Select(s) => match s.filter {
+                    Some(Expr::Compare { right, .. }) => {
+                        assert_eq!(*right, Expr::Literal(Literal::Str(payload.into())), "{payload:?}")
+                    }
+                    other => panic!("{payload:?}: filter became {other:?}"),
+                },
+                other => panic!("{payload:?}: statement became {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_parameter_cannot_stand_for_a_name() {
+        // Identifiers stay in the statement text; a parameter is only ever a
+        // value, so `FROM ?` is a parse error whatever it holds.
+        with_err("SELECT id FROM ?;", &[Param::Text("docs".into())]);
+        with_err("SELECT ? FROM docs;", &[Param::Text("id".into())]);
+    }
+
+    #[test]
+    fn the_count_must_match() {
+        let too_few = with_err("SELECT id FROM docs WHERE a = ? AND b = ?;", &[Param::Int(1)]);
+        assert_eq!(too_few.kind, ParseErrorKind::ParamCount { placeholders: 2, given: 1 });
+        let too_many = with_err("SELECT id FROM docs WHERE a = ?;", &[Param::Int(1), Param::Int(2)]);
+        assert_eq!(too_many.kind, ParseErrorKind::ParamCount { placeholders: 1, given: 2 });
+        // Plain `parse` is `parse_with_params` with none.
+        let bare = err("SELECT id FROM docs WHERE a = ?;");
+        assert_eq!(bare.kind, ParseErrorKind::ParamCount { placeholders: 1, given: 0 });
+        assert!(bare.to_string().contains("1 placeholder"), "{bare}");
+    }
+
+    #[test]
+    fn non_finite_parameters_are_refused() {
+        for p in [
+            Param::Float(f64::NAN),
+            Param::Float(f64::INFINITY),
+            Param::Vector(vec![1.0, f32::NAN]),
+            Param::Vector(vec![f32::NEG_INFINITY]),
+            Param::Vector(vec![]),
+        ] {
+            let e = with_err("SELECT id FROM docs WHERE a = ?;", std::slice::from_ref(&p));
+            assert!(
+                matches!(e.kind, ParseErrorKind::InvalidParam { index: 0, .. }),
+                "{p:?}: {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_misplaced_parameter_is_located_at_its_placeholder() {
+        let src = "SELECT id FROM docs WHERE a = 1 ?;";
+        let e = with_err(src, &[Param::Int(1)]);
+        assert_eq!(&src[e.span.start..e.span.end], "?");
     }
 }

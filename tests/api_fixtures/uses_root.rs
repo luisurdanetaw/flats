@@ -4,7 +4,7 @@
 
 use flats::{
     ColumnId, ColumnSpec, ColumnType, CollectionConfig, CollectionId, CompactionOptions, Cursor,
-    Db, DbOptions, Error, Ordinal, OutputRow, QueryError, RangeOp, RegValue, Result, Row,
+    Db, DbOptions, Error, Ordinal, OutputRow, Param, QueryError, RangeOp, RegValue, Result, Row,
     RowStream, Schema, SearchResult, Value,
 };
 
@@ -37,6 +37,8 @@ fn workflow(dir: &std::path::Path) -> Result<()> {
             let _ = n;
         }
     }
+    let params: [Param; 2] = [vec![1.0f32, 0.0].into(), Param::Int(1)];
+    let _ = db.execute_with("SEARCH TOP 1 NEAREST TO ? FROM raw WHERE id = ?;", &params);
     let _ = flats::dot(&[1.0], &[1.0]);
     db.backup(dir.join("backup"))?;
     db.drop_collection("raw")?;

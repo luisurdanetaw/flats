@@ -58,7 +58,7 @@ use crate::compiler::bytecode::ValidateError;
 use crate::compiler::compile;
 use crate::engine::Db;
 use crate::sql::bind::{BoundStatement, Projected};
-use crate::sql::{BindError, ParseError, Statement, analyze, parse, plan};
+use crate::sql::{BindError, Param, ParseError, Statement, analyze, parse_with_params, plan};
 use crate::vm::exec::{ExecError, OutputRow, Vm};
 
 /// How many times a conflicted write is run again before giving up.
@@ -240,8 +240,43 @@ impl Db {
     /// serialize every statement through one caller and make parallel `SELECT`s
     /// impossible — the opposite of what the read path was built for.
     pub fn execute(&self, sql: &str) -> Result<RowStream, Error> {
-        // 1. PARSE (lexing included — the parser wraps lex errors).
-        let statement = parse(sql).map_err(Error::Parse)?;
+        self.execute_with(sql, &[])
+    }
+
+    /// Run one V-SQL statement with its `?` placeholders filled from
+    /// `params`, in order.
+    ///
+    /// **Use this whenever a value comes from outside the program.** A
+    /// parameter is substituted after lexing, as a value: nothing in it — a
+    /// quote, a `;`, a keyword — is ever read as syntax, and it can only stand
+    /// where a literal can, never for a collection or column name. A vector
+    /// parameter is also exact and cheaper than formatting floats into text.
+    ///
+    /// The number of `?` must equal `params.len()`; a mismatch, a non-finite
+    /// float, or an empty vector is a [`Error::Parse`] and runs nothing.
+    /// Otherwise a parameter behaves exactly as the literal it stands for —
+    /// the same type checks, the same coercions, the same errors.
+    ///
+    /// ```
+    /// # use flats::{Db, DbOptions, Param};
+    /// # let tmp = tempfile::tempdir().unwrap();
+    /// # let db = Db::open(tmp.path(), &[], DbOptions::default()).unwrap();
+    /// # db.execute("CREATE COLLECTION docs (id TEXT PRIMARY KEY, vector VECTOR(2), lang TEXT) WITH (capacity = 10);").unwrap();
+    /// db.execute_with(
+    ///     "INSERT INTO docs (id, vector, lang) VALUES (?, ?, ?);",
+    ///     &["d1".into(), vec![0.6f32, 0.8].into(), "en".into()],
+    /// )?;
+    /// let hits = db.execute_with(
+    ///     "SEARCH TOP 5 NEAREST TO ? FROM docs WHERE lang = ? RETURNING id, score;",
+    ///     &[vec![1.0f32, 0.0].into(), "en".into()],
+    /// )?;
+    /// assert_eq!(hits.count(), 1);
+    /// # Ok::<(), flats::QueryError>(())
+    /// ```
+    pub fn execute_with(&self, sql: &str, params: &[Param]) -> Result<RowStream, Error> {
+        // 1. PARSE (lexing included — the parser wraps lex errors), with the
+        //    parameters substituted between the two.
+        let statement = parse_with_params(sql, params).map_err(Error::Parse)?;
         // The compiler needs the TARGET collection's storage schema, and only
         // the statement says which collection that is — read it before `analyze`
         // consumes the statement.
