@@ -450,8 +450,13 @@ impl<'a> Lexer<'a> {
     }
 
     /// Scan a maximal digit run; a `.` joins the number ONLY if a digit follows
-    /// (so `768.` is `IntLit(768)` and leaves the dot). Parse failure — e.g. an
-    /// `i64` overflow — becomes [`LexErrorKind::InvalidNumber`].
+    /// (so `768.` is `IntLit(768)` and leaves the dot). An exponent
+    /// `[eE][+-]?digits` follows the same rule — it joins only when a digit
+    /// completes it, so `1e` is `IntLit(1)` then `Ident("e")` — and makes the
+    /// literal a float even without a dot: `1e5` is `FloatLit(100000.0)`, as
+    /// every float printer that emits it means it. Parse failure — an `i64`
+    /// overflow, or a float that saturates to infinity like `1e999` — becomes
+    /// [`LexErrorKind::InvalidNumber`].
     fn scan_number(&mut self, start: usize) -> Result<SpannedToken, LexError> {
         let bytes = self.src.as_bytes();
         while matches!(bytes.get(self.pos), Some(c) if c.is_ascii_digit()) {
@@ -467,6 +472,20 @@ impl<'a> Lexer<'a> {
                 self.pos += 1;
             }
         }
+        if matches!(bytes.get(self.pos), Some(b'e' | b'E')) {
+            // The exponent's digits start one byte later when it is signed.
+            let digits = match bytes.get(self.pos + 1) {
+                Some(b'+' | b'-') => self.pos + 2,
+                _ => self.pos + 1,
+            };
+            if matches!(bytes.get(digits), Some(c) if c.is_ascii_digit()) {
+                is_float = true;
+                self.pos = digits;
+                while matches!(bytes.get(self.pos), Some(c) if c.is_ascii_digit()) {
+                    self.pos += 1;
+                }
+            }
+        }
         let text = &self.src[start..self.pos];
         // The two parses have different error types; normalize both to
         // InvalidNumber(text) here rather than trying to unify them.
@@ -475,7 +494,13 @@ impl<'a> Lexer<'a> {
             pos: start,
         };
         let token = if is_float {
-            Token::FloatLit(text.parse::<f64>().map_err(|_| invalid())?)
+            // `parse::<f64>` saturates an out-of-range literal to infinity
+            // instead of failing; no V-SQL value may be infinite.
+            let value = text.parse::<f64>().map_err(|_| invalid())?;
+            if !value.is_finite() {
+                return Err(invalid());
+            }
+            Token::FloatLit(value)
         } else {
             Token::IntLit(text.parse::<i64>().map_err(|_| invalid())?)
         };
@@ -917,5 +942,108 @@ mod tests {
                 Token::Semicolon,
             ]
         );
+    }
+
+    // -- exponents ----------------------------------------------------------
+    //
+    // Every mainstream float printer switches to scientific notation for small
+    // or large magnitudes: Rust `{:?}` writes `1e-5`, Python `repr` writes
+    // `1e-05`, JavaScript `String()` writes `1e-7` and `1e+21`. Embeddings are
+    // full of small components, so a client that formats its vector with the
+    // language's own printer MUST be able to hand the text to `execute`.
+
+    #[test]
+    fn an_exponent_makes_a_float() {
+        for (src, want) in [
+            ("1e5", 1e5),
+            ("1E5", 1e5),
+            ("1e+5", 1e5),
+            ("1e-5", 1e-5),
+            ("1.5e-3", 1.5e-3),
+            ("2.5E+10", 2.5e10),
+            ("0e0", 0.0),
+        ] {
+            assert_eq!(lex(src), vec![Token::FloatLit(want)], "lexing {src:?}");
+        }
+    }
+
+    #[test]
+    fn what_rust_python_and_javascript_print_lexes_to_the_same_value() {
+        // Python repr pads the exponent to two digits and always signs it.
+        for src in [
+            "1e-05",
+            "1.2e-07",
+            "3.4e+38",
+            "1e+21",
+            "1e-7",
+            "1e21",
+            "1.1754944e-38",
+            "6.02214076e23",
+        ] {
+            let want: f64 = src.parse().unwrap();
+            assert_eq!(lex(src), vec![Token::FloatLit(want)], "lexing {src:?}");
+        }
+        // And Rust's own shortest round-trip printer, over awkward f32s.
+        for x in [1e-5_f32, f32::MIN_POSITIVE, f32::MAX, 1.0e-45, 7.006492e-7] {
+            let src = format!("{x:?}");
+            assert_eq!(
+                lex(&src),
+                vec![Token::FloatLit(src.parse().unwrap())],
+                "lexing {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_exponent_inside_a_negative_vector_literal() {
+        // Sign is still the parser's (design decision 2) — only the mantissa's
+        // sign; the exponent's sign belongs to the literal.
+        assert_eq!(
+            lex("[-1e-5, 2E+3]"),
+            vec![
+                Token::LBracket,
+                Token::Minus,
+                Token::FloatLit(1e-5),
+                Token::Comma,
+                Token::FloatLit(2e3),
+                Token::RBracket,
+            ]
+        );
+    }
+
+    #[test]
+    fn an_e_with_no_digits_after_it_is_not_an_exponent() {
+        // Same rule as the trailing dot: a suffix joins the number only when a
+        // digit completes it, otherwise it is left for the next token.
+        assert_eq!(lex("1e"), vec![Token::IntLit(1), ident("e")]);
+        assert_eq!(lex("1.5e"), vec![Token::FloatLit(1.5), ident("e")]);
+        assert_eq!(
+            lex("2e-x"),
+            vec![Token::IntLit(2), ident("e"), Token::Minus, ident("x")]
+        );
+        let err = lex_err("1e+");
+        assert_eq!(err.kind, LexErrorKind::UnexpectedChar('+'));
+    }
+
+    #[test]
+    fn a_literal_too_large_for_f64_is_an_invalid_number_not_infinity() {
+        // `str::parse::<f64>` saturates to inf rather than failing. An infinite
+        // component poisons every dot product it touches, so refuse it here
+        // with the literal in hand instead of storing it.
+        for src in ["1e999", "1.0E+400"] {
+            let err = lex_err(src);
+            assert_eq!(err.kind, LexErrorKind::InvalidNumber(src.to_string()));
+            assert_eq!(err.pos, 0);
+        }
+        // Underflow is not an error: it rounds to zero, as every printer that
+        // could have produced it would agree.
+        assert_eq!(lex("1e-400"), vec![Token::FloatLit(0.0)]);
+    }
+
+    #[test]
+    fn an_exponent_literal_spans_all_of_its_text() {
+        let toks = Lexer::new("x < 1.5e-3;").tokenize().unwrap();
+        assert_eq!(toks[2].token, Token::FloatLit(1.5e-3));
+        assert_eq!(toks[2].span, Span { start: 4, end: 10 });
     }
 }

@@ -85,6 +85,9 @@ NOTE: V1 IS LINUX ONLY
 V-SQL: SUBSET OF SQL DEDICATED TO FLATS
 
 -- Types: only VECTOR(dim), TEXT, INT, FLOAT... thats it!
+-- Float literals take an exponent (1e-5, 2.5E+10, Python's 1e-05) so a client
+-- can format with its language's own printer. Overflow (1e999, or a vector
+-- element past f32::MAX) is refused, never stored as infinity.
 
 -- Vector similarity search queries (core)
 SEARCH TOP 5 NEAREST TO [...] FROM docs;                              

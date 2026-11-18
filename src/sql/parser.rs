@@ -73,6 +73,13 @@ pub enum ParseErrorKind {
         /// What was written, and what to reach for instead.
         what: String,
     },
+    /// A vector element that is a finite number but has no finite `f32` to
+    /// become (`3.5e38`). Vectors are stored as `f32`; narrowing would store
+    /// an infinity, which poisons every dot product it touches.
+    VectorElementOutOfRange {
+        /// The element as written, sign applied.
+        value: f64,
+    },
     /// Input remained after a complete statement + its `;`.
     TrailingTokens,
     /// Input ended while a rule still expected more tokens.
@@ -97,6 +104,11 @@ impl fmt::Display for ParseError {
             ParseErrorKind::Unsupported { what } => {
                 write!(f, "{what} is not supported at byte {}", self.span.start)
             }
+            ParseErrorKind::VectorElementOutOfRange { value } => write!(
+                f,
+                "vector element {value:e} at byte {} is outside the f32 range",
+                self.span.start
+            ),
             ParseErrorKind::TrailingTokens => {
                 write!(f, "unexpected trailing tokens at byte {}", self.span.start)
             }
@@ -654,9 +666,28 @@ impl Parser {
 
     /// A single vector element: a `number` coerced to `f32`.
     fn parse_vector_elem(&mut self) -> Result<f32, ParseError> {
+        // Remember where the element starts: once it is consumed the cursor
+        // sits on the `,`/`]` after it, which is the wrong place to point.
+        let at = self.pos;
         match self.parse_number()? {
+            // Every i64 narrows to a finite f32 (|i64| < 2^63 < f32::MAX).
             Literal::Int(n) => Ok(n as f32),
-            Literal::Float(f) => Ok(f as f32),
+            Literal::Float(f) => {
+                let narrowed = f as f32;
+                if narrowed.is_finite() {
+                    return Ok(narrowed);
+                }
+                // Point at the digits, not a leading `-`.
+                let number = if self.tokens[at].token == Token::Minus {
+                    at + 1
+                } else {
+                    at
+                };
+                Err(ParseError {
+                    kind: ParseErrorKind::VectorElementOutOfRange { value: f },
+                    span: self.tokens[number].span,
+                })
+            }
             // parse_number only ever yields Int or Float; stay exhaustive
             // without panicking.
             Literal::Vector(_) | Literal::Str(_) => {
@@ -1576,5 +1607,49 @@ mod tests {
                 ],
             })
         );
+    }
+
+    // -- vector element range ----------------------------------------------
+    //
+    // Vector elements are stored as f32 but lexed as f64, so a literal can be
+    // a perfectly finite f64 and still have no f32 to become: `3.5e38` narrows
+    // to +inf. An infinite component poisons every dot product it touches, and
+    // with exponents in the grammar it is one keystroke away — refuse it here,
+    // where the element's position is still known.
+
+    #[test]
+    fn a_vector_element_beyond_f32_range_is_refused() {
+        for src in [
+            "SEARCH TOP 1 NEAREST TO [0.5, 3.5e38] FROM docs;",
+            "SEARCH TOP 1 NEAREST TO [0.5, -3.5e38] FROM docs;",
+            "INSERT INTO docs (id, vector) VALUES (1, [1e39]);",
+        ] {
+            let e = err(src);
+            assert!(
+                matches!(e.kind, ParseErrorKind::VectorElementOutOfRange { .. }),
+                "{src}: got {e:?}"
+            );
+            assert!(
+                e.to_string().contains("f32"),
+                "{src}: message names f32: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_largest_f32_is_still_a_vector_element() {
+        match ok("SEARCH TOP 1 NEAREST TO [3.4028235e38, -3.4028235e38, 1e-45] FROM docs;") {
+            Statement::Search(s) => {
+                assert_eq!(s.query, Literal::Vector(vec![f32::MAX, f32::MIN, 1e-45]))
+            }
+            other => panic!("expected a search, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_element_is_located_at_the_element() {
+        let src = "SEARCH TOP 1 NEAREST TO [0.5, 3.5e38] FROM docs;";
+        let e = err(src);
+        assert_eq!(&src[e.span.start..e.span.end], "3.5e38");
     }
 }
