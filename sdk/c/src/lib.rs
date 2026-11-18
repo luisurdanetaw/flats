@@ -185,7 +185,7 @@ static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 /// `const char *flats_version(void)`
 #[unsafe(no_mangle)]
 pub extern "C" fn flats_version() -> *const c_char {
-    VERSION.as_ptr() as *const c_char
+    VERSION.as_ptr().cast::<c_char>()
 }
 
 /// `const char *flats_last_error(void)`
@@ -444,7 +444,7 @@ pub unsafe extern "C" fn flats_result_text(
                 // end in the NUL this length excludes.
                 unsafe { *len = bytes.len().saturating_sub(1) };
             }
-            bytes.as_ptr() as *const c_char
+            bytes.as_ptr().cast::<c_char>()
         }
         _ => ptr::null(),
     }
@@ -675,7 +675,7 @@ pub unsafe extern "C" fn flats_batch_text(
             return Err(Fail::invalid("text is NULL"));
         }
         // SAFETY: non-NULL and valid for `len` bytes by contract.
-        let bytes = unsafe { std::slice::from_raw_parts(utf8 as *const u8, len) };
+        let bytes = unsafe { std::slice::from_raw_parts(utf8.cast::<u8>(), len) };
         let text = std::str::from_utf8(bytes)
             .map_err(|_| Fail::invalid(format!("column {column:?}: text is not valid UTF-8")))?;
         batch.set(column, Value::Text(text.to_string()))

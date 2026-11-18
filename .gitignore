@@ -1,1 +1,6 @@
 /target
+__pycache__/
+*.pyc
+# SDK build products copied next to their wrappers
+/sdk/node/flats.node
+/sdk/python/flats/libflats_c.so

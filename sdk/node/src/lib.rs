@@ -298,7 +298,7 @@ unsafe fn get_cstring(env: napi_env, v: napi_value, what: &str) -> Js<CString> {
             napi_get_value_string_utf8(
                 env,
                 v,
-                buf.as_mut_ptr() as *mut c_char,
+                buf.as_mut_ptr().cast::<c_char>(),
                 len + 1,
                 &mut written,
             )
@@ -738,7 +738,7 @@ unsafe extern "C" fn js_batch_set(env: napi_env, info: napi_callback_info) -> na
                     check(flats_batch_text(
                         batch,
                         name.as_ptr(),
-                        bytes.as_ptr() as *const c_char,
+                        bytes.as_ptr().cast::<c_char>(),
                         bytes.len(),
                     ))?;
                 }

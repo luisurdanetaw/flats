@@ -65,6 +65,11 @@ fn a_c_program_builds_against_the_header_and_runs() {
     let ran = Command::new(&exe)
         .arg(dir.path().join("db"))
         .arg(&backup)
+        // Cargo points LD_LIBRARY_PATH at its own target directories for test
+        // processes, and that outranks the binary's RUNPATH — so a different
+        // (possibly stale) libflats_c.so there would be loaded instead of the
+        // one just built. Load exactly the library this test linked.
+        .env_remove("LD_LIBRARY_PATH")
         .output()
         .expect("run smoke");
     let stdout = String::from_utf8_lossy(&ran.stdout);

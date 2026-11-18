@@ -9,6 +9,17 @@ default-members = ["."]
 name = "flats"
 version = "0.1.0"
 edition = "2024"
+# let-chains (`if let … && …`) are stable from 1.88.
+rust-version = "1.88"
+description = "A tiny embeddable vector database: exact search over mmap'd vectors, a WAL, metadata filters, and a small SQL dialect."
+repository = "https://github.com/luisurdanetaw/flats"
+readme = "README.md"
+keywords = ["vector", "database", "embeddings", "similarity-search", "embedded"]
+categories = ["database-implementations", "data-structures"]
+# NOT SET YET: `license` (or `license-file`). crates.io refuses a publish
+# without one, and choosing it is the code owner's call.
+# The language bindings are workspace members with their own packaging.
+exclude = ["sdk/", ".github/", ".idea/"]
 
 [dependencies]
 thiserror = "2"

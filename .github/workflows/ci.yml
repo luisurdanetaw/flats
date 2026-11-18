@@ -46,6 +46,8 @@ jobs:
         run: cargo doc --no-deps --lib --locked
         env:
           RUSTDOCFLAGS: -D warnings
+      - name: clippy (SDK crates)
+        run: cargo clippy -p flats-c -p flats-node --all-targets --locked -- -D warnings
 
   # ── Build → test → bench (the blocking pipeline) ───────────────────────────
   build-test-bench:
@@ -116,9 +118,39 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+      # c_char is i8 on x86_64 and u8 here, so pointer casts that are fine on
+      # one arch are lint errors on the other.
+      - name: clippy (SDK crates)
+        run: cargo clippy -p flats-c -p flats-node --all-targets --locked -- -D warnings
       - name: Build (all targets)
         run: cargo build --all-targets --locked
       - name: Test
         run: cargo test --locked
       - name: Doc tests
         run: cargo test --doc --locked
+
+  # ── SDKs: the C ABI, and the Python and Node bindings over it ─────────────
+  sdk:
+    name: sdk · C · Python · Node
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      # Rust tests of every C entry point, plus a C program compiled with the
+      # system cc against include/flats.h and run.
+      - name: C ABI
+        run: cargo test -p flats-c --locked
+      - name: Build the shared libraries
+        run: cargo build --release -p flats-c -p flats-node --locked
+      - name: Python
+        run: python3 -m unittest discover -s sdk/python/tests -t sdk/python -v
+      - name: Node.js
+        run: node --test sdk/node/test/

@@ -92,7 +92,7 @@ impl Res {
                             FLATS_TYPE_TEXT => {
                                 let mut len = 0;
                                 let p = flats_result_text(self.0, r, col, &mut len);
-                                let bytes = std::slice::from_raw_parts(p as *const u8, len);
+                                let bytes = std::slice::from_raw_parts(p.cast::<u8>(), len);
                                 assert_eq!(*p.add(len), 0, "NUL-terminated");
                                 Cell::Text(String::from_utf8(bytes.to_vec()).unwrap())
                             }
@@ -213,7 +213,7 @@ fn null_and_invalid_arguments_are_refused_not_crashed_on() {
         );
         let bad_utf8 = [0xFFu8, 0xFE, 0];
         assert_eq!(
-            flats_execute(db.0, bad_utf8.as_ptr() as *const c_char, ptr::null_mut()),
+            flats_execute(db.0, bad_utf8.as_ptr().cast::<c_char>(), ptr::null_mut()),
             FLATS_ERR_INVALID_ARGUMENT
         );
         assert!(last_error().unwrap().contains("UTF-8"));
@@ -321,7 +321,7 @@ impl Batch {
     fn text(&self, col: &str, v: &str) -> i32 {
         let col = c(col);
         // SAFETY: live batch; `v` is valid for `v.len()` bytes (no NUL needed).
-        unsafe { flats_batch_text(self.0, col.as_ptr(), v.as_ptr() as *const c_char, v.len()) }
+        unsafe { flats_batch_text(self.0, col.as_ptr(), v.as_ptr().cast::<c_char>(), v.len()) }
     }
     fn end_row(&self) -> i32 {
         // SAFETY: live batch.

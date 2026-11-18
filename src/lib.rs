@@ -1,12 +1,63 @@
 //! Flats: a tiny, embeddable vector database.
 //!
-//! v1 is brute-force flat search backed by mmap'd vectors and a write-ahead
-//! log. See `CLAUDE.md` for design scope and rationale.
+//! Exact (brute-force) similarity search over `mmap`'d vectors, a write-ahead
+//! log for durability, metadata filters through roaring bitmaps, and a small
+//! SQL dialect, V-SQL, to drive it all. A library, not a server: open a
+//! directory and query it from the same process.
+//!
+//! # Quickstart
+//!
+//! ```
+//! use flats::{Db, DbOptions, RegValue};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # let tmp = tempfile::tempdir()?;
+//! # let path = tmp.path().join("my-db");
+//! let db = Db::open(&path, &[], DbOptions::default())?;
+//!
+//! db.execute(
+//!     "CREATE COLLECTION docs (
+//!          id TEXT PRIMARY KEY,
+//!          vector VECTOR(3),
+//!          year INT
+//!      ) WITH (capacity = 10000);",
+//! )?;
+//!
+//! // One statement, one durable record: both rows land, or neither does.
+//! db.execute(
+//!     "INSERT INTO docs (id, vector, year) VALUES
+//!          ('a', [0.1, 0.9, 0.0], 2023),
+//!          ('b', [0.8, 0.1, 1e-5], 2024);",
+//! )?;
+//!
+//! // Top-k by dot product, filtered before ranking, so `k` counts matches.
+//! let hits = db.execute(
+//!     "SEARCH TOP 1 NEAREST TO [1, 0, 0] FROM docs WHERE year >= 2024 RETURNING id, score;",
+//! )?;
+//! let rows = hits.collect::<Result<Vec<_>, _>>()?;
+//! assert_eq!(rows.len(), 1);
+//! match rows[0].0.as_slice() {
+//!     [RegValue::Str(id), RegValue::Real(score)] => println!("{id}: {score}"),
+//!     other => panic!("unexpected row {other:?}"),
+//! }
+//! # assert!(matches!(rows[0].0.as_slice(), [RegValue::Str(id), _] if id == "b"));
+//!
+//! db.close()?; // checkpoints; dropping without it is crash-safe too
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Bulk loads skip SQL text entirely with [`Db::insert_many`]; a consistent
+//! copy is one [`Db::backup`] away. Python, Node.js and C bindings live in
+//! `sdk/` and wrap the same engine through one C ABI.
+//!
+//! # The API
 //!
 //! The supported API is what this crate root re-exports: [`Db`] and its
 //! options, [`Db::execute`] for V-SQL with the [`RowStream`] it returns, and
 //! the schema and value types those speak. Every module behind them is
-//! private (see the `internals` feature in `Cargo.toml`).
+//! private (see the `internals` feature in `Cargo.toml`). Design scope and
+//! guarantees are in `CLAUDE.md` and `ARCHITECTURE.md`.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 // No `unwrap()`/`expect()` in library code (CLAUDE.md §5): bubble a `Result`.

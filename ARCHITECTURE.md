@@ -429,6 +429,27 @@ Reads continue throughout; writes wait for the copy.
 
 ---
 
+## 8. The SDKs — one C ABI, thin bindings over it
+
+```text
+Python (ctypes)  ─┐
+Node.js (N-API)  ─┼─►  sdk/c  flats.h / flats-c  ─►  flats (root API only)
+C                ─┘
+```
+
+`sdk/c` is the only implementation of the foreign interface: open/close,
+`execute` (results collected into typed cells), `backup`, and a batch-insert
+path that takes vectors as binary and commits through `Db::insert_many`.
+Errors are a status code plus a per-thread message; panics are caught at the
+boundary. It is built from the engine's PUBLIC API alone, like any downstream
+crate. The Python package wraps it with ctypes; the Node addon (`sdk/node`) is
+a Rust cdylib that hand-declares the N-API functions it needs and calls the
+same `flats_c` functions, so the bindings cannot drift apart semantically.
+The two SDK crates hold their own `unsafe` (FFI exports cannot avoid it),
+under the same `// SAFETY:` rule as the engine's quarantines.
+
+---
+
 ## What is and isn't guaranteed
 
 | Guaranteed | How |
