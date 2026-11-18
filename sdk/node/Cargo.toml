@@ -1,0 +1,13 @@
+[package]
+name = "flats-node"
+version = "0.1.0"
+edition = "2024"
+description = "Node.js (N-API) addon for the Flats embeddable vector database"
+publish = false
+
+[lib]
+name = "flats_node"
+crate-type = ["cdylib"]
+
+[dependencies]
+flats-c = { path = "../c" }

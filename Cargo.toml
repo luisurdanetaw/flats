@@ -1,3 +1,10 @@
+# The SDKs live beside the engine: `sdk/c` is the C ABI every language binding
+# wraps, `sdk/node` the Node.js addon over it. Plain `cargo test` at the root
+# still builds and tests only the engine (`flats`); pass `--workspace` for all.
+[workspace]
+members = [".", "sdk/c", "sdk/node"]
+default-members = ["."]
+
 [package]
 name = "flats"
 version = "0.1.0"
