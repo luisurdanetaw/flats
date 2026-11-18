@@ -261,6 +261,7 @@ impl Db {
         let mutates = matches!(
             bound,
             BoundStatement::Insert(_)
+                | BoundStatement::InsertMany(_)
                 | BoundStatement::CreateCollection(_)
                 | BoundStatement::Delete(_)
                 | BoundStatement::Update(_)
@@ -388,6 +389,7 @@ impl Target {
         match statement {
             Statement::Select(s) => Target::Existing(s.from.clone()),
             Statement::Insert(i) => Target::Existing(i.collection.clone()),
+            Statement::InsertMany(m) => Target::Existing(m.collection.clone()),
             Statement::CreateCollection(_) => Target::New,
             // A SEARCH reads an existing collection, like a SELECT. (The binder
             // rejects it for now — see `BindError::Unbound` — but this is the
@@ -427,6 +429,7 @@ fn labels_of(bound: &BoundStatement) -> Vec<String> {
             })
             .collect(),
         BoundStatement::Insert(_)
+        | BoundStatement::InsertMany(_)
         | BoundStatement::CreateCollection(_)
         | BoundStatement::Delete(_)
         | BoundStatement::Update(_) => Vec::new(),

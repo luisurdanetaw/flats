@@ -206,6 +206,7 @@ fn needs_db(op: &Op) -> bool {
             | Op::OpenWrite { .. }
             | Op::KnnScan { .. }
             | Op::Insert { .. }
+            | Op::InsertMany { .. }
             | Op::Mutate { .. }
             | Op::CreateCollection { .. }
             // Every bitmap op reads the collection's metadata index.
@@ -231,6 +232,7 @@ fn mnemonic(op: &Op) -> &'static str {
         Op::ResultRow { .. } => "ResultRow",
         Op::MakeRecord { .. } => "MakeRecord",
         Op::Insert { .. } => "Insert",
+        Op::InsertMany { .. } => "InsertMany",
         Op::KnnScan { .. } => "KnnScan",
         Op::RowId { .. } => "RowId",
         Op::Score { .. } => "Score",
@@ -814,6 +816,26 @@ impl Vm {
                     // Blocks until durable AND applied, so the row is readable
                     // through a cursor the moment this returns.
                     db.insert(collection, &vector, row)
+                        .map_err(ExecError::Engine)?;
+                }
+                Op::InsertMany { cur, start, count } => {
+                    let (cur, start, count) = (*cur, *start, *count);
+                    let db = db.ok_or(ExecError::Detached { op: "InsertMany" })?;
+                    let (collection, schema) = match self.slot(cur)? {
+                        Slot::Write { collection, schema } => (*collection, schema.clone()),
+                        _ => return Err(ExecError::NotAWriteCursor { cur: cur.0 }),
+                    };
+                    // The same split `Insert` does, once per record; the
+                    // batch then goes down whole, as one durable record.
+                    let mut rows = Vec::with_capacity(count as usize);
+                    for reg in start.0..start.0 + count {
+                        let record = match self.reg(Reg(reg)) {
+                            Some(RegValue::Record(record)) => record,
+                            _ => return Err(ExecError::NotARecord { reg }),
+                        };
+                        rows.push(split_record(record, &schema).map_err(ExecError::Split)?);
+                    }
+                    db.insert_many(collection, rows)
                         .map_err(ExecError::Engine)?;
                 }
 

@@ -38,8 +38,14 @@
 pub enum Statement {
     /// `SELECT …`
     Select(SelectStmt),
-    /// `INSERT INTO …`
+    /// `INSERT INTO …` with ONE row of values.
     Insert(InsertStmt),
+    /// `INSERT INTO … VALUES (…), (…), …` — two or more rows, one statement.
+    ///
+    /// A separate variant rather than a `Vec` of rows on [`InsertStmt`] so the
+    /// one-row statement every existing stage and test speaks keeps its exact
+    /// shape; a multi-row statement binds each row through the same routine.
+    InsertMany(InsertManyStmt),
     /// `CREATE COLLECTION …`
     CreateCollection(CreateStmt),
     /// `SEARCH TOP … NEAREST TO … FROM …`
@@ -280,6 +286,20 @@ pub struct InsertStmt {
     /// One value per source position. The parser does NOT check that
     /// `values.len() == columns.len()` — count/type validation is the planner's.
     pub values: Vec<Literal>,
+}
+
+/// `INSERT INTO collection ( columns ) VALUES ( … ), ( … ), …` — two or more
+/// rows against one column list. Lands as ONE record: every row or none.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertManyStmt {
+    /// Target collection.
+    pub collection: String,
+    /// Target columns, in source order, shared by every row.
+    pub columns: Vec<String>,
+    /// One value list per row, in source order. As for [`InsertStmt`], the
+    /// parser does not check a row's length against `columns` — the binder
+    /// does, row by row.
+    pub rows: Vec<Vec<Literal>>,
 }
 
 /// A literal value in an `INSERT ... VALUES (...)` list. Carries no type

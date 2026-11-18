@@ -542,6 +542,23 @@ impl Apply for IndexApplier {
                     return Ok(Outcome::Conflicted);
                 }
 
+                // UNIQUENESS, decided here for the same reason an `Insert`'s
+                // is: this thread is the only place where "no live row holds
+                // this key" cannot change between asking and acting. Two bulk
+                // inserts can both pass their callers' checks; only one gets
+                // past this. A refusal is a verdict, not an apply failure, and
+                // it is deterministic — replay reaches it again — so the
+                // watermarks advance exactly as for a conflict.
+                if let Some(reason) = self.install_conflict(*collection, &retire.0, install)? {
+                    let w = self.writers(*collection)?;
+                    w.flat.advance_applied_lsn(lsn.0);
+                    w.meta.advance_applied_lsn(lsn);
+                    w.tuple.advance_applied_lsn(lsn);
+                    self.last_applied = self.last_applied.max(lsn.0);
+                    return Ok(Outcome::Rejected(reason));
+                }
+                let w = self.writers(*collection)?;
+
                 // DATA FIRST, LIVENESS LAST — the same rule as `Insert`, but
                 // now spanning a whole statement. Every installed row must be
                 // readable in both stores before anything publishes it, or a
@@ -651,6 +668,45 @@ impl IndexApplier {
         };
         let w = self.writers(collection)?;
         if w.meta.is_key_taken(key, &value).map_err(to_io)? {
+            return Ok(Some(RejectReason::DuplicateKey));
+        }
+        Ok(None)
+    }
+
+    /// The primary-key verdict for a `Record::Mutate`: a key repeated among
+    /// its installs, or held by a live row the record does not retire.
+    ///
+    /// Records that predate this check could only reach it with a key that
+    /// was ALREADY duplicated — UPDATE cannot assign a key, and its copies'
+    /// keys are freed by the rows it retires — so replaying an older log
+    /// reaches the verdict it always effectively had.
+    fn install_conflict(
+        &mut self,
+        collection: u32,
+        retire: &RoaringBitmap,
+        install: &[Install],
+    ) -> io::Result<Option<RejectReason>> {
+        let Some(key) = self
+            .registry
+            .iter()
+            .find(|c| c.id == collection)
+            .and_then(|c| c.schema.primary_key)
+        else {
+            return Ok(None);
+        };
+        let values: Vec<&Value> = install
+            .iter()
+            .filter_map(|r| r.metadata.iter().find(|(id, _)| *id == key).map(|(_, v)| v))
+            .collect();
+        let mut seen = std::collections::HashSet::with_capacity(values.len());
+        if values.iter().any(|v| !seen.insert(render_key(v))) {
+            return Ok(Some(RejectReason::DuplicateKey));
+        }
+        let w = self.writers(collection)?;
+        if w.meta
+            .any_key_held_outside(key, &values, retire)
+            .map_err(to_io)?
+        {
             return Ok(Some(RejectReason::DuplicateKey));
         }
         Ok(None)
@@ -1212,6 +1268,136 @@ impl Db {
                 Err(self.wal_err(e))
             }
         }
+    }
+
+    /// Insert many rows as ONE durable record: all of them, or none.
+    ///
+    /// Each element is `(vector, row)`, exactly what [`insert`](Self::insert)
+    /// takes. The batch is logged as a single `Record::Mutate` that retires
+    /// nothing — one frame, one CRC, one fsync — so it costs one commit instead
+    /// of one per row, and a crash either keeps every row or none.
+    ///
+    /// Returns each row's ordinal, in input order. Like `insert`'s, they are
+    /// stable only until the collection is next compacted.
+    ///
+    /// Everything that can be refused is refused BEFORE an ordinal is claimed,
+    /// so a refused batch costs the collection no capacity: a wrong dimension
+    /// or malformed row anywhere, a primary key repeated inside the batch or
+    /// already held by a live row (both [`Error::DuplicateKey`], naming the
+    /// first offender), a payload over [`MAX_INSTALL_BYTES`]
+    /// ([`Error::StatementTooLarge`]), or more rows than the collection has
+    /// room for ([`Error::CapacityExceeded`]).
+    ///
+    /// The key checks here are the diagnostic, not the guarantee — two
+    /// batches can both pass them. The commit thread re-checks every installed
+    /// key before folding the record in, and refuses the whole record if one
+    /// is taken; that refusal surfaces here as the same `DuplicateKey`.
+    ///
+    /// An empty batch succeeds without logging anything.
+    pub fn insert_many(&self, collection: u32, rows: Vec<(Vec<f32>, Row)>) -> Result<Vec<Ordinal>> {
+        let _gate = self.gate.enter();
+        let coll = self.collection(collection)?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 1. VALIDATE every row, in input order, so the error names the first
+        //    offender a caller would find by reading their own batch.
+        let dim = coll.config.schema.vector().dim.get();
+        for (vector, row) in &rows {
+            if vector.len() != dim {
+                return Err(Error::DimensionMismatch {
+                    expected: dim,
+                    got: vector.len(),
+                });
+            }
+            coll.config.schema.validate_row(row)?;
+        }
+        if let Some(key) = coll.config.schema.primary_key {
+            self.check_batch_keys(&coll, key, rows.iter().map(|(_, row)| row))?;
+        }
+        self.check_poison()?;
+
+        // 2. SIZE, before any ordinal exists. `mutate` checks it too, but only
+        //    after the caller has reserved — too late to keep the capacity.
+        //    The ordinal is a fixed-width field, so a placeholder measures the
+        //    same as the real one.
+        let mut install: Vec<Install> = rows
+            .into_iter()
+            .map(|(vector, metadata)| Install {
+                ordinal: 0,
+                vector,
+                metadata,
+            })
+            .collect();
+        let bytes = bincode::serialized_size(&install)
+            .map_err(|e| Error::Io(io::Error::new(io::ErrorKind::InvalidData, e.to_string())))?
+            as usize;
+        if bytes > MAX_INSTALL_BYTES {
+            return Err(Error::StatementTooLarge {
+                bytes,
+                cap: MAX_INSTALL_BYTES,
+            });
+        }
+
+        // 3. CLAIM one consecutive run — all of it, or a refusal that burns
+        //    nothing.
+        let count = install.len() as u64;
+        let start = coll.alloc_ordinals(count)?;
+        self.allocated(&coll, start, start + count);
+        for (i, row) in install.iter_mut().enumerate() {
+            row.ordinal = start + i as u64;
+        }
+        let ordinals: Vec<Ordinal> = (start..start + count).map(|o| Ordinal(o as u32)).collect();
+
+        // 4. ONE record. A batch retires nothing, so it can never be stale —
+        //    `Conflicted` is unreachable — and the only refusal left is the
+        //    commit thread's key check.
+        let keys: Vec<Row> = match coll.config.schema.primary_key {
+            Some(_) => install.iter().map(|r| r.metadata.clone()).collect(),
+            None => Vec::new(),
+        };
+        match self.mutate(collection, RoaringBitmap::new(), install)? {
+            Outcome::Applied => Ok(ordinals),
+            Outcome::Rejected(RejectReason::DuplicateKey) | Outcome::Conflicted => {
+                // Another writer took one of these keys between our check and
+                // the commit. Name it: by now the winner is live, so the same
+                // check that missed it before finds it.
+                if let Some(key) = coll.config.schema.primary_key {
+                    self.check_batch_keys(&coll, key, keys.iter())?;
+                }
+                Err(Error::DuplicateKey {
+                    column: coll.config.schema.primary_key.map_or_else(
+                        || "<none>".to_string(),
+                        |k| Self::key_name(&coll.config.schema, k),
+                    ),
+                    value: "<taken concurrently>".to_string(),
+                })
+            }
+        }
+    }
+
+    /// Refuse a batch in which a primary key repeats, or is already held by a
+    /// live row — whichever comes first in input order.
+    fn check_batch_keys<'r>(
+        &self,
+        coll: &Collection,
+        key: ColumnId,
+        rows: impl Iterator<Item = &'r Row>,
+    ) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for row in rows {
+            if let Some((_, value)) = row.iter().find(|(id, _)| *id == key)
+                && !seen.insert(render_key(value))
+            {
+                return Err(Error::DuplicateKey {
+                    column: Self::key_name(&coll.config.schema, key),
+                    value: render_key(value),
+                });
+            }
+            self.check_duplicate_key(coll, key, row)?;
+        }
+        Ok(())
     }
 
     /// Tombstone `ordinal` in `collection`. Blocks until durable. Idempotent.

@@ -30,7 +30,7 @@ use std::fmt;
 
 use crate::sql::ast::{
     Assignment, CollectionOption, ColumnDef, ColumnType, CompareOp, CreateStmt, DeleteStmt, Expr,
-    InsertStmt, Literal, Projection, SearchStmt, SelectStmt, Statement, UpdateStmt,
+    InsertManyStmt, InsertStmt, Literal, Projection, SearchStmt, SelectStmt, Statement, UpdateStmt,
 };
 use crate::sql::lexer::{LexError, Lexer, Span, SpannedToken, Token};
 
@@ -248,7 +248,7 @@ impl Parser {
     pub fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         let stmt = match self.peek() {
             Token::Select => Statement::Select(self.parse_select()?),
-            Token::Insert => Statement::Insert(self.parse_insert()?),
+            Token::Insert => self.parse_insert_statement()?,
             Token::Create => Statement::CreateCollection(self.parse_create()?),
             Token::Search => Statement::Search(self.parse_search()?),
             Token::Delete => Statement::Delete(self.parse_delete()?),
@@ -603,7 +603,43 @@ impl Parser {
         Ok(CollectionOption { name, value })
     }
 
-    /// `insert := INSERT INTO ident '(' ident (',' ident)* ')' VALUES '(' literal (',' literal)* ')'`
+    /// `insert := INSERT INTO ident '(' ident (',' ident)* ')' VALUES row (',' row)*`
+    /// with `row := '(' literal (',' literal)* ')'`.
+    ///
+    /// One row is a [`Statement::Insert`], exactly as it always was; two or
+    /// more are a [`Statement::InsertMany`].
+    fn parse_insert_statement(&mut self) -> Result<Statement, ParseError> {
+        let first = self.parse_insert()?;
+        if *self.peek() != Token::Comma {
+            return Ok(Statement::Insert(first));
+        }
+        let mut rows = vec![first.values];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            rows.push(self.parse_value_row()?);
+        }
+        Ok(Statement::InsertMany(InsertManyStmt {
+            collection: first.collection,
+            columns: first.columns,
+            rows,
+        }))
+    }
+
+    /// `row := '(' literal (',' literal)* ')'` — one parenthesized value list.
+    fn parse_value_row(&mut self) -> Result<Vec<Literal>, ParseError> {
+        self.expect(Token::LParen)?;
+        let mut values = vec![self.parse_literal()?];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            values.push(self.parse_literal()?);
+        }
+        self.expect(Token::RParen)?;
+        Ok(values)
+    }
+
+    /// `INSERT INTO ident '(' ident (',' ident)* ')' VALUES row` — the head and
+    /// FIRST row; [`parse_insert_statement`](Self::parse_insert_statement)
+    /// takes any rows after it.
     fn parse_insert(&mut self) -> Result<InsertStmt, ParseError> {
         self.expect(Token::Insert)?;
         self.expect(Token::Into)?;
@@ -618,13 +654,7 @@ impl Parser {
         self.expect(Token::RParen)?;
 
         self.expect(Token::Values)?;
-        self.expect(Token::LParen)?;
-        let mut values = vec![self.parse_literal()?];
-        while *self.peek() == Token::Comma {
-            self.advance();
-            values.push(self.parse_literal()?);
-        }
-        self.expect(Token::RParen)?;
+        let values = self.parse_value_row()?;
 
         // NOTE: no check that columns.len() == values.len() — a count mismatch
         // is a semantic error the planner catches, not a syntax error.
@@ -1651,5 +1681,60 @@ mod tests {
         let src = "SEARCH TOP 1 NEAREST TO [0.5, 3.5e38] FROM docs;";
         let e = err(src);
         assert_eq!(&src[e.span.start..e.span.end], "3.5e38");
+    }
+
+    // -- multi-row INSERT ---------------------------------------------------
+    //
+    // `insert := INSERT INTO ident '(' cols ')' VALUES row (',' row)*`. A
+    // single row stays `Statement::Insert`, exactly as before; two or more
+    // become `Statement::InsertMany`, one statement and one record downstream.
+
+    #[test]
+    fn two_value_rows_parse_as_one_insert_many() {
+        assert_eq!(
+            ok("INSERT INTO docs (id, vector) VALUES (1, [0.5]), (2, [-1e-5]);"),
+            Statement::InsertMany(InsertManyStmt {
+                collection: "docs".to_string(),
+                columns: cols(&["id", "vector"]),
+                rows: vec![
+                    vec![Literal::Int(1), Literal::Vector(vec![0.5])],
+                    vec![Literal::Int(2), Literal::Vector(vec![-1e-5])],
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn one_value_row_is_still_a_plain_insert() {
+        assert!(matches!(
+            ok("INSERT INTO docs (id) VALUES (1);"),
+            Statement::Insert(_)
+        ));
+    }
+
+    #[test]
+    fn rows_of_different_lengths_still_parse() {
+        // Arity is the binder's, per row — the parser does not do semantics.
+        match ok("INSERT INTO docs (a, b) VALUES (1, 2), (3), (4, 5, 6);") {
+            Statement::InsertMany(m) => {
+                assert_eq!(
+                    m.rows.iter().map(Vec::len).collect::<Vec<_>>(),
+                    vec![2, 1, 3]
+                );
+            }
+            other => panic!("expected InsertMany, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_value_row_lists_are_errors() {
+        for src in [
+            "INSERT INTO docs (a) VALUES (1),;",
+            "INSERT INTO docs (a) VALUES (1) (2);",
+            "INSERT INTO docs (a) VALUES (1), 2;",
+            "INSERT INTO docs (a) VALUES (1), ();",
+        ] {
+            err(src);
+        }
     }
 }

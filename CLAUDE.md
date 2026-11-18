@@ -126,6 +126,13 @@ SELECT x, y FROM docs WHERE a < 4 AND a = 2; -- NOTE: we support < > <= >= != =
 -- INSERT (every column, including the key — V-SQL has no NULLs and no defaults)
 INSERT INTO docs (id, vector, author, title, published_at) VALUES ('d1', [0.1, ...], 'alice', 'My doc', 1700000000);
 
+-- Multi-row INSERT: one statement, ONE durable record — every row or none. A key
+-- repeated in the batch or already live refuses the whole batch. (Rust API:
+-- Db::insert_many.)
+INSERT INTO docs (id, vector, author, title, published_at) VALUES
+    ('d2', [0.1, ...], 'bob', 'A', 1700000001),
+    ('d3', [0.2, ...], 'eve', 'B', 1700000002);
+
 -- DELETE
 DELETE FROM <collection> WHERE <predicate>;
 

@@ -559,6 +559,38 @@ impl<'a> Compiler<'a> {
                 self.emit(Op::Insert { cur, rec });
             }
 
+            LogicalPlan::InsertMany(many) => {
+                // LEAF, like Insert: no loop, no body. The records get a
+                // CONTIGUOUS run of registers first, so the one write op can
+                // name them as `start..start+count`; each row's values are
+                // loaded into fresh registers above that run and packed down
+                // into its slot.
+                let cur = self.alloc_cursor();
+                self.emit(Op::OpenWrite {
+                    cur,
+                    collection: many.collection.clone(),
+                });
+                let count = many.rows.len() as u32;
+                let records = self.next_reg;
+                self.next_reg += count;
+                for (i, row) in many.rows.iter().enumerate() {
+                    let base = self.next_reg;
+                    for value in row {
+                        self.emit_literal(&value.value);
+                    }
+                    self.emit(Op::MakeRecord {
+                        start: Reg(base),
+                        count: self.next_reg - base,
+                        dst: Reg(records + i as u32),
+                    });
+                }
+                self.emit(Op::InsertMany {
+                    cur,
+                    start: Reg(records),
+                    count,
+                });
+            }
+
             LogicalPlan::CreateCollection(create) => {
                 // LEAF: one fat op. The interned schema is the one `compile`
                 // LOWERED FROM THIS STATEMENT'S DDL — never `self.schema`, which
@@ -679,7 +711,9 @@ mod tests {
     use crate::sql::bind::{
         BoundPredicate, ColumnRef, ColumnSchema, Projected, Schema as BindSchema, TypedValue,
     };
-    use crate::sql::plan::{CreateCollection, Delete, Insert, LogicalPlan, Project, Scan, Update};
+    use crate::sql::plan::{
+        CreateCollection, Delete, Insert, InsertMany, LogicalPlan, Project, Scan, Update,
+    };
     use std::num::NonZeroUsize;
 
     // ------------------------------------------------------------------------
@@ -1540,6 +1574,55 @@ mod tests {
             compile(plan, Some(&docs_meta_schema())).expect("compiles"),
             expected
         );
+    }
+
+    // ========================================================================
+    // INSERT MANY — one write op over a contiguous run of records.
+    // ========================================================================
+
+    #[test]
+    fn insert_many_packs_each_row_into_a_contiguous_record_run() {
+        let plan = LogicalPlan::InsertMany(InsertMany {
+            collection: "docs".to_string(),
+            schema: docs_bind_schema(),
+            rows: vec![bootstrap_row(), bootstrap_row(), bootstrap_row()],
+        });
+        let program = compile(plan, Some(&docs_meta_schema())).expect("compiles");
+        program.validate().expect("a valid program");
+
+        // Exactly one write, naming the three records as r0..r3.
+        let writes: Vec<&Op> = program
+            .ops
+            .iter()
+            .filter(|op| matches!(op, Op::Insert { .. } | Op::InsertMany { .. }))
+            .collect();
+        assert_eq!(
+            writes,
+            vec![&Op::InsertMany {
+                cur: Cursor(0),
+                start: Reg(0),
+                count: 3,
+            }]
+        );
+        // Row i is packed into record register i, from four fresh registers
+        // above the run — never from inside it.
+        let packs: Vec<(u32, u32, u32)> = program
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::MakeRecord { start, count, dst } => Some((start.0, *count, dst.0)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(packs, vec![(3, 4, 0), (7, 4, 1), (11, 4, 2)]);
+        // No row loop: INSERT walks no rows.
+        assert!(
+            !program
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::SeekFirst { .. } | Op::Next { .. }))
+        );
+        assert_eq!(program.ops.last(), Some(&Op::Halt));
     }
 
     // ========================================================================

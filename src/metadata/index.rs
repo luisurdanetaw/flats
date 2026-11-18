@@ -524,6 +524,43 @@ impl Writer {
         Ok(!(holders & inner.live.clone()).is_empty())
     }
 
+    /// Whether ANY of `values` is held in `col` by a live row that `retire`
+    /// does not free — the uniqueness check for a whole `Record::Mutate`.
+    ///
+    /// The multi-row sibling of [`is_key_taken`](Self::is_key_taken), and
+    /// different from a loop of it in two ways that matter:
+    ///
+    /// * **One lock hold** for the whole record, so the verdict is about one
+    ///   state of `live`, and no per-key copy of the live bitmap: a holder set
+    ///   for a key is one row, so the test is a disjointness check against
+    ///   `live` in place. A bulk insert of n rows stays O(n), not O(n·live).
+    /// * **`retire` frees keys.** An UPDATE retires a row and installs its
+    ///   copy under the same key; that key is held only by a row the record
+    ///   itself removes, so it is not a conflict.
+    ///
+    /// Repeats WITHIN `values` are the caller's to detect — this answers only
+    /// "is a key taken by a row that will still be live".
+    pub fn any_key_held_outside(
+        &self,
+        col: ColumnId,
+        values: &[&Value],
+        retire: &RoaringBitmap,
+    ) -> Result<bool> {
+        let inner = self.lock();
+        let store = inner
+            .columns
+            .get(col as usize)
+            .ok_or(Error::UnknownColumn { column: col })?;
+        for value in values {
+            let mut holders = store.lookup_eq(col, value)?;
+            holders -= retire;
+            if !holders.is_disjoint(&inner.live) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Apply ONE `Record::Mutate` — every retirement and every installation —
     /// under a SINGLE lock hold.
     ///
