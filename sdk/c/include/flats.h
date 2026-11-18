@@ -140,6 +140,10 @@ int flats_batch_vector(flats_batch *b, const float *data, size_t len);
 int flats_batch_int(flats_batch *b, const char *column, int64_t value);
 int flats_batch_float(flats_batch *b, const char *column, double value);
 int flats_batch_text(flats_batch *b, const char *column, const char *utf8, size_t len);
+/* The type a column takes — FLATS_TYPE_* (VECTOR for the vector column) —
+ * or 0 if the collection has no such column. For bindings whose language has
+ * one number type and must pick flats_batch_int or flats_batch_float. */
+int flats_batch_column_type(const flats_batch *b, const char *column);
 /* Finish the current row. Refused if any column is unset. */
 int flats_batch_end_row(flats_batch *b);
 /* Rows finished and not yet committed. */

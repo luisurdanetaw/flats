@@ -497,6 +497,8 @@ pub struct flats_batch {
     db: *const flats_db,
     collection: u32,
     dim: usize,
+    /// The vector column's name, so `flats_batch_column_type` can answer it.
+    vector_name: String,
     /// Scalar column name → (storage id, type).
     columns: HashMap<String, (ColumnId, ColumnType)>,
     /// Column names by storage id, for "missing column" messages.
@@ -545,6 +547,7 @@ pub unsafe extern "C" fn flats_batch_new(
             db,
             collection: id,
             dim: schema.vector().dim.get(),
+            vector_name: schema.vector().name.clone(),
             columns,
             names,
             vector: None,
@@ -677,6 +680,36 @@ pub unsafe extern "C" fn flats_batch_text(
             .map_err(|_| Fail::invalid(format!("column {column:?}: text is not valid UTF-8")))?;
         batch.set(column, Value::Text(text.to_string()))
     })
+}
+
+/// `int flats_batch_column_type(const flats_batch *b, const char *column)`
+///
+/// # Safety
+/// `b` is NULL or a live batch; `column` is NULL or a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flats_batch_column_type(
+    b: *const flats_batch,
+    column: *const c_char,
+) -> i32 {
+    // SAFETY: NULL or live, by contract.
+    let Some(batch) = (unsafe { b.as_ref() }) else {
+        return 0;
+    };
+    // SAFETY: forwarded from this function's own contract. Not run through
+    // `guard`: an answer of 0 is the documented "no such column", not an
+    // error to record.
+    let Ok(column) = (unsafe { arg_str(column, "column") }) else {
+        return 0;
+    };
+    if column == batch.vector_name {
+        return FLATS_TYPE_VECTOR;
+    }
+    match batch.columns.get(column) {
+        Some((_, ColumnType::Int)) => FLATS_TYPE_INT,
+        Some((_, ColumnType::Float)) => FLATS_TYPE_FLOAT,
+        Some((_, ColumnType::Text)) => FLATS_TYPE_TEXT,
+        None => 0,
+    }
 }
 
 /// `int flats_batch_end_row(flats_batch *b)`

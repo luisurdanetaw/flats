@@ -485,3 +485,28 @@ fn close_checkpoints_and_reports_ok() {
     let db = Db::open(dir.path());
     assert_eq!(db.query("SELECT id FROM docs;").rows().len(), 0);
 }
+
+#[test]
+fn a_batch_reports_each_columns_type() {
+    // Dynamic languages with one number type (JavaScript) ask the schema
+    // which setter a value needs.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let b = Batch::new(&db, "docs").unwrap();
+    let ty = |col: &str| {
+        let col = c(col);
+        // SAFETY: live batch, valid string.
+        unsafe { flats_batch_column_type(b.0, col.as_ptr()) }
+    };
+    assert_eq!(ty("id"), FLATS_TYPE_TEXT);
+    assert_eq!(ty("year"), FLATS_TYPE_INT);
+    assert_eq!(ty("score"), FLATS_TYPE_FLOAT);
+    assert_eq!(ty("vector"), FLATS_TYPE_VECTOR);
+    assert_eq!(ty("nope"), 0);
+    // SAFETY: NULLs are part of the contract.
+    assert_eq!(
+        unsafe { flats_batch_column_type(ptr::null(), ptr::null()) },
+        0
+    );
+}
