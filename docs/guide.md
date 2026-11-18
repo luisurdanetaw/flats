@@ -1,0 +1,227 @@
+# Flats user guide
+
+This guide covers what every SDK shares: the model, V-SQL, and how to run a
+Flats database well. For language specifics see the SDK guides:
+[Python](../sdk/python/README.md) · [Node.js](../sdk/node/README.md) ·
+[C](../sdk/c/README.md) · [Rust](../README.md#rust).
+
+## The model in two minutes
+
+- **A database is a directory.** Open it from your process; there is no
+  server. One process should own a directory at a time.
+- **A collection** is a fixed-shape table with exactly one `VECTOR(dim)`
+  column, any number of `TEXT`, `INT` and `FLOAT` columns, and exactly one
+  `PRIMARY KEY` (`TEXT` or `INT`). Its `capacity` — the most rows it will
+  ever hold — is fixed when you create it.
+- **Search is exact.** `SEARCH` scores every live row against your query
+  vector and returns the best `k`. No index to build, no recall to tune.
+- **Score is the dot product.** Higher is more similar. For **cosine
+  similarity**, normalize vectors to unit length before inserting them and
+  before searching; the dot product of unit vectors *is* the cosine.
+- **Every write is durable when the call returns** — it is in the
+  write-ahead log and fsynced. A multi-row statement is all-or-nothing.
+- **Writes are visible immediately.** A row can be searched the moment its
+  insert returns.
+- **No NULLs, no defaults.** Every insert gives every column a value.
+
+## A first session
+
+```sql
+CREATE COLLECTION articles (
+    id        TEXT PRIMARY KEY,
+    vector    VECTOR(384),
+    lang      TEXT,
+    year      INT,
+    rating    FLOAT
+) WITH (capacity = 500000);
+
+INSERT INTO articles (id, vector, lang, year, rating) VALUES
+    ('a1', [0.012, -0.08, ...], 'en', 2023, 4.5),
+    ('a2', [0.044,  0.01, ...], 'es', 2024, 3.9);
+
+SEARCH TOP 10 NEAREST TO [0.02, -0.05, ...] FROM articles
+    WHERE lang = 'en' AND year >= 2023
+    RETURNING id, score, rating;
+```
+
+In practice you rarely write `INSERT` text yourself: every SDK has an
+`insert` call that sends vectors as binary, which is several times faster
+(see [Loading data](#loading-data)).
+
+## V-SQL
+
+V-SQL is a deliberately small SQL. One statement per call, ending in `;`.
+Keywords are case-insensitive.
+
+### Types and literals
+
+| Type | Literal | Notes |
+|---|---|---|
+| `INT` | `42`, `-7` | 64-bit signed |
+| `FLOAT` | `0.5`, `-1e-5`, `2.5E+10` | 64-bit; NaN is refused |
+| `TEXT` | `'hello'`, `'it''s'` | UTF-8; double a quote to escape it |
+| `VECTOR(n)` | `[0.1, -2, 3e-7]` | `n` 32-bit floats; ints are fine |
+
+Scientific notation is accepted everywhere, so a float formatted by
+Python's `repr`, JavaScript's `String` or Rust's `{:?}` can be pasted in
+as-is. A value too large for its type (`1e999`, or a vector component past
+`3.4e38`) is an error, never a silent infinity.
+
+### Statements
+
+**Create and drop**
+
+```sql
+CREATE COLLECTION docs (id INT PRIMARY KEY, vector VECTOR(768), title TEXT)
+    WITH (capacity = 1000000);
+
+DROP COLLECTION docs;   -- rows, files and all; the name is free again at once
+```
+
+**Insert** — every column, the key included. Several rows in one statement
+land together or not at all; a key that is already taken, or repeated in the
+statement, refuses the whole statement.
+
+```sql
+INSERT INTO docs (id, vector, title) VALUES (1, [...], 'one'), (2, [...], 'two');
+```
+
+**Search** — the core query.
+
+```sql
+SEARCH TOP 5 NEAREST TO [...] FROM docs;                          -- every scalar column
+SEARCH TOP 5 NEAREST TO [...] FROM docs RETURNING id, score;      -- pick columns
+SEARCH TOP 5 NEAREST TO [...] FROM docs RETURNING id, vector;     -- include embeddings
+SEARCH TOP 5 NEAREST TO [...] FROM docs WHERE title != 'draft' RETURNING id, score;
+```
+
+Results come nearest first. `score` exists only in `RETURNING`. The query
+vector must have the collection's dimension.
+
+**Select** — read rows without ranking them. Row order is unspecified.
+
+```sql
+SELECT * FROM docs;                       -- every scalar column, never the vector
+SELECT id, vector FROM docs WHERE id = 7; -- name the vector column to get it
+```
+
+**Update** — `WHERE` is required. The primary key cannot be changed (delete
+and re-insert instead). Replacing the embedding needs the key, because one
+statement carries one vector and so must name one row.
+
+```sql
+UPDATE docs SET title = 'renamed' WHERE id = 7;
+UPDATE docs SET title = 'archived' WHERE id < 100;
+UPDATE docs SET vector = [...], title = 'v2' WHERE id = 7;
+```
+
+**Delete** — `WHERE` is required; there is no "delete everything" (drop the
+collection instead).
+
+```sql
+DELETE FROM docs WHERE title = 'draft';
+```
+
+### WHERE clauses
+
+Comparisons `=  !=  <  <=  >  >=`, combined with `AND`, `OR` and
+parentheses.
+
+```sql
+WHERE lang = 'en' AND (year < 2010 OR rating >= 4.5)
+```
+
+- Ordered comparisons (`<`, `>`, …) work on `INT` and `FLOAT`; `TEXT`
+  supports `=` and `!=` only.
+- `IN` and `NOT` are not supported, and say so: write `IN` as an `OR` chain
+  and `NOT a = x` as `a != x`.
+- There is no `LIMIT`, `ORDER BY`, `GROUP BY` or join. `SEARCH … TOP k` is
+  the way to get "the best k".
+
+**Filtered search keeps k.** The filter runs *before* ranking: `TOP 10 …
+WHERE lang = 'en'` returns ten English rows whenever ten exist, however rare
+English is. A selective filter also makes the search faster, since fewer
+rows are scored.
+
+## Loading data
+
+Use your SDK's `insert` call rather than `INSERT` text: it passes vectors as
+binary floats and commits in large batches. Measured at 768 dimensions:
+
+| Path | Rows / second |
+|---|---|
+| SDK `insert` with float32 buffers (Python `array('f')`/NumPy, JS `Float32Array`) | ~45,000 |
+| Rust `Db::insert_many` | ~75,000 |
+| `INSERT … VALUES` with 1,000 rows per statement | ~7,000 |
+| One row per `INSERT` statement | ~400 |
+
+SDK inserts commit every 10,000 rows. Each batch is atomic; a large load is
+not atomic as a whole, so if it fails midway, earlier batches are in. Make
+loads idempotent by keying on your own ids and checking what exists first if
+you need to resume.
+
+## Sizing: capacity, dimension, memory
+
+- **Disk and memory** are about `capacity × dim × 4` bytes for vectors —
+  1M × 768 is ~3 GB — plus the metadata. Vectors are memory-mapped, so the OS
+  pages them; for fast search the working set should fit in RAM.
+- **Capacity is fixed.** Inserting past it fails with a capacity error. Size
+  it for growth. Deleted and updated rows keep their slot until **compaction**
+  reclaims it, which runs automatically in the background; an update is a
+  delete plus an insert, so heavy update traffic consumes capacity until then.
+- **Dimension is fixed** per collection. Changing embedding models means a
+  new collection.
+
+## Operations
+
+**Durability and crashes.** A write is acknowledged after it is fsynced to
+the log. On open, Flats replays whatever the log holds past the last
+checkpoint — after a crash, just open the directory again. Closing cleanly
+(`close()`) checkpoints, which makes the next open faster.
+
+**Backups.** Each SDK has `backup(dest)`: a consistent copy, taken while the
+database stays open. Reads continue during the copy; writes wait for it. The
+copy holds whole statements only. To restore, open the copy. `dest` must not
+exist or must be empty.
+
+**Concurrency.** One database handle can be shared by many threads. Reads run
+in parallel and never block; writes are serialized. Each statement sees one
+consistent snapshot. There are no multi-statement transactions.
+
+**Listing collections.** V-SQL has no `SHOW` statement. The Rust API has
+`Db::collections()`; the bundled shell (`cargo run --release -- DIR`) has
+`.tables` and `.schema`.
+
+## Performance
+
+Search time is proportional to `rows × dim`: it reads every live vector once.
+Rough figures on a desktop CPU at 768 dimensions:
+
+| Live rows | One search |
+|---|---|
+| 20,000 | ~2 ms |
+| 1,000,000 | ~105 ms |
+
+- **Filter when you can.** A `WHERE` matching 10% of rows searched 1M rows in
+  ~27 ms.
+- **Throughput** stops scaling past a few concurrent searches: they compete
+  for memory bandwidth.
+- **Smaller dimensions are proportionally faster.** A 384-dim model searches
+  twice as fast as a 768-dim one.
+- Flats suits collections up to a few hundred thousand vectors at
+  interactive latency, and larger ones for batch or low-QPS work. Past that,
+  an approximate (ANN) index is the right tool.
+
+## Errors
+
+Every SDK reports the same four kinds:
+
+| Kind | Means | Typical cause |
+|---|---|---|
+| Query error | The statement is wrong; nothing changed | typo, unknown collection/column, unsupported syntax, missing column in INSERT |
+| Engine error | The database refused or failed it | duplicate primary key, collection full, backup target not empty, I/O |
+| Invalid argument | A value or handle the call cannot take | wrong vector length, wrong type for a column, NaN, closed database |
+| Internal error | A bug in Flats | please report it |
+
+Messages are specific — they name the column, value or construct at fault —
+so they are worth surfacing to your users or logs as they are.

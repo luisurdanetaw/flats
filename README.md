@@ -17,6 +17,14 @@ a server: open a directory and query it from the same process. CPU only.
   snapshots. Deleted rows are reclaimed by background compaction.
 - **Linux, x86_64 and aarch64** for v1.
 
+## Documentation
+
+- **[User guide](docs/guide.md)**: the model, V-SQL, loading data, sizing,
+  backups, performance, errors.
+- SDK guides: [Python](sdk/python/README.md) · [Node.js](sdk/node/README.md) ·
+  [C](sdk/c/README.md). Rust: the crate docs (`cargo doc --open`) and below.
+- [Architecture](ARCHITECTURE.md): how it works and what is guaranteed.
+
 ## Quickstart
 
 ### Rust
