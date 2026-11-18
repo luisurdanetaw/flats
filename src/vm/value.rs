@@ -142,7 +142,7 @@ pub fn to_literal(value: &RegValue) -> Option<Literal> {
     }
 }
 
-/// A stored value as a register's contents, for [`Op::Column`](crate::compiler::Op).
+/// A stored value as a register's contents, for `Op::Column`.
 /// Total — every stored scalar has a register form.
 impl From<&Value> for RegValue {
     fn from(value: &Value) -> RegValue {

@@ -1435,6 +1435,11 @@ impl Db {
     /// capacity, and the payload cap — because a record that cannot apply must
     /// never reach the durable WAL, or it would fail apply forever on every
     /// replay and (since Phase 7) halt the database each time.
+    ///
+    /// *Internal: hidden from the documented API — its signature speaks
+    /// engine-internal types. Exempt from semver; reachable for this crate's
+    /// tests. Use [`Db::execute`] instead.*
+    #[doc(hidden)]
     pub fn mutate(
         &self,
         collection: u32,
@@ -1517,6 +1522,11 @@ impl Db {
     ///
     /// Returns `Outcome::Conflicted` when the rows moved on between the read
     /// and the commit — the caller re-resolves its predicate and tries again.
+    ///
+    /// *Internal: hidden from the documented API — its signature speaks
+    /// engine-internal types. Exempt from semver; reachable for this crate's
+    /// tests. Use [`Db::execute`] instead.*
+    #[doc(hidden)]
     pub fn update_rows(
         &self,
         collection: u32,
@@ -1653,6 +1663,11 @@ impl Db {
     /// counts rows that satisfy it, so a filtered search still returns `k` rows
     /// whenever `k` of them match. See
     /// [`index::Reader::search_filtered`](crate::index::index::Reader::search_filtered).
+    ///
+    /// *Internal: hidden from the documented API — its signature speaks
+    /// engine-internal types. Exempt from semver; reachable for this crate's
+    /// tests. Use [`Db::execute`] instead.*
+    #[doc(hidden)]
     pub fn search_where(
         &self,
         collection: u32,
@@ -1723,6 +1738,11 @@ impl Db {
     /// Resolve ONCE and hold the returned `Arc` for the life of a query: a
     /// `LiveSet` is immutable, so the rows it admits never change underneath
     /// the caller. Calling this per row would defeat the point.
+    ///
+    /// *Internal: hidden from the documented API — its signature speaks
+    /// engine-internal types. Exempt from semver; reachable for this crate's
+    /// tests. Use [`Db::execute`] instead.*
+    #[doc(hidden)]
     pub fn live_snapshot(&self, collection: u32) -> Option<Arc<meta::LiveSet>> {
         catalog_snapshot(&self.catalog)
             .get(&collection)
@@ -1731,6 +1751,11 @@ impl Db {
 
     /// A cloneable read handle for `collection`, for issuing searches from other
     /// threads in parallel. Returns `None` for an unknown collection.
+    ///
+    /// *Internal: hidden from the documented API — its signature speaks
+    /// engine-internal types. Exempt from semver; reachable for this crate's
+    /// tests. Use [`Db::execute`] instead.*
+    #[doc(hidden)]
     pub fn reader(&self, collection: u32) -> Option<Reader> {
         catalog_snapshot(&self.catalog)
             .get(&collection)
@@ -1740,6 +1765,11 @@ impl Db {
     /// Read handle for `collection`'s metadata index (lookup_eq/lookup_range
     /// bitmaps). Primitive read-side plumbing — the real SEARCH..WHERE
     /// executor is a later phase. `None` for an unknown collection.
+    ///
+    /// *Internal: hidden from the documented API — its signature speaks
+    /// engine-internal types. Exempt from semver; reachable for this crate's
+    /// tests. Use [`Db::execute`] instead.*
+    #[doc(hidden)]
     pub fn metadata_reader(&self, collection: u32) -> Option<meta::Reader> {
         catalog_snapshot(&self.catalog)
             .get(&collection)
@@ -1748,6 +1778,11 @@ impl Db {
 
     /// Read handle for `collection`'s tuple store (RETURNING values by
     /// ordinal). `None` for an unknown collection.
+    ///
+    /// *Internal: hidden from the documented API — its signature speaks
+    /// engine-internal types. Exempt from semver; reachable for this crate's
+    /// tests. Use [`Db::execute`] instead.*
+    #[doc(hidden)]
     pub fn tuple_reader(&self, collection: u32) -> Option<tuples::Reader> {
         catalog_snapshot(&self.catalog)
             .get(&collection)
@@ -1803,6 +1838,11 @@ impl Db {
     ///
     /// The iterator is `'static` so the returned cursor borrows nothing; pass an
     /// owned collection's `into_iter()`.
+    ///
+    /// *Internal: hidden from the documented API — its signature speaks
+    /// engine-internal types. Exempt from semver; reachable for this crate's
+    /// tests. Use [`Db::execute`] instead.*
+    #[doc(hidden)]
     pub fn scan_over(
         &self,
         collection: u32,
@@ -1838,7 +1878,7 @@ impl Db {
     /// Matching is EXACT, deliberately: `create_collection` enforces uniqueness
     /// with the same exact comparison, so a case-insensitive lookup here could
     /// resolve two names that the catalog considers distinct. It reads the same
-    /// live snapshot as [`Catalog::schema_of`](crate::sql::bind::Catalog) — so a
+    /// live snapshot as `Catalog::schema_of` — so a
     /// name the binder resolved
     /// against resolves to a real id here, including one created earlier in the
     /// same session.

@@ -14,7 +14,16 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1"
 roaring = "0.11.4"
 
+[features]
+# Exposes the engine's internal modules (wal, index, metadata, vm, …) as
+# `#[doc(hidden)]` public paths. NOT part of the supported API and exempt from
+# semver: it exists so the test suite and benches can reach the layers they
+# exercise directly. Library users should never need it.
+internals = []
+
 [dev-dependencies]
+# The crate's own tests and benches see the internals (see `internals` above).
+flats = { path = ".", features = ["internals"] }
 tempfile = "3"
 # Compile-time trait assertions (header-only, no proc-macros, test-only). Used to
 # pin `Writer: !Clone`, the type-level half of the single-writer invariant.

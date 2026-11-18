@@ -278,8 +278,8 @@ impl<'a> Cursor<'a> {
     /// How many rows this cursor has materialized out of the tuple store.
     ///
     /// This is a STORAGE-READ COUNT, not a bookkeeping tally: it is incremented
-    /// at the one place [`tuples::Reader::get`] returns
-    /// [`Live`](RowGet::Live), so `fetched() + skipped()` is exactly the number
+    /// at the one place the tuple store's `Reader::get` returns
+    /// `RowGet::Live`, so `fetched() + skipped()` is exactly the number
     /// of `get` calls the cursor has issued. That is what makes it usable as
     /// evidence that a scan is LAZY — a consumer that stops after `k` rows
     /// leaves this at `k`, while an eager implementation would show the whole

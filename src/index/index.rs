@@ -93,13 +93,19 @@ const F_CAPACITY: usize = 32;
 const F_SEQ: usize = 40;
 const F_CRC: usize = 48;
 
+/// A row's position within its collection, shared by the vector index and both
+/// metadata stores. Stable only until the collection is next compacted, which
+/// renumbers every row; a row's lasting identity is its primary key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Ordinal(pub u32);
 
+/// One hit of a similarity search.
 #[derive(Debug, Clone, Copy)]
 pub struct SearchResult {
+    /// The matching row.
     pub id: Ordinal,
-    pub score: f32, // dot product: higher = more similar
+    /// Its dot product with the query: higher is more similar.
+    pub score: f32,
 }
 impl PartialEq for SearchResult {
     fn eq(&self, other: &Self) -> bool {

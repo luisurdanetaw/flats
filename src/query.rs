@@ -71,7 +71,7 @@ const MAX_WRITE_ATTEMPTS: usize = 10;
 
 /// A lazy stream of result rows.
 ///
-/// Owns the suspended [`Vm`] that produces them, and borrows nothing — see the
+/// Owns the suspended `Vm` that produces them, and borrows nothing — see the
 /// module header. Iterating pulls one row at a time; the stream is FUSED, so
 /// once it ends (drained or errored) it keeps returning `None`.
 pub struct RowStream {
@@ -120,7 +120,7 @@ impl Iterator for RowStream {
     /// Pull one row. `None` ends the stream; `Some(Err(_))` is a RUNTIME
     /// failure that happened after `execute` already succeeded.
     ///
-    /// [`Vm::resume`] rather than `step`, because a read stream is detached: its
+    /// `Vm::resume` rather than `step`, because a read stream is detached: its
     /// cursor is already open and the rest of the scan needs no database.
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {

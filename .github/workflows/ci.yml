@@ -36,6 +36,16 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+      # The run above builds the library WITH `internals` (the test suite's
+      # self dev-dependency turns it on). A downstream crate sees the default
+      # build, where the modules are private and `missing_docs` is on — lint
+      # and document THAT one too.
+      - name: clippy (default features, as a dependent sees it)
+        run: cargo clippy --lib --locked -- -D warnings
+      - name: rustdoc (public API)
+        run: cargo doc --no-deps --lib --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   # ── Build → test → bench (the blocking pipeline) ───────────────────────────
   build-test-bench:

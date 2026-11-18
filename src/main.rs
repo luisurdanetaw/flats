@@ -84,17 +84,24 @@
 //!
 //! Statements end with `;` and may span lines. `.help` lists the meta-commands.
 
+// The platform bindings below hold `unsafe`; be explicit about its scopes
+// exactly as the library is (CLAUDE.md §5).
+#![forbid(unsafe_op_in_unsafe_fn)]
+
 mod editor;
+// The terminal and signal bindings only the shell needs. They stay in
+// `src/platform` — one of the two `unsafe` quarantines (CLAUDE.md §5) — but are
+// compiled into this binary rather than the library, which uses neither.
+#[path = "platform/mod.rs"]
+mod platform;
 
 use std::io::{self, BufRead, ErrorKind, IsTerminal, Lines, StdinLock, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use flats::engine::{Db, DbOptions};
-use flats::metadata::common::{CollectionConfig, ColumnType};
-use flats::platform::signal;
-use flats::platform::tty::RawMode;
-use flats::vm::exec::RegValue;
+use flats::{CollectionConfig, ColumnType, Db, DbOptions, RegValue};
+use platform::signal;
+use platform::tty::RawMode;
 
 use editor::{Editor, Input, Keys};
 

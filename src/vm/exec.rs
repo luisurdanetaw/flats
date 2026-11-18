@@ -76,7 +76,7 @@ use crate::wal::wal::{Outcome, RejectReason};
 
 /// A value in a register.
 ///
-/// NAMING: this is the *contents* of a register; [`Reg`] is the *index* of one.
+/// NAMING: this is the *contents* of a register; `Reg` is the *index* of one.
 /// They are deliberately not both called `Reg` — this codebase keeps
 /// structurally-different types with related meanings type- and name-distinct
 /// (see the `DeclarationOrdinal` / `ColumnId` split), and a `Reg` that is
@@ -90,16 +90,16 @@ pub enum RegValue {
     /// Never written. NOT a SQL `NULL` — V-SQL has no nulls (see
     /// [`ColumnType`](crate::metadata::common::ColumnType)); this is the
     /// "the emitter never loaded this register" state, and reading it is an
-    /// [`ExecError::UnsetRegister`].
+    /// `ExecError::UnsetRegister`.
     Unset,
-    /// An `i64`, from [`Op::Integer`] or an `INT` column.
+    /// An `i64`, from `Op::Integer` or an `INT` column.
     Int(i64),
-    /// An `f64`, from [`Op::Real`] or a `FLOAT` column.
+    /// An `f64`, from `Op::Real` or a `FLOAT` column.
     Real(f64),
-    /// A string, from [`Op::String`] or a `TEXT` column.
+    /// A string, from `Op::String` or a `TEXT` column.
     Str(String),
-    /// An embedding — **seam (b)**. Produced today only by [`Op::VectorConst`];
-    /// [`Op::VectorFetch`] joins it in 5b, and a `SEARCH … NEAREST TO [...]`
+    /// An embedding — **seam (b)**. Produced today only by `Op::VectorConst`;
+    /// `Op::VectorFetch` joins it in 5b, and a `SEARCH … NEAREST TO [...]`
     /// query vector interns as a `Const` and lands here too.
     ///
     /// `Arc<[f32]>` rather than a pool handle because the two producers have
@@ -108,8 +108,8 @@ pub enum RegValue {
     /// in a `'static` register file. An `Arc` is the one representation both
     /// can produce and neither has to copy again.
     Vector(Arc<[f32]>),
-    /// A packed row, built by [`Op::MakeRecord`] and consumed by
-    /// [`Op::Insert`]. The ISA's `MakeRecord dst` is a register, so a register
+    /// A packed row, built by `Op::MakeRecord` and consumed by
+    /// `Op::Insert`. The ISA's `MakeRecord dst` is a register, so a register
     /// has to be able to hold one.
     Record(Record),
     /// A set of ordinals — the value a `WHERE` clause computes.
@@ -164,7 +164,7 @@ enum Slot {
     },
 }
 
-/// One row yielded by [`Op::ResultRow`].
+/// One row yielded by `Op::ResultRow`.
 ///
 /// Built from a RUN OF REGISTERS — **seam (c)** — never read straight off a
 /// cursor. That is what will let `RETURNING id, score` mix a stored column

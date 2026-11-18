@@ -41,7 +41,7 @@ pub use crate::wal::wal::Lsn;
 ///
 /// This is the SCALAR-ONLY numbering (dense `0..N`, vector excluded) that the
 /// tuple store and metadata index address by — distinct from a
-/// [`DeclarationOrdinal`], which is vector-inclusive.
+/// `DeclarationOrdinal`, which is vector-inclusive.
 pub type ColumnId = u32;
 
 /// A column's position in the VECTOR-INCLUSIVE declaration numbering — the
@@ -78,8 +78,11 @@ impl DeclarationOrdinal {
 // bincode tags enum variants POSITIONALLY — append variants, never reorder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColumnType {
+    /// `INT`: a 64-bit signed integer.
     Int,
+    /// `FLOAT`: a 64-bit float, never NaN.
     Float,
+    /// `TEXT`: a UTF-8 string.
     Text,
 }
 
@@ -87,8 +90,11 @@ pub enum ColumnType {
 /// inside the index — reject at the insert boundary (Phase 4a rule).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
+    /// An `INT` value.
     Int(i64),
+    /// A `FLOAT` value.
     Float(f64),
+    /// A `TEXT` value.
     Text(String),
 }
 
@@ -112,9 +118,13 @@ pub type Row = Vec<(ColumnId, Value)>;
 /// Range comparison operators for lookup_range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RangeOp {
+    /// `<`
     Lt,
+    /// `<=`
     Le,
+    /// `>`
     Gt,
+    /// `>=`
     Ge,
 }
 
@@ -132,6 +142,7 @@ pub struct CollectionConfig {
     pub id: u32,
     /// Human-facing name — what V-SQL will key on. Unique across the catalog.
     pub name: String,
+    /// The most rows the collection can hold, fixed at creation.
     pub capacity: usize,
     /// The full schema — the single vector column (name + declaration ordinal +
     /// dim) AND every scalar. The vector's dim lives here (`schema.vector().dim`),
@@ -151,7 +162,7 @@ pub struct CollectionConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Schema {
     /// The SCALAR columns. `ColumnId` is the index into this Vec — i.e.
-    /// columns[3].id == 3 — the scalar-only numbering the tuple store and
+    /// `columns[3].id == 3` — the scalar-only numbering the tuple store and
     /// metadata index address by. The vector is NOT here (it has no `ColumnId`);
     /// it lives in `vector`.
     pub columns: Vec<ColumnDef>,
@@ -370,6 +381,7 @@ impl Schema {
         Ok(())
     }
 
+    /// The scalar column with this id, if the schema has one.
     pub fn column(&self, id: ColumnId) -> Option<&ColumnDef> {
         // columns[i].id == i by construction, so the id IS the index.
         self.columns.get(id as usize)

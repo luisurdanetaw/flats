@@ -167,3 +167,4 @@ Concurrency: single writer, multiple readers. Please refer to ARCHITECTURE.md fo
 - Adding a new SIMD path? Add it to `simd_parity.rs` first, then implement.
 - Touching `unsafe`? Write the `// SAFETY:` comment before the code.
 - Tempted to add a dependency? Read §2 again. The answer is most likely no.
+- Adding to the public API? It is ONLY what `src/lib.rs` re-exports. Every module is private on default features; the `internals` feature (on for our own tests/benches via a self dev-dependency) makes them `#[doc(hidden)] pub`. `tests/public_api.rs` builds a downstream crate to hold that line — extend its `uses_root` fixture with anything you export.
