@@ -92,6 +92,7 @@ or one of
 | `FLATS_ERR_INVALID_ARGUMENT` | NULL handle or string, invalid UTF-8, a value the schema refuses (wrong vector length, wrong type, NaN, unknown column) |
 | `FLATS_ERR_QUERY` | Bad or unsupported V-SQL, unknown collection or column |
 | `FLATS_ERR_ENGINE` | Duplicate primary key, collection full, backup target not empty, I/O |
+| `FLATS_ERR_INTERRUPTED` | The statement was stopped by `flats_interrupt` or by its timeout |
 | `FLATS_ERR_INTERNAL` | A bug in Flats |
 
 **Error messages.** After a failure, `flats_last_error()` describes it. The
@@ -213,6 +214,18 @@ batch is emptied either way and can be reused.
 
 `flats_batch_column_type(b, "col")` reports a column's type. It's useful when
 your values come untyped, from JSON or a scripting language.
+
+## Timeouts and cancellation
+
+```c
+flats_set_statement_timeout_ms(db, 2000);  /* stop statements running > 2 s */
+flats_set_statement_timeout_ms(db, -1);    /* off (the default) */
+flats_interrupt(db);                       /* stop everything running now */
+```
+
+A stopped statement returns `FLATS_ERR_INTERRUPTED`, and nothing it would
+have written is written. `flats_interrupt` is safe from any thread, for
+example a watchdog thread, and only reaches statements already running.
 
 ## Backups
 

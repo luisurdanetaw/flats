@@ -935,6 +935,34 @@ unsafe extern "C" fn js_cursor_free(env: napi_env, info: napi_callback_info) -> 
     }
 }
 
+/// `interrupt(handle)`
+unsafe extern "C" fn js_interrupt(env: napi_env, info: napi_callback_info) -> napi_value {
+    // SAFETY: see the section note.
+    unsafe {
+        run(env, || {
+            let [h] = args::<1>(env, info)?;
+            check(flats_interrupt(db_of(env, h)?))?;
+            undefined(env)
+        })
+    }
+}
+
+/// `setStatementTimeout(handle, ms)` — negative disables.
+unsafe extern "C" fn js_set_statement_timeout(
+    env: napi_env,
+    info: napi_callback_info,
+) -> napi_value {
+    // SAFETY: see the section note.
+    unsafe {
+        run(env, || {
+            let [h, ms] = args::<2>(env, info)?;
+            let ms = get_f64(env, ms)?;
+            check(flats_set_statement_timeout_ms(db_of(env, h)?, ms as i64))?;
+            undefined(env)
+        })
+    }
+}
+
 /// `backup(handle, dest)`
 unsafe extern "C" fn js_backup(env: napi_env, info: napi_callback_info) -> napi_value {
     // SAFETY: see the section note.
@@ -1476,7 +1504,9 @@ unsafe extern "C" fn js_backup_async(env: napi_env, info: napi_callback_info) ->
 /// Called by Node with a live `env` and the module's `exports` object.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn napi_register_module_v1(env: napi_env, exports: napi_value) -> napi_value {
-    let functions: [(&str, napi_callback); 21] = [
+    let functions: [(&str, napi_callback); 23] = [
+        ("interrupt", js_interrupt),
+        ("setStatementTimeout", js_set_statement_timeout),
         ("openAsync", js_open_async),
         ("closeAsync", js_close_async),
         ("executeAsync", js_execute_async),

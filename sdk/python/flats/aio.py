@@ -104,3 +104,12 @@ class AsyncDatabase:
 
     async def backup(self, dest):
         return await _in_thread(self._db.backup, dest)
+
+    def interrupt(self):
+        """Stop every statement running now (not a coroutine: it never
+        waits)."""
+        self._db.interrupt()
+
+    def set_timeout(self, seconds):
+        """See :meth:`flats.Database.set_timeout`."""
+        self._db.set_timeout(seconds)

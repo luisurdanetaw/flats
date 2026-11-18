@@ -623,6 +623,11 @@ impl Reader {
         let mut heap = BinaryHeap::with_capacity(k.min(committed));
 
         for (id, v) in vectors.chunks_exact(dim).enumerate() {
+            // A long scan can be stopped — `Db::interrupt` or a statement
+            // timeout — between blocks of rows, including before the first.
+            if id % crate::cancel::KERNEL_CHECK_EVERY == 0 {
+                crate::cancel::check()?;
+            }
             // The liveness snapshot, and the ONLY liveness test: one shift and
             // one AND, in front of the dot product. A row the snapshot does not
             // admit is not this query's to return, however close it happens to

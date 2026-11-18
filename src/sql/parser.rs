@@ -40,6 +40,48 @@ use crate::sql::params::Param;
 pub struct Parser {
     tokens: Vec<SpannedToken>,
     pos: usize,
+    /// Parentheses currently open in the expression being parsed.
+    depth: usize,
+    /// Comparisons parsed so far in this statement.
+    terms: usize,
+}
+
+/// The deepest a `WHERE` expression may nest parentheses.
+///
+/// Every stage after the parser walks an expression recursively, so depth is
+/// stack: unbounded, one query could overflow it and abort the host process.
+/// 64 is far beyond any hand-written predicate and safe on a 256 KiB stack.
+pub const MAX_EXPR_DEPTH: usize = 64;
+
+/// The most comparisons one statement may hold. Long `AND`/`OR` chains — the
+/// way V-SQL spells `IN` — are rebalanced into shallow trees (see
+/// the parser's `chain`), so this bounds work and memory, not stack.
+pub const MAX_EXPR_TERMS: usize = 4096;
+
+/// Chains of the same operator up to this long keep their left-nested shape;
+/// longer ones are rebalanced.
+const BALANCE_ABOVE: usize = 32;
+
+/// Join `parts` with `join`. Up to [`BALANCE_ABOVE`] operands fold left —
+/// the shape `a OR b OR c` always had. Beyond that the tree is built
+/// balanced, depth `log2(n)` instead of `n`: AND and OR are associative, so the
+/// meaning is identical, and the recursive stages downstream stay shallow.
+fn chain(mut parts: Vec<Expr>, join: fn(Box<Expr>, Box<Expr>) -> Expr) -> Expr {
+    if parts.len() <= BALANCE_ABOVE {
+        let mut it = parts.into_iter();
+        let first = it.next().unwrap_or(Expr::Column(String::new()));
+        return it.fold(first, |l, r| join(Box::new(l), Box::new(r)));
+    }
+    fn balanced(parts: &mut [Option<Expr>], join: fn(Box<Expr>, Box<Expr>) -> Expr) -> Expr {
+        if parts.len() == 1 {
+            return parts[0].take().unwrap_or(Expr::Column(String::new()));
+        }
+        let mid = parts.len() / 2;
+        let (l, r) = parts.split_at_mut(mid);
+        join(Box::new(balanced(l, join)), Box::new(balanced(r, join)))
+    }
+    let mut slots: Vec<Option<Expr>> = parts.drain(..).map(Some).collect();
+    balanced(&mut slots, join)
 }
 
 /// A syntax error, with the source span it was detected at. Mirrors the
@@ -101,6 +143,19 @@ pub enum ParseErrorKind {
         /// `"LIMIT"` or `"OFFSET"`.
         what: &'static str,
     },
+    /// A predicate past [`MAX_EXPR_DEPTH`] or [`MAX_EXPR_TERMS`].
+    TooComplex {
+        /// Which cap, in words.
+        what: String,
+    },
+    /// The statement text is longer than the database's
+    /// `Limits::max_statement_bytes`.
+    TooLarge {
+        /// Its length.
+        bytes: usize,
+        /// The limit.
+        limit: usize,
+    },
     /// Input remained after a complete statement + its `;`.
     TrailingTokens,
     /// Input ended while a rule still expected more tokens.
@@ -146,6 +201,15 @@ impl fmt::Display for ParseError {
             ParseErrorKind::NegativeWindow { what } => {
                 write!(f, "{what} at byte {} must not be negative", self.span.start)
             }
+            ParseErrorKind::TooComplex { what } => write!(
+                f,
+                "the statement is too complex at byte {}: {what}",
+                self.span.start
+            ),
+            ParseErrorKind::TooLarge { bytes, limit } => write!(
+                f,
+                "the statement is {bytes} bytes, over the {limit}-byte limit"
+            ),
             ParseErrorKind::TrailingTokens => {
                 write!(f, "unexpected trailing tokens at byte {}", self.span.start)
             }
@@ -178,6 +242,21 @@ pub fn parse(src: &str) -> Result<Statement, ParseError> {
 /// ([`ParseErrorKind::ParamCount`]); a float must be finite and a vector
 /// non-empty and finite ([`ParseErrorKind::InvalidParam`]).
 pub fn parse_with_params(src: &str, params: &[Param]) -> Result<Statement, ParseError> {
+    parse_with_limit(src, params, usize::MAX)
+}
+
+/// [`parse_with_params`], refusing text longer than `max_bytes` before
+/// lexing it ([`ParseErrorKind::TooLarge`]).
+pub fn parse_with_limit(src: &str, params: &[Param], max_bytes: usize) -> Result<Statement, ParseError> {
+    if src.len() > max_bytes {
+        return Err(ParseError {
+            kind: ParseErrorKind::TooLarge {
+                bytes: src.len(),
+                limit: max_bytes,
+            },
+            span: Span { start: 0, end: 0 },
+        });
+    }
     let tokens = Lexer::new(src).tokenize().map_err(|e| ParseError {
         span: Span {
             start: e.pos,
@@ -186,7 +265,12 @@ pub fn parse_with_params(src: &str, params: &[Param]) -> Result<Statement, Parse
         kind: ParseErrorKind::Lex(e),
     })?;
     let tokens = substitute(tokens, params)?;
-    let mut parser = Parser { tokens, pos: 0 };
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        depth: 0,
+        terms: 0,
+    };
     let statement = parser.parse_statement()?;
     // `parse_statement` consumes the trailing ';' (per the grammar); only Eof
     // may remain. Any real token here is leftover input.
@@ -529,24 +613,22 @@ impl Parser {
     /// `a = 1 OR b = 2 AND c = 3` group as `a = 1 OR (b = 2 AND c = 3)`.
     /// Left-associative, like SQL.
     fn parse_or(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_and()?;
+        let mut parts = vec![self.parse_and()?];
         while *self.peek() == Token::Or {
             self.advance();
-            let right = self.parse_and()?;
-            left = Expr::Or(Box::new(left), Box::new(right));
+            parts.push(self.parse_and()?);
         }
-        Ok(left)
+        Ok(chain(parts, Expr::Or))
     }
 
     /// `and_expr := cmp_expr (AND cmp_expr)*`
     fn parse_and(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_comparison()?;
+        let mut parts = vec![self.parse_comparison()?];
         while *self.peek() == Token::And {
             self.advance();
-            let right = self.parse_comparison()?;
-            left = Expr::And(Box::new(left), Box::new(right));
+            parts.push(self.parse_comparison()?);
         }
-        Ok(left)
+        Ok(chain(parts, Expr::And))
     }
 
     /// `cmp_expr := primary [op primary]`
@@ -556,6 +638,12 @@ impl Parser {
     /// `(a < b) < c`. One optional operator, then stop — a second one is left
     /// for the caller to choke on, which reports the error at the right token.
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
+        self.terms += 1;
+        if self.terms > MAX_EXPR_TERMS {
+            return Err(self.error(ParseErrorKind::TooComplex {
+                what: format!("more than {MAX_EXPR_TERMS} comparisons"),
+            }));
+        }
         let left = self.parse_primary()?;
         let op = match self.peek() {
             Token::Lt => CompareOp::Lt,
@@ -589,8 +677,15 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         match self.peek() {
             Token::LParen => {
+                if self.depth >= MAX_EXPR_DEPTH {
+                    return Err(self.error(ParseErrorKind::TooComplex {
+                        what: format!("parentheses nested more than {MAX_EXPR_DEPTH} deep"),
+                    }));
+                }
                 self.advance();
+                self.depth += 1;
                 let inner = self.parse_expr()?;
+                self.depth -= 1;
                 self.expect(Token::RParen)?;
                 Ok(inner)
             }
@@ -2171,5 +2266,91 @@ mod tests {
         // A negative count arriving as a parameter is refused by name.
         let e = with_err("SELECT id FROM docs LIMIT ?;", &[Param::Int(-1)]);
         assert!(matches!(e.kind, ParseErrorKind::NegativeWindow { .. }), "{e:?}");
+    }
+
+    // -- complexity caps --------------------------------------------------------
+    //
+    // Every later stage walks a predicate recursively, so an unbounded one is
+    // a stack overflow — a crash of the host process from one query. Nesting
+    // and size are capped here, before anything recurses.
+
+    #[test]
+    fn nesting_deeper_than_the_cap_is_refused_not_a_crash() {
+        let ok_depth = MAX_EXPR_DEPTH;
+        ok(&format!("SELECT id FROM t WHERE {}n = 1{};", "(".repeat(ok_depth), ")".repeat(ok_depth)));
+        for depth in [MAX_EXPR_DEPTH + 1, 100_000] {
+            let e = err(&format!("SELECT id FROM t WHERE {}n = 1{};", "(".repeat(depth), ")".repeat(depth)));
+            assert!(matches!(e.kind, ParseErrorKind::TooComplex { .. }), "depth {depth}: {e:?}");
+        }
+    }
+
+    #[test]
+    fn more_comparisons_than_the_cap_are_refused() {
+        let chain = |n: usize| (0..n).map(|i| format!("n = {i}")).collect::<Vec<_>>().join(" OR ");
+        ok(&format!("SELECT id FROM t WHERE {};", chain(MAX_EXPR_TERMS)));
+        let e = err(&format!("SELECT id FROM t WHERE {};", chain(MAX_EXPR_TERMS + 1)));
+        assert!(matches!(e.kind, ParseErrorKind::TooComplex { .. }), "{e:?}");
+        assert!(e.to_string().contains(&MAX_EXPR_TERMS.to_string()), "{e}");
+    }
+
+    /// Depth of an expression tree.
+    fn depth(e: &Expr) -> usize {
+        match e {
+            Expr::And(l, r) | Expr::Or(l, r) => 1 + depth(l).max(depth(r)),
+            Expr::Compare { left, right, .. } => 1 + depth(left).max(depth(right)),
+            _ => 1,
+        }
+    }
+
+    /// The comparisons of an expression, left to right.
+    fn leaves(e: &Expr, out: &mut Vec<Expr>) {
+        match e {
+            Expr::And(l, r) | Expr::Or(l, r) => {
+                leaves(l, out);
+                leaves(r, out);
+            }
+            other => out.push(other.clone()),
+        }
+    }
+
+    #[test]
+    fn a_long_chain_is_balanced_so_it_stays_shallow() {
+        let n = MAX_EXPR_TERMS;
+        let src = format!(
+            "SELECT id FROM t WHERE {};",
+            (0..n).map(|i| format!("n = {i}")).collect::<Vec<_>>().join(" OR ")
+        );
+        let Statement::Select(s) = ok(&src) else { panic!() };
+        let filter = s.filter.unwrap();
+        assert!(depth(&filter) <= 20, "depth {} for {n} terms", depth(&filter));
+        // Same comparisons, same order: OR is associative, so only the
+        // grouping changed.
+        let mut got = Vec::new();
+        leaves(&filter, &mut got);
+        assert_eq!(got.len(), n);
+        for (i, leaf) in got.iter().enumerate() {
+            assert_eq!(
+                leaf,
+                &Expr::Compare {
+                    left: Box::new(Expr::Column("n".into())),
+                    op: CompareOp::Eq,
+                    right: Box::new(Expr::Literal(Literal::Int(i as i64))),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_chain_keeps_its_left_nested_shape() {
+        // Chains up to the balancing threshold parse exactly as they always did.
+        let Statement::Select(s) = ok("SELECT id FROM t WHERE a = 1 OR b = 2 OR c = 3;") else { panic!() };
+        assert!(matches!(s.filter, Some(Expr::Or(ref l, _)) if matches!(**l, Expr::Or(..))));
+    }
+
+    #[test]
+    fn an_oversized_statement_is_refused_before_lexing() {
+        let e = parse_with_limit("SELECT id FROM t;", &[], 8).unwrap_err();
+        assert!(matches!(e.kind, ParseErrorKind::TooLarge { bytes: 17, limit: 8 }), "{e:?}");
+        assert!(parse_with_limit("SELECT id FROM t;", &[], 17).is_ok());
     }
 }

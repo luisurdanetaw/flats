@@ -880,3 +880,67 @@ fn a_batch_keeps_working_while_other_threads_use_the_same_database() {
     });
     assert_eq!(db.query("SELECT id FROM docs;").rows().len(), 200);
 }
+
+// -- limits and interruption ---------------------------------------------------
+
+#[test]
+fn a_timeout_stops_a_search_with_its_own_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    load(&db, 10);
+    // SAFETY: live handle.
+    unsafe { assert_eq!(flats_set_statement_timeout_ms(db.0, 0), FLATS_OK) };
+    let (rc, _) = db.exec_params(
+        "SEARCH TOP 1 NEAREST TO ? FROM docs;",
+        &[p_vec(&[1.0, 0.0, 0.0])],
+    );
+    assert_eq!(rc, FLATS_ERR_INTERRUPTED);
+    assert!(
+        last_error().unwrap().contains("timeout"),
+        "{:?}",
+        last_error()
+    );
+    // Negative disables it again.
+    // SAFETY: live handle.
+    unsafe { assert_eq!(flats_set_statement_timeout_ms(db.0, -1), FLATS_OK) };
+    assert_eq!(
+        db.exec_params(
+            "SEARCH TOP 1 NEAREST TO ? FROM docs;",
+            &[p_vec(&[1.0, 0.0, 0.0])]
+        )
+        .0,
+        FLATS_OK
+    );
+}
+
+#[test]
+fn interrupt_stops_a_running_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    load(&db, 50);
+    let cur = query(db.0, "SELECT id FROM docs;", &[]).unwrap();
+    assert_eq!(cur.next(1).0, FLATS_OK);
+    // SAFETY: live handle.
+    unsafe { assert_eq!(flats_interrupt(db.0), FLATS_OK) };
+    assert_eq!(cur.next(10).0, FLATS_ERR_INTERRUPTED);
+    // New statements are unaffected.
+    assert_eq!(db.query("SELECT id FROM docs;").rows().len(), 50);
+    // SAFETY: NULL is a refusal.
+    unsafe { assert_eq!(flats_interrupt(ptr::null_mut()), FLATS_ERR_INVALID_ARGUMENT) };
+}
+
+#[test]
+fn an_overly_complex_predicate_is_a_query_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let deep = format!(
+        "SELECT id FROM docs WHERE {}year = 1{};",
+        "(".repeat(10_000),
+        ")".repeat(10_000)
+    );
+    assert_eq!(db.exec(&deep), FLATS_ERR_QUERY);
+    assert!(last_error().unwrap().contains("too complex"));
+}

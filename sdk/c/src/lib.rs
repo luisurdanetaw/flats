@@ -48,6 +48,8 @@ pub const FLATS_ERR_QUERY: i32 = 2;
 pub const FLATS_ERR_ENGINE: i32 = 3;
 /// A bug in Flats (a caught panic).
 pub const FLATS_ERR_INTERNAL: i32 = 4;
+/// The statement was stopped: `flats_interrupt`, or its timeout.
+pub const FLATS_ERR_INTERRUPTED: i32 = 5;
 
 /// An `INT` cell.
 pub const FLATS_TYPE_INT: i32 = 1;
@@ -89,6 +91,7 @@ impl Fail {
         // of a missing collection.
         let code = match e {
             flats::Error::UnknownCollectionName { .. } => FLATS_ERR_QUERY,
+            flats::Error::Interrupted { .. } => FLATS_ERR_INTERRUPTED,
             _ => FLATS_ERR_ENGINE,
         };
         Fail {
@@ -100,6 +103,7 @@ impl Fail {
     fn query(e: QueryError) -> Fail {
         let code = match &e {
             QueryError::Parse(_) | QueryError::Bind(_) | QueryError::Compile(_) => FLATS_ERR_QUERY,
+            QueryError::Engine(flats::Error::Interrupted { .. }) => FLATS_ERR_INTERRUPTED,
             // The compiler emitted a malformed program: a Flats bug.
             QueryError::Validate(_) => FLATS_ERR_INTERNAL,
             _ => FLATS_ERR_ENGINE,
@@ -488,6 +492,42 @@ pub unsafe extern "C" fn flats_cursor_free(cur: *mut flats_cursor) {
         // SAFETY: a live cursor from `flats_query` (a `Box`), released once.
         drop(unsafe { Box::from_raw(cur) });
     }
+}
+
+/// `int flats_interrupt(flats_db *db)`
+///
+/// # Safety
+/// `db` is NULL or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flats_interrupt(db: *const flats_db) -> i32 {
+    guard(|| {
+        // SAFETY: forwarded from this function's own contract.
+        let handle = unsafe { arg_ref(db, "db") }?;
+        with_db(&handle.db, |db| {
+            db.interrupt();
+            Ok(())
+        })
+    })
+}
+
+/// `int flats_set_statement_timeout_ms(flats_db *db, int64_t ms)`
+///
+/// # Safety
+/// `db` is NULL or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flats_set_statement_timeout_ms(db: *const flats_db, ms: i64) -> i32 {
+    guard(|| {
+        // SAFETY: forwarded from this function's own contract.
+        let handle = unsafe { arg_ref(db, "db") }?;
+        with_db(&handle.db, |db| {
+            let timeout = u64::try_from(ms).ok().map(std::time::Duration::from_millis);
+            db.set_limits(flats::Limits {
+                statement_timeout: timeout,
+                ..db.limits()
+            });
+            Ok(())
+        })
+    })
 }
 
 /// `int flats_backup(flats_db *db, const char *dest)`

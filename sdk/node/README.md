@@ -240,6 +240,7 @@ Every error is a `flats.FlatsError`; check the subclass:
 | `flats.QueryError` | Bad or unsupported V-SQL, an unknown collection or column, a missing column in an INSERT, a `?` count that doesn't match `params` |
 | `flats.EngineError` | Duplicate primary key, collection full, backup target not empty, I/O failure |
 | `flats.InvalidArgumentError` | Wrong vector length, a value of the wrong type for its column, NaN or infinity, unknown column in `insert` |
+| `flats.InterruptedError` | The statement was stopped by `interrupt()` or by its timeout |
 | `flats.InternalError` | A bug in Flats |
 
 ```js
@@ -255,6 +256,20 @@ try {
 (a number for the SQL string, say), or a collection or column name that isn't
 a plain identifier, throw `TypeError`; a non-finite query vector in `search`
 throws `RangeError`.
+
+## Timeouts and cancellation
+
+```js
+db.setStatementTimeout(2000);   // stop any statement running longer than 2 s
+db.setStatementTimeout(null);   // off again (the default)
+
+db.interrupt();                 // stop everything running right now
+```
+
+A stopped statement throws (or rejects with) `flats.InterruptedError`, and
+nothing it would have written is written. `interrupt()` only reaches
+statements already running. Both methods exist on `AsyncDatabase` too, and
+they're synchronous there as well: neither has to wait for anything.
 
 ## The Promise API (use this in servers)
 

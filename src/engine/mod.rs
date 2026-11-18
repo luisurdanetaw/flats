@@ -94,6 +94,36 @@ pub use crate::metadata::common::CollectionConfig;
 /// newtype is a separate, deliberate change.
 pub type CollectionId = u32;
 
+/// The largest vector dimension a collection may declare.
+pub const MAX_DIM: usize = 65_536;
+
+/// The most vector storage one collection may reserve: `capacity × dim × 4`
+/// bytes. Checked, with [`MAX_DIM`] and the ordinal space, BEFORE a CREATE is
+/// logged — a create that could not be materialized would otherwise be durable,
+/// fail to apply, and poison the database on every reopen.
+pub const MAX_COLLECTION_BYTES: u64 = 4 << 40; // 4 TiB
+
+/// Runtime limits, changeable on an open database with [`Db::set_limits`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Limits {
+    /// The longest statement text accepted, in bytes. Default 256 MiB —
+    /// room for a 10,000-row multi-row INSERT of 768-dim vectors as text.
+    pub max_statement_bytes: usize,
+    /// How long one statement may run before it is stopped with
+    /// [`Error::Interrupted`]. Checked while searching and between rows of a
+    /// scan; a write, once logged, always completes. Default: none.
+    pub statement_timeout: Option<Duration>,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_statement_bytes: 256 * 1024 * 1024,
+            statement_timeout: None,
+        }
+    }
+}
+
 /// Engine tunables.
 #[derive(Debug, Clone, Copy)]
 pub struct DbOptions {
@@ -1190,10 +1220,36 @@ pub struct Db {
     /// One past the highest collection id ever issued; shared with the
     /// applier, which advances it as creates land. Ids are never reused.
     next_id: Arc<AtomicU32>,
+    /// See [`Limits`]; read at the start of every statement.
+    limits: RwLock<Limits>,
+    /// Bumped by [`Db::interrupt`]; a statement started in an older
+    /// generation stops at its next check. See `crate::cancel`.
+    interrupts: Arc<AtomicU64>,
     /// The exclusive lock on `<dir>/LOCK`. LAST on purpose: fields drop in
     /// declaration order, after `Drop::drop` has shut everything down, so the
     /// directory is released only once nothing can touch it any more.
     _lock: std::fs::File,
+}
+
+/// Refuse a collection that could never be materialized — checked before a
+/// CREATE is logged, so it can never become a durable record that fails to
+/// apply on every replay.
+fn check_collection_size(dim: usize, capacity: usize) -> Result<()> {
+    if dim > MAX_DIM {
+        return Err(Error::InvalidDimension);
+    }
+    // Ordinals are u32 (the metadata bitmaps' address space).
+    if capacity > u32::MAX as usize {
+        return Err(Error::InvalidCapacity);
+    }
+    let bytes = dim as u128 * capacity as u128 * 4;
+    if bytes > u128::from(MAX_COLLECTION_BYTES) {
+        return Err(Error::CollectionTooLarge {
+            bytes,
+            cap: MAX_COLLECTION_BYTES,
+        });
+    }
+    Ok(())
 }
 
 /// Name of the lock file in a database directory.
@@ -1430,6 +1486,8 @@ impl Db {
             compaction,
             compactor,
             next_id,
+            limits: RwLock::new(Limits::default()),
+            interrupts: Arc::new(AtomicU64::new(0)),
             _lock: lock,
         })
     }
@@ -1934,6 +1992,13 @@ impl Db {
     /// excluded. Results are most-similar (highest dot product) first. Runs
     /// lock-free against the reader; concurrent searches do not serialize.
     pub fn search(&self, collection: u32, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
+        crate::cancel::under_current_or(
+            || self.statement_watch(),
+            || self.search_unwatched(collection, query, k),
+        )
+    }
+
+    fn search_unwatched(&self, collection: u32, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
         let coll = self.collection(collection)?;
         // The SNAPSHOT is the authority, not the flat index's own view of what
         // exists. `flat.write_at` runs first in the fan-out, so without this a
@@ -1988,6 +2053,7 @@ impl Db {
         if capacity == 0 {
             return Err(Error::InvalidCapacity);
         }
+        check_collection_size(schema.vector().dim.get(), capacity)?;
         // The schema carries the vector (name + declaration ordinal + dim) and
         // every scalar, and is invalid-by-construction impossible via
         // `Schema::from_columns`. Re-check in case the caller hand-assembled one
@@ -2021,6 +2087,36 @@ impl Db {
             .append(Record::CreateCollection { config })
             .map_err(|e| self.wal_err(e))?;
         Ok(id)
+    }
+
+    /// Replace the runtime [`Limits`]. Applies to statements started after
+    /// the call; a statement already running keeps the limits it started with.
+    pub fn set_limits(&self, limits: Limits) {
+        *self.limits.write().unwrap_or_else(|e| e.into_inner()) = limits;
+    }
+
+    /// The current runtime [`Limits`].
+    pub fn limits(&self) -> Limits {
+        *self.limits.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Stop every statement running on this database right now — searches,
+    /// scans and streams — with [`Error::Interrupted`] at its next check
+    /// (within a fraction of a millisecond for a search). Statements started
+    /// after this call are unaffected. Safe from any thread. A write already
+    /// logged completes; nothing is half-written.
+    pub fn interrupt(&self) {
+        self.interrupts.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The watch a statement starting now runs under: this moment's
+    /// interrupt generation, and its deadline under the current limits.
+    pub(crate) fn statement_watch(&self) -> crate::cancel::Watch {
+        let deadline = self
+            .limits()
+            .statement_timeout
+            .map(|t| std::time::Instant::now() + t);
+        crate::cancel::Watch::start(&self.interrupts, deadline)
     }
 
     /// Drop the collection named `name`: its rows, its stores and its files.

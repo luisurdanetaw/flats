@@ -240,6 +240,39 @@ Node.js. Both run each call off the event loop.
 `Db::collections()`; the bundled shell (`cargo run --release -- DIR`) has
 `.tables` and `.schema`.
 
+## Limits and cancellation
+
+**Stopping a statement.** Any statement can be cut short:
+
+- **Interrupt.** `interrupt()` stops every statement running on the database
+  at that moment, from any thread. A search stops within a fraction of a
+  millisecond, and a scan or cursor before its next row. Statements started
+  afterwards are unaffected. It's the tool for a "cancel" button or a
+  watchdog.
+- **Timeout.** Setting a statement timeout (`set_timeout`,
+  `setStatementTimeout`, `flats_set_statement_timeout_ms`,
+  `Limits::statement_timeout`) stops any statement that runs longer than
+  that. It is off by default.
+
+A stopped statement fails with an *interrupted* error. Writes are one record
+each and are logged only once complete, so a stopped statement never leaves
+anything half-written.
+
+**Hard caps.** These protect the process from a single hostile or runaway
+statement, whatever the settings:
+
+| Cap | Limit | Beyond it |
+|---|---|---|
+| Parenthesis nesting in a `WHERE` | 64 levels | query error |
+| Comparisons in one statement | 4,096 | query error |
+| Statement text | 256 MiB by default (`Limits::max_statement_bytes`) | query error |
+| Vector dimension | 65,536 | refused at `CREATE` |
+| Vector storage per collection (`capacity × dim × 4`) | 4 TiB | refused at `CREATE` |
+| Capacity | 2³² − 1 rows | refused at `CREATE` |
+
+Long `AND`/`OR` chains, the way V-SQL spells `IN`, are fine up to the
+comparison cap: they are rebalanced internally so they stay cheap.
+
 ## Performance
 
 Search time is proportional to `rows × dim`: it reads every live vector once.
@@ -269,6 +302,7 @@ Every SDK reports the same four kinds:
 | Query error | The statement is wrong; nothing changed | typo, unknown collection/column, unsupported syntax, missing column in INSERT |
 | Engine error | The database refused or failed it | duplicate primary key, collection full, backup target not empty, I/O |
 | Invalid argument | A value or handle the call cannot take | wrong vector length, wrong type for a column, NaN, closed database |
+| Interrupted | The statement was stopped | `interrupt()` was called, or it ran past its timeout |
 | Internal error | A bug in Flats | please report it |
 
 Messages are specific — they name the column, value or construct at fault —

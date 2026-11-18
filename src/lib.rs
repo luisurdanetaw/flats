@@ -99,7 +99,7 @@ macro_rules! internal_modules {
 }
 
 internal_modules!(
-    compiler, engine, error, index, metadata, query, simd, sql, vm, wal
+    cancel, compiler, engine, error, index, metadata, query, simd, sql, vm, wal
 );
 
 // ---------------------------------------------------------------------------
@@ -109,9 +109,12 @@ internal_modules!(
 // The database and its options.
 pub use crate::engine::cursor::Cursor;
 pub use crate::engine::{
-    CollectionConfig, CollectionId, CompactionOptions, Db, DbOptions, MAX_INSTALL_BYTES,
+    CollectionConfig, CollectionId, CompactionOptions, Db, DbOptions, Limits, MAX_COLLECTION_BYTES,
+    MAX_DIM, MAX_INSTALL_BYTES,
 };
+// The caps on a `WHERE` predicate's shape.
 pub use crate::error::{Error, Result};
+pub use crate::sql::{MAX_EXPR_DEPTH, MAX_EXPR_TERMS};
 // What `Db::insert`, `Db::insert_many` and `Db::search` hand back.
 pub use crate::index::index::{Ordinal, SearchResult};
 // Schemas and the values rows are made of.

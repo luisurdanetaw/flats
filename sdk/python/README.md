@@ -241,6 +241,7 @@ Every error is a `flats.FlatsError`; catch the subclass you care about:
 | `flats.QueryError` | Bad or unsupported V-SQL, an unknown collection or column, a missing column in an INSERT, a `?` count that doesn't match `params` |
 | `flats.EngineError` | Duplicate primary key, collection full, backup target not empty, I/O failure |
 | `flats.InvalidArgumentError` | Wrong vector length, a value of the wrong type for its column, NaN or infinity, unknown column in `insert` |
+| `flats.Interrupted` | The statement was stopped by `interrupt()` or by its timeout |
 | `flats.InternalError` | A bug in Flats |
 
 ```python
@@ -253,6 +254,18 @@ except flats.EngineError as e:
 `e.code` holds the numeric status from the C library. Passing a non-`str`
 where text is expected raises `TypeError`. A non-finite query vector, or a
 collection or column name that isn't a plain identifier, raises `ValueError`.
+
+## Timeouts and cancellation
+
+```python
+db.set_timeout(2.0)        # stop any statement running longer than 2 s
+db.set_timeout(None)       # off again (the default)
+
+db.interrupt()             # stop everything running right now, from any thread
+```
+
+A stopped statement raises `flats.Interrupted`, and nothing it would have
+written is written. `interrupt()` only reaches statements already running.
 
 ## Threads
 

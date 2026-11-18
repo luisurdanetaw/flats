@@ -36,6 +36,7 @@ __all__ = [
     "QueryError",
     "EngineError",
     "InternalError",
+    "Interrupted",
     "version",
 ]
 
@@ -79,7 +80,14 @@ class InternalError(FlatsError):
     code = 4
 
 
-_ERRORS = {1: InvalidArgumentError, 2: QueryError, 3: EngineError, 4: InternalError}
+class Interrupted(FlatsError):
+    """The statement was stopped: :meth:`Database.interrupt`, or its timeout
+    (FLATS_ERR_INTERRUPTED). Nothing it would have written was written."""
+
+    code = 5
+
+
+_ERRORS = {1: InvalidArgumentError, 2: QueryError, 3: EngineError, 4: InternalError, 5: Interrupted}
 
 _INT, _FLOAT, _TEXT, _VECTOR = 1, 2, 3, 4
 
@@ -157,6 +165,8 @@ def _declare(lib):
             [db_p, c_char_p, ctypes.POINTER(_Param), c_size, ctypes.POINTER(res_p)],
         ),
         "flats_backup": (c_int, [db_p, c_char_p]),
+        "flats_interrupt": (c_int, [db_p]),
+        "flats_set_statement_timeout_ms": (c_int, [db_p, ctypes.c_int64]),
         "flats_query": (
             c_int,
             [db_p, c_char_p, ctypes.POINTER(_Param), c_size, ctypes.POINTER(ctypes.POINTER(_Cursor))],
@@ -561,6 +571,21 @@ class Database:
             finally:
                 _lib.flats_batch_free(batch)
         return total
+
+    def interrupt(self):
+        """Stop every statement running on this database right now — on any
+        thread — with :class:`Interrupted`. Statements started afterwards are
+        unaffected."""
+        with self._use() as db:
+            _check(_lib.flats_interrupt(db))
+
+    def set_timeout(self, seconds):
+        """Stop any statement running longer than ``seconds`` with
+        :class:`Interrupted`; ``None`` disables (the default). Applies to
+        statements started after the call."""
+        ms = -1 if seconds is None else int(seconds * 1000)
+        with self._use() as db:
+            _check(_lib.flats_set_statement_timeout_ms(db, ms))
 
     def backup(self, dest):
         """Write a consistent copy into ``dest`` (absent or an empty

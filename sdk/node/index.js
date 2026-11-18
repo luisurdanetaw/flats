@@ -61,8 +61,11 @@ class InvalidArgumentError extends FlatsError {}
 class QueryError extends FlatsError {}
 class EngineError extends FlatsError {}
 class InternalError extends FlatsError {}
+/** The statement was stopped: interrupt(), or its timeout. Nothing it would
+ * have written was written. */
+class InterruptedError extends FlatsError {}
 
-const CLASSES = { 1: InvalidArgumentError, 2: QueryError, 3: EngineError, 4: InternalError };
+const CLASSES = { 1: InvalidArgumentError, 2: QueryError, 3: EngineError, 4: InternalError, 5: InterruptedError };
 
 /** Call into the addon, rethrowing its errors as the matching class. */
 function call(fn, ...args) {
@@ -279,6 +282,20 @@ class Database {
     return total;
   }
 
+  /**
+   * Stop every statement running on this database right now with
+   * InterruptedError. Statements started afterwards are unaffected.
+   */
+  interrupt() {
+    call(native.interrupt, this._handle());
+  }
+
+  /** Stop any statement running longer than `ms` milliseconds; null disables. */
+  setStatementTimeout(ms) {
+    if (ms !== null && (typeof ms !== 'number' || !(ms >= 0))) throw new TypeError('ms must be a non-negative number or null');
+    call(native.setStatementTimeout, this._handle(), ms === null ? -1 : Math.floor(ms));
+  }
+
   /** Write a consistent copy into `dest` (absent or empty). Restore with `new Database(dest)`. */
   backup(dest) {
     if (typeof dest !== 'string') throw new TypeError('dest must be a string');
@@ -462,6 +479,19 @@ class AsyncDatabase {
     });
   }
 
+  /** Stop every statement running now (synchronous: it never waits). */
+  interrupt() {
+    if (this._db === null) throw new FlatsError('database is closed', 1);
+    call(native.interrupt, this._db);
+  }
+
+  /** Stop any statement running longer than `ms`; null disables. */
+  setStatementTimeout(ms) {
+    if (this._db === null) throw new FlatsError('database is closed', 1);
+    if (ms !== null && (typeof ms !== 'number' || !(ms >= 0))) throw new TypeError('ms must be a non-negative number or null');
+    call(native.setStatementTimeout, this._db, ms === null ? -1 : Math.floor(ms));
+  }
+
   /** Write a consistent copy into `dest`. */
   backup(dest) {
     if (typeof dest !== 'string') return Promise.reject(new TypeError('dest must be a string'));
@@ -492,6 +522,7 @@ module.exports = {
   QueryError,
   EngineError,
   InternalError,
+  InterruptedError,
   BATCH_ROWS,
   version,
 };

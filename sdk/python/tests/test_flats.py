@@ -217,6 +217,33 @@ class TestStreaming(Base):
         self.assertEqual(page, all_ids[20:30])
 
 
+class TestLimits(Base):
+    def test_a_timeout_stops_a_search(self):
+        self.db.insert("docs", [{"id": f"d{i}", "vector": [1, 0, 0], "year": i, "score": 0.0} for i in range(10)])
+        self.db.set_timeout(0)
+        with self.assertRaises(flats.Interrupted) as cm:
+            self.db.search("docs", [1, 0, 0], k=1)
+        self.assertIn("timeout", str(cm.exception))
+        self.assertIsInstance(cm.exception, flats.FlatsError)
+        self.db.set_timeout(None)
+        self.assertEqual(len(self.db.search("docs", [1, 0, 0], k=1)), 1)
+
+    def test_interrupt_stops_a_running_cursor(self):
+        self.db.insert("docs", [{"id": f"d{i}", "vector": [1, 0, 0], "year": i, "score": 0.0} for i in range(50)])
+        cur = self.db.query("SELECT id FROM docs;", chunk_rows=1)
+        next(cur)
+        self.db.interrupt()
+        with self.assertRaises(flats.Interrupted):
+            list(cur)
+        self.assertEqual(len(self.db.execute("SELECT id FROM docs;")), 50)
+
+    def test_an_overly_complex_predicate_is_a_query_error(self):
+        deep = "(" * 10000 + "year = 1" + ")" * 10000
+        with self.assertRaises(flats.QueryError) as cm:
+            self.db.execute(f"SELECT id FROM docs WHERE {deep};")
+        self.assertIn("too complex", str(cm.exception))
+
+
 class TestLifecycle(unittest.TestCase):
     def test_context_manager_closes_and_data_survives(self):
         with tempfile.TemporaryDirectory() as d:

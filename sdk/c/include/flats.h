@@ -59,6 +59,9 @@ extern "C" {
 #define FLATS_ERR_ENGINE           3
 /* A bug in Flats (a caught panic). */
 #define FLATS_ERR_INTERNAL         4
+/* The statement was stopped before it finished: flats_interrupt, or its
+ * timeout. Nothing it would have written was written. */
+#define FLATS_ERR_INTERRUPTED      5
 
 /* ---- cell types (flats_result_type) ------------------------------------ */
 
@@ -166,6 +169,24 @@ void flats_cursor_free(flats_cursor *cur);
 /* Write a consistent copy of the database into directory `dest`, which must
  * not exist or must be empty. Restore by opening `dest`. */
 int flats_backup(flats_db *db, const char *dest);
+
+/* ---- limits and cancellation -------------------------------------------- */
+
+/* Stop every statement running on db right now (searches, scans, cursors)
+ * with FLATS_ERR_INTERRUPTED at its next check — within a fraction of a
+ * millisecond for a search. Statements started afterwards are unaffected.
+ * Safe to call from any thread, e.g. a watchdog. */
+int flats_interrupt(flats_db *db);
+
+/* Stop any statement that runs longer than ms milliseconds with
+ * FLATS_ERR_INTERRUPTED. Negative disables (the default). Applies to
+ * statements started after the call. */
+int flats_set_statement_timeout_ms(flats_db *db, int64_t ms);
+
+/* Hard caps, independent of any setting: a WHERE may nest parentheses at most
+ * 64 deep and hold at most 4096 comparisons (FLATS_ERR_QUERY beyond); a
+ * collection may declare at most 65536 dimensions and reserve at most 4 TiB of
+ * vector storage (FLATS_ERR_ENGINE beyond, before anything is written). */
 
 /* ---- results ----------------------------------------------------------- */
 

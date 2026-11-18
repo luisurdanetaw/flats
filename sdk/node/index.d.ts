@@ -41,6 +41,10 @@ export class Database {
   search(collection: string, vector: ArrayLike<number>, options?: SearchOptions): Result;
   insert(collection: string, rows: Iterable<Row>): number;
   backup(dest: string): void;
+  /** Stop every statement running now. */
+  interrupt(): void;
+  /** Stop statements running longer than `ms`; null disables. */
+  setStatementTimeout(ms: number | null): void;
 }
 
 /** Rows of one statement, read lazily on the thread pool: use `for await`. */
@@ -63,6 +67,8 @@ export class AsyncDatabase {
   search(collection: string, vector: ArrayLike<number>, options?: SearchOptions): Promise<Result>;
   insert(collection: string, rows: Iterable<Row>): Promise<number>;
   backup(dest: string): Promise<void>;
+  interrupt(): void;
+  setStatementTimeout(ms: number | null): void;
 }
 
 /** Open (creating if missing) a database; resolves to an AsyncDatabase. */
@@ -75,6 +81,8 @@ export class InvalidArgumentError extends FlatsError {}
 export class QueryError extends FlatsError {}
 export class EngineError extends FlatsError {}
 export class InternalError extends FlatsError {}
+/** The statement was stopped: interrupt(), or its timeout. */
+export class InterruptedError extends FlatsError {}
 
 export const BATCH_ROWS: number;
 export function version(): string;

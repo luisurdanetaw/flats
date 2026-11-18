@@ -412,3 +412,39 @@ describe('streaming', () => {
     assert.deepEqual(page, all.slice(20, 30));
   });
 });
+
+describe('limits', () => {
+  test('a timeout stops a search; interrupt stops a running iterator', async () => {
+    const dir = tmpdir();
+    const db = new flats.Database(path.join(dir, 'db'));
+    db.execute(SCHEMA);
+    db.insert('docs', rows(50));
+    db.setStatementTimeout(0);
+    assert.throws(() => db.search('docs', [1, 0, 0]), (e) => e instanceof flats.InterruptedError && /timeout/.test(e.message));
+    db.setStatementTimeout(null);
+    assert.equal(db.search('docs', [1, 0, 0], { k: 1 }).length, 1);
+    const it = db.iterate('SELECT id FROM docs;', [], { chunkRows: 1 });
+    it.next();
+    db.interrupt();
+    assert.throws(() => [...it], flats.InterruptedError);
+    assert.equal(db.execute('SELECT id FROM docs;').length, 50);
+    // The async API too.
+    db.close();
+    const adb = await flats.open(path.join(dir, 'db'));
+    adb.setStatementTimeout(0);
+    await assert.rejects(adb.search('docs', [1, 0, 0]), flats.InterruptedError);
+    adb.interrupt();
+    await adb.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('an overly complex predicate is a QueryError', () => {
+    const dir = tmpdir();
+    const db = new flats.Database(path.join(dir, 'db'));
+    db.execute(SCHEMA);
+    const deep = '('.repeat(10000) + 'year = 1' + ')'.repeat(10000);
+    assert.throws(() => db.execute(`SELECT id FROM docs WHERE ${deep};`), (e) => e instanceof flats.QueryError && /too complex/.test(e.message));
+    db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});

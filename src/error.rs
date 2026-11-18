@@ -269,6 +269,25 @@ pub enum Error {
         path: String,
     },
 
+    /// The statement was stopped before it finished: by `Db::interrupt`, or by
+    /// running past `Limits::statement_timeout`. Nothing it would have written
+    /// was written (writes are one record, logged only once complete).
+    #[error("statement stopped: {reason}")]
+    Interrupted {
+        /// `"statement timeout"` or `"interrupted by Db::interrupt"`.
+        reason: String,
+    },
+
+    /// A collection whose vectors could never be stored: more bytes than the
+    /// per-collection cap. Refused before anything is logged.
+    #[error("collection would need {bytes} bytes of vector storage, over the {cap}-byte cap")]
+    CollectionTooLarge {
+        /// `capacity × dim × 4`.
+        bytes: u128,
+        /// The cap ([`MAX_COLLECTION_BYTES`](crate::MAX_COLLECTION_BYTES)).
+        cap: u64,
+    },
+
     /// A persisted snapshot's schema contradicts the one the caller supplied.
     #[error("snapshot schema does not match the schema supplied by the caller")]
     SchemaMismatch,

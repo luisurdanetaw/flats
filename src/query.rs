@@ -58,7 +58,7 @@ use crate::compiler::bytecode::ValidateError;
 use crate::compiler::compile;
 use crate::engine::Db;
 use crate::sql::bind::{BoundStatement, Projected};
-use crate::sql::{BindError, Param, ParseError, Statement, analyze, parse_with_params, plan};
+use crate::sql::{BindError, Param, ParseError, Statement, analyze, parse_with_limit, plan};
 use crate::vm::exec::{ExecError, OutputRow, Vm};
 
 /// How many times a conflicted write is run again before giving up.
@@ -84,6 +84,9 @@ pub struct RowStream {
     /// The statement's `LIMIT`/`OFFSET`, applied as rows are pulled — so a
     /// `LIMIT 10` stops the scan after ten rows instead of reading them all.
     window: Window,
+    /// The statement's interrupt generation and deadline, checked before each
+    /// row is pulled. `None` for a stream that is already finished.
+    watch: Option<crate::cancel::Watch>,
 }
 
 /// What is left of a `LIMIT n OFFSET m` as a stream is consumed.
@@ -110,6 +113,7 @@ impl RowStream {
             vm,
             done: false,
             window: Window::ALL,
+            watch: None,
         }
     }
 
@@ -121,6 +125,7 @@ impl RowStream {
             vm: Vm::halted(),
             done: true,
             window: Window::ALL,
+            watch: None,
         }
     }
 
@@ -144,8 +149,24 @@ impl Iterator for RowStream {
     /// `Vm::resume` rather than `step`, because a read stream is detached: its
     /// cursor is already open and the rest of the scan needs no database.
     fn next(&mut self) -> Option<Self::Item> {
+        match self.watch.clone() {
+            Some(watch) => crate::cancel::under(&watch, || self.pull()),
+            None => self.pull(),
+        }
+    }
+}
+
+impl RowStream {
+    /// One row, under whatever watch `next` installed.
+    fn pull(&mut self) -> Option<Result<OutputRow, Error>> {
         if self.done {
             return None;
+        }
+        // Stopped by Db::interrupt or its deadline? Checked before each row,
+        // so a stream nobody is reading costs nothing.
+        if let Err(e) = crate::cancel::check() {
+            self.done = true;
+            return Some(Err(Error::Engine(e)));
         }
         // The cap is checked BEFORE pulling, so a satisfied LIMIT never reads
         // the row after its last.
@@ -317,9 +338,23 @@ impl Db {
     /// # Ok::<(), flats::QueryError>(())
     /// ```
     pub fn execute_with(&self, sql: &str, params: &[Param]) -> Result<RowStream, Error> {
+        // The statement's clock and interrupt generation start NOW, and it
+        // runs under them — its cursors' opening (where a SEARCH ranks), its
+        // write, and every row a stream later pulls.
+        let watch = self.statement_watch();
+        crate::cancel::under(&watch, || self.execute_watched(sql, params, &watch))
+    }
+
+    fn execute_watched(
+        &self,
+        sql: &str,
+        params: &[Param],
+        watch: &crate::cancel::Watch,
+    ) -> Result<RowStream, Error> {
         // 1. PARSE (lexing included — the parser wraps lex errors), with the
         //    parameters substituted between the two.
-        let statement = parse_with_params(sql, params).map_err(Error::Parse)?;
+        let statement = parse_with_limit(sql, params, self.limits().max_statement_bytes)
+            .map_err(Error::Parse)?;
         // A row window belongs to the result stream, not to the statement the
         // rest of the pipeline sees: unwrap it here and apply it as rows are
         // pulled.
@@ -454,6 +489,7 @@ impl Db {
                     opened?;
                     let mut stream = RowStream::over(labels, vm);
                     stream.window = window;
+                    stream.watch = Some(watch.clone());
                     return Ok(stream);
                 }
                 vm = Vm::new(program.clone())?;
