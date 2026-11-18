@@ -341,14 +341,7 @@ impl<'a> Compiler<'a> {
 
     /// One ordered comparison. Split out only so the four arms above read as
     /// four one-liners.
-    fn emit_range(
-        &mut self,
-        collection: &str,
-        col: ColumnId,
-        op: RangeOp,
-        value: Reg,
-        dst: Reg,
-    ) {
+    fn emit_range(&mut self, collection: &str, col: ColumnId, op: RangeOp, value: Reg, dst: Reg) {
         self.emit(Op::BitmapRange {
             collection: collection.to_string(),
             col,
@@ -1246,7 +1239,9 @@ mod tests {
             include_vector: false,
         });
         let program = compile(plan, Some(&docs_meta_schema())).expect("compiles");
-        program.validate().expect("a filtered program is well-formed");
+        program
+            .validate()
+            .expect("a filtered program is well-formed");
     }
 
     // ========================================================================

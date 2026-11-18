@@ -82,10 +82,11 @@ fn main() {
 
         println!("dim = {dim}");
         let scalar_ns = run("scalar", dim, &a, &b, scalar::dot);
-        let relaxed_ns = run("scalar_relaxed", dim, &a, &b, scalar::dot_relaxed);  // ← ADD
-        println!("    speedup: scalar_relaxed/scalar = {:.2}x", scalar_ns / relaxed_ns);  // ← ADD
-
-
+        let relaxed_ns = run("scalar_relaxed", dim, &a, &b, scalar::dot_relaxed); // ← ADD
+        println!(
+            "    speedup: scalar_relaxed/scalar = {:.2}x",
+            scalar_ns / relaxed_ns
+        ); // ← ADD
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -95,7 +96,10 @@ fn main() {
                     flats::simd::avx2::dot(a, b)
                 });
                 println!("    speedup: avx2/scalar = {:.2}x", scalar_ns / simd_ns);
-                println!("    speedup: avx2/scalar_relaxed = {:.2}x", relaxed_ns / simd_ns);  // ← ADD
+                println!(
+                    "    speedup: avx2/scalar_relaxed = {:.2}x",
+                    relaxed_ns / simd_ns
+                ); // ← ADD
             } else {
                 println!("    avx2+fma: not available on this host");
             }

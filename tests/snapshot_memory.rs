@@ -50,7 +50,7 @@ fn proc_status_bytes(field: &str) -> usize {
     let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix(field)
-            && let Some(kb) = rest.trim_start_matches(':').trim().split_whitespace().next()
+            && let Some(kb) = rest.trim_start_matches(':').split_whitespace().next()
             && let Ok(kb) = kb.parse::<usize>()
         {
             return kb * 1024;
@@ -102,7 +102,9 @@ fn concurrent_snapshots_stay_within_budget_and_come_back() {
         if i > 0 {
             // One write between opens. The row is new, so the bitset grows by
             // a word at most — the cost being measured is the COPY, not the row.
-            writer.insert_row(Ordinal(ORDINALS + i as u32), &empty_row()).unwrap();
+            writer
+                .insert_row(Ordinal(ORDINALS + i as u32), &empty_row())
+                .unwrap();
             handle.bump();
         }
         pinned.push(handle.resolve());
@@ -204,7 +206,10 @@ fn concurrent_snapshots_stay_within_budget_and_come_back() {
         let mut again = Vec::new();
         for i in 0..QUERIES {
             writer
-                .insert_row(Ordinal(ORDINALS + 1_000 + (round * 100 + i) as u32), &empty_row())
+                .insert_row(
+                    Ordinal(ORDINALS + 1_000 + (round * 100 + i) as u32),
+                    &empty_row(),
+                )
                 .unwrap();
             handle.bump();
             again.push(handle.resolve());
@@ -244,7 +249,9 @@ fn sparse_high_ordinal_costs_a_full_bitset() {
     let (mut writer, reader, _lsn) =
         MetadataIndex::open_or_create(dir.path(), vector_only()).unwrap();
     writer.insert_row(Ordinal(0), &empty_row()).unwrap();
-    writer.insert_row(Ordinal(ORDINALS - 1), &empty_row()).unwrap();
+    writer
+        .insert_row(Ordinal(ORDINALS - 1), &empty_row())
+        .unwrap();
 
     let handle = reader.live_handle();
     let before = rss();

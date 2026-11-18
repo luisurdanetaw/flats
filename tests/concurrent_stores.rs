@@ -623,67 +623,67 @@ fn snapshot_never_contains_an_unwritten_row() {
     let acked = Arc::new(AtomicU64::new(SEED_ROWS));
 
     let next = std::thread::scope(|scope| {
-    let mut handles = Vec::new();
-    for _ in 0..reader_threads() {
-        let db = &db;
-        let tuples = tuples.clone();
-        let flat = flat.clone();
-        let stop = stop.clone();
-        let violations = violations.clone();
-        let resolves = resolves.clone();
-        let checks = checks.clone();
-        let notes = notes.clone();
-        handles.push(scope.spawn(move || {
-            // A COVERAGE FLOOR in the loop condition, not a threshold asserted
-            // afterwards: every reader here walks the snapshot to find its max,
-            // so one number serves all of them. See the guards below.
-            const MIN_ITERS: u64 = 300;
-            let mut seen = 0u64;
-            while !stop.load(Ordering::Relaxed) || seen < MIN_ITERS {
-                seen += 1;
-                let set = db.live_snapshot(0).expect("collection 0");
-                resolves.fetch_add(1, Ordering::Relaxed);
-                let Some(max) = set.iter().max() else {
-                    continue;
-                };
-                checks.fetch_add(1, Ordering::Relaxed);
+        let mut handles = Vec::new();
+        for _ in 0..reader_threads() {
+            let db = &db;
+            let tuples = tuples.clone();
+            let flat = flat.clone();
+            let stop = stop.clone();
+            let violations = violations.clone();
+            let resolves = resolves.clone();
+            let checks = checks.clone();
+            let notes = notes.clone();
+            handles.push(scope.spawn(move || {
+                // A COVERAGE FLOOR in the loop condition, not a threshold asserted
+                // afterwards: every reader here walks the snapshot to find its max,
+                // so one number serves all of them. See the guards below.
+                const MIN_ITERS: u64 = 300;
+                let mut seen = 0u64;
+                while !stop.load(Ordering::Relaxed) || seen < MIN_ITERS {
+                    seen += 1;
+                    let set = db.live_snapshot(0).expect("collection 0");
+                    resolves.fetch_add(1, Ordering::Relaxed);
+                    let Some(max) = set.iter().max() else {
+                        continue;
+                    };
+                    checks.fetch_add(1, Ordering::Relaxed);
 
-                match tuples.get(Ordinal(max), &COLS).expect("get") {
-                    RowGet::Live(values) => {
-                        verify_values(max as u64, &values);
-                        // The flat index must hold it too. This was dropped
-                        // while `flat.delete` still ran before `tuple.delete_row`
-                        // — a snapshot could then catch the two stores
-                        // disagreeing. Neither call exists now: retiring a row
-                        // touches only `live`, so all three stores agree about
-                        // every ordinal a snapshot admits.
-                        if flat.vector_at(Ordinal(max)).is_none() {
-                            violations.fetch_add(1, Ordering::Relaxed);
+                    match tuples.get(Ordinal(max), &COLS).expect("get") {
+                        RowGet::Live(values) => {
+                            verify_values(max as u64, &values);
+                            // The flat index must hold it too. This was dropped
+                            // while `flat.delete` still ran before `tuple.delete_row`
+                            // — a snapshot could then catch the two stores
+                            // disagreeing. Neither call exists now: retiring a row
+                            // touches only `live`, so all three stores agree about
+                            // every ordinal a snapshot admits.
+                            if flat.vector_at(Ordinal(max)).is_none() {
+                                violations.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
-                    }
-                    RowGet::Missing => {
-                        violations.fetch_add(1, Ordering::Relaxed);
-                        let mut n = notes.lock().unwrap_or_else(|e| e.into_inner());
-                        if n.len() < MAX_OBSERVATIONS {
-                            n.push(format!(
-                                "ordinal {max} is in a v{} snapshot (len={}) but the tuple \
+                        RowGet::Missing => {
+                            violations.fetch_add(1, Ordering::Relaxed);
+                            let mut n = notes.lock().unwrap_or_else(|e| e.into_inner());
+                            if n.len() < MAX_OBSERVATIONS {
+                                n.push(format!(
+                                    "ordinal {max} is in a v{} snapshot (len={}) but the tuple \
                                  store says Missing",
-                                set.version(),
-                                set.len()
-                            ));
+                                    set.version(),
+                                    set.len()
+                                ));
+                            }
                         }
                     }
                 }
-            }
-        }));
-    }
+            }));
+        }
 
-    let (_live, next) = drive_writer(&db, 0x51A2_7E31_0C4D_9B77, &acked);
-    stop.store(true, Ordering::Relaxed);
-    for h in handles {
-        h.join().expect("reader thread panicked");
-    }
-    next
+        let (_live, next) = drive_writer(&db, 0x51A2_7E31_0C4D_9B77, &acked);
+        stop.store(true, Ordering::Relaxed);
+        for h in handles {
+            h.join().expect("reader thread panicked");
+        }
+        next
     });
 
     // The same meaningfulness guards the decider uses: silence is only evidence

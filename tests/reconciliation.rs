@@ -225,7 +225,10 @@ fn crash_between_b_and_c_torn_header_falls_back_to_previous_slot() {
     }
 
     let (replayed, reader) = recover(&idx_path, &wal_path);
-    assert_eq!(replayed, 3, "fell back to prior slot (watermark 0) => full replay");
+    assert_eq!(
+        replayed, 3,
+        "fell back to prior slot (watermark 0) => full replay"
+    );
     assert_exactly(&reader, 3);
 }
 
@@ -249,7 +252,10 @@ fn crash_between_c_and_d_header_durable_wal_not_truncated() {
     }
 
     let (replayed, reader) = recover(&idx_path, &wal_path);
-    assert_eq!(replayed, 0, "entire prefix already durable => nothing replayed");
+    assert_eq!(
+        replayed, 0,
+        "entire prefix already durable => nothing replayed"
+    );
     assert_exactly(&reader, 3);
 }
 

@@ -46,9 +46,9 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -234,7 +234,10 @@ fn collection_dir(dir: &Path, id: u32) -> PathBuf {
 /// CreateCollection replay idempotent at the file level: a half-materialized
 /// collection from a crash is absorbed. Returns the writers, the read-side
 /// `Collection`, and the min durable watermark across the three stores.
-fn open_collection(dir: &Path, cfg: &CollectionConfig) -> Result<(CollectionWriters, Collection, u64)> {
+fn open_collection(
+    dir: &Path,
+    cfg: &CollectionConfig,
+) -> Result<(CollectionWriters, Collection, u64)> {
     // An interrupted compaction can leave the directory mid-swap; resolve that
     // first. A no-op otherwise.
     compact::settle(dir, cfg.id)?;
@@ -243,7 +246,10 @@ fn open_collection(dir: &Path, cfg: &CollectionConfig) -> Result<(CollectionWrit
 
 /// `open_collection` against an explicit directory — the canonical one, or a
 /// compaction's staging copy.
-fn open_collection_in(cdir: &Path, cfg: &CollectionConfig) -> Result<(CollectionWriters, Collection, u64)> {
+fn open_collection_in(
+    cdir: &Path,
+    cfg: &CollectionConfig,
+) -> Result<(CollectionWriters, Collection, u64)> {
     let cdir = cdir.to_path_buf();
     std::fs::create_dir_all(&cdir)?;
 
@@ -752,7 +758,7 @@ struct Flusher {
 }
 
 impl Flusher {
-    fn spawn(wal: WalHandle, interval: Duration) -> Flusher {
+    fn spawn(wal: WalHandle, interval: Duration) -> io::Result<Flusher> {
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let join = std::thread::Builder::new()
             .name("flats-flusher".into())
@@ -771,9 +777,11 @@ impl Flusher {
                 while let Err(RecvTimeoutError::Timeout) = stop_rx.recv_timeout(interval) {
                     let _ = wal.checkpoint();
                 }
-            })
-            .expect("spawn flusher thread");
-        Flusher { stop: stop_tx, join }
+            })?;
+        Ok(Flusher {
+            stop: stop_tx,
+            join,
+        })
     }
 
     fn stop(self) {
@@ -814,22 +822,21 @@ const CATALOG_VERSION: u32 = 3;
 const CATALOG_FILE: &str = "catalog.snap";
 const CATALOG_TMP: &str = "catalog.snap.tmp";
 
-fn encode_catalog(registry: &[CollectionConfig], last_lsn: u64) -> Vec<u8> {
+fn encode_catalog(registry: &[CollectionConfig], last_lsn: u64) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     buf.extend_from_slice(CATALOG_MAGIC);
     buf.extend_from_slice(&CATALOG_VERSION.to_le_bytes());
     buf.extend_from_slice(&last_lsn.to_le_bytes());
 
-    // Plain data into memory — no fallible step (same reasoning as
-    // Record::encode in wal.rs).
-    let body = bincode::serialize(&registry)
-        .expect("catalog body serialization into memory cannot fail");
+    // Plain data into memory — no fallible step today, but surfaced rather
+    // than unwrapped (same reasoning as Record::encode in wal.rs).
+    let body = bincode::serialize(&registry).map_err(io::Error::other)?;
     buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
     buf.extend_from_slice(&body);
 
     let crc = crc32(&buf);
     buf.extend_from_slice(&crc.to_le_bytes());
-    buf
+    Ok(buf)
 }
 
 /// Inverse of `encode_catalog`. Trailing CRC verified FIRST, like the stores.
@@ -856,8 +863,7 @@ fn decode_catalog(bytes: &[u8]) -> Result<(Vec<CollectionConfig>, u64)> {
             "catalog: unsupported version {version}"
         )));
     }
-    let last_lsn =
-        u64::from_le_bytes(head[8..16].try_into().map_err(|_| corrupt("truncated"))?);
+    let last_lsn = u64::from_le_bytes(head[8..16].try_into().map_err(|_| corrupt("truncated"))?);
     let body_len =
         u32::from_le_bytes(head[16..20].try_into().map_err(|_| corrupt("truncated"))?) as usize;
     let body = head
@@ -885,7 +891,12 @@ fn load_catalog(dir: &Path) -> Result<(Vec<CollectionConfig>, u64)> {
 /// Persist the registry with the shared tmp → fsync → rename → dir-fsync
 /// dance (a leftover garbage .tmp from a crash is overwritten, never read).
 fn persist_catalog(dir: &Path, registry: &[CollectionConfig], last_lsn: u64) -> Result<()> {
-    write_snapshot_atomic(dir, CATALOG_TMP, CATALOG_FILE, &encode_catalog(registry, last_lsn))
+    write_snapshot_atomic(
+        dir,
+        CATALOG_TMP,
+        CATALOG_FILE,
+        &encode_catalog(registry, last_lsn)?,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -923,7 +934,11 @@ impl Db {
     /// (`CollectionConfigMismatch` otherwise). Collections registered by
     /// earlier opens re-emerge without being re-supplied — pass `&[]` to open
     /// an existing database as-is.
-    pub fn open(dir: impl AsRef<Path>, collections: &[CollectionConfig], opts: DbOptions) -> Result<Db> {
+    pub fn open(
+        dir: impl AsRef<Path>,
+        collections: &[CollectionConfig],
+        opts: DbOptions,
+    ) -> Result<Db> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
 
@@ -966,8 +981,7 @@ impl Db {
         //    `collection-{id}.idx` layout (the WAL format changed too); the
         //    upgrade path is a clean shutdown on the old build.
         let mut map: CatalogMap = HashMap::with_capacity(registry.len());
-        let mut writers: HashMap<u32, CollectionWriters> =
-            HashMap::with_capacity(registry.len());
+        let mut writers: HashMap<u32, CollectionWriters> = HashMap::with_capacity(registry.len());
         // Conservative global minimum watermark across every store of every
         // collection (see the recovery note below).
         let mut min_watermark = u64::MAX;
@@ -1004,7 +1018,11 @@ impl Db {
         //    so it can never be skipped — replay re-materializes the
         //    collection, then its data records follow.
         let skip_through = min_watermark.min(cat_lsn);
-        let skip_through = if skip_through == u64::MAX { 0 } else { skip_through };
+        let skip_through = if skip_through == u64::MAX {
+            0
+        } else {
+            skip_through
+        };
 
         // 3. Start the WAL; recovery replays the tail into the writers (which the
         //    applier owns). The catalog's readers observe the same inners; a
@@ -1033,7 +1051,15 @@ impl Db {
         }
 
         // 5. Background checkpoints (the flusher just pokes the commit thread).
-        let flusher = Flusher::spawn(wal.handle(), opts.checkpoint_interval);
+        //    A failed spawn must not leave the commit thread running detached
+        //    (`Wal` has no Drop), so tear down what has started, like `Drop`.
+        let flusher = match Flusher::spawn(wal.handle(), opts.checkpoint_interval) {
+            Ok(flusher) => flusher,
+            Err(e) => {
+                wal.shutdown();
+                return Err(e.into());
+            }
+        };
 
         // 6. Background compaction, on the same cadence.
         let gate = Arc::new(WriteGate::new());
@@ -1045,9 +1071,22 @@ impl Db {
             running: Mutex::new(()),
             stop: std::sync::atomic::AtomicBool::new(false),
         });
-        let compactor = opts.compaction.enabled.then(|| {
-            Compactor::spawn(Arc::clone(&compaction), wal.handle(), opts.checkpoint_interval)
-        });
+        let compactor = if opts.compaction.enabled {
+            match Compactor::spawn(
+                Arc::clone(&compaction),
+                wal.handle(),
+                opts.checkpoint_interval,
+            ) {
+                Ok(compactor) => Some(compactor),
+                Err(e) => {
+                    flusher.stop();
+                    wal.shutdown();
+                    return Err(e.into());
+                }
+            }
+        } else {
+            None
+        };
 
         Ok(Db {
             catalog,
@@ -1656,7 +1695,11 @@ impl Db {
         if let Some(flusher) = self.flusher.take() {
             flusher.stop();
         }
-        let wal = self.wal.take().expect("wal present until close");
+        // Only `close` (which consumes self) and `Drop` take the WAL, so it is
+        // always here; if not, there is nothing left to shut down.
+        let Some(wal) = self.wal.take() else {
+            return Ok(());
+        };
         // Final checkpoint on the commit thread — but shut the thread down
         // whichever way it goes. Returning early here used to drop `Wal`
         // without joining, leaking the commit thread; a halted log makes that
@@ -2049,7 +2092,10 @@ mod tests {
         let hits = db.search(0, &[1.0, 0.0], 4).unwrap();
         assert_eq!(hits.len(), 1);
         let mut cursor = db.scan(0).unwrap();
-        assert!(cursor.seek_first().unwrap(), "the scan cursor still sees the row");
+        assert!(
+            cursor.seek_first().unwrap(),
+            "the scan cursor still sees the row"
+        );
         assert_eq!(cursor.ordinal().unwrap(), Ordinal(0));
     }
 
@@ -3271,7 +3317,14 @@ mod tests {
         let tuples = db.tuple_reader(0).unwrap();
 
         // WHERE a < 3 → {0, 1}.
-        let filter = meta.lookup_range(0, RangeOp::Lt, &Value::Int(3), &db.live_snapshot(0).unwrap()).unwrap();
+        let filter = meta
+            .lookup_range(
+                0,
+                RangeOp::Lt,
+                &Value::Int(3),
+                &db.live_snapshot(0).unwrap(),
+            )
+            .unwrap();
         assert_eq!(filter.iter().collect::<Vec<u32>>(), vec![0, 1]);
 
         // Intersect with search candidates by hand.
@@ -3291,11 +3344,20 @@ mod tests {
 
         // Delete and re-check exclusion everywhere.
         db.delete(0, 0).unwrap();
-        let filter = meta.lookup_eq(1, &Value::Text("alice".into()), &db.live_snapshot(0).unwrap()).unwrap();
+        let filter = meta
+            .lookup_eq(
+                1,
+                &Value::Text("alice".into()),
+                &db.live_snapshot(0).unwrap(),
+            )
+            .unwrap();
         assert_eq!(filter.iter().collect::<Vec<u32>>(), vec![2]);
         // Retiring a row clears its live bit and touches nothing else — the
         // values are still there for anyone holding an older snapshot.
-        assert!(matches!(tuples.get(Ordinal(0), &[0]).unwrap(), RowGet::Live(_)));
+        assert!(matches!(
+            tuples.get(Ordinal(0), &[0]).unwrap(),
+            RowGet::Live(_)
+        ));
         assert_eq!(meta.live_count(), 2);
 
         db.close().unwrap();
@@ -3309,8 +3371,12 @@ mod tests {
         {
             let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
             for i in 0..5i64 {
-                db.insert(0, &[i as f32, 1.0], meta_row(i, if i % 2 == 0 { "even" } else { "odd" }))
-                    .unwrap();
+                db.insert(
+                    0,
+                    &[i as f32, 1.0],
+                    meta_row(i, if i % 2 == 0 { "even" } else { "odd" }),
+                )
+                .unwrap();
             }
             db.delete(0, 3).unwrap();
             // Drop, not close: skips the final checkpoint, everything lives
@@ -3326,14 +3392,26 @@ mod tests {
         assert_eq!(hits.len(), 4);
         assert_eq!(meta.live_count(), 4);
         for ord in [0u32, 1, 2, 4] {
-            assert!(matches!(tuples.get(Ordinal(ord), &[0]).unwrap(), RowGet::Live(_)));
+            assert!(matches!(
+                tuples.get(Ordinal(ord), &[0]).unwrap(),
+                RowGet::Live(_)
+            ));
         }
         // Retired, so absent from `live` — but its values survive.
-        assert!(matches!(tuples.get(Ordinal(3), &[0]).unwrap(), RowGet::Live(_)));
+        assert!(matches!(
+            tuples.get(Ordinal(3), &[0]).unwrap(),
+            RowGet::Live(_)
+        ));
         assert!(!meta.live().contains(3));
 
         // Spot-check lookups and values.
-        let evens = meta.lookup_eq(1, &Value::Text("even".into()), &db.live_snapshot(0).unwrap()).unwrap();
+        let evens = meta
+            .lookup_eq(
+                1,
+                &Value::Text("even".into()),
+                &db.live_snapshot(0).unwrap(),
+            )
+            .unwrap();
         assert_eq!(evens.iter().collect::<Vec<u32>>(), vec![0, 2, 4]);
         assert_eq!(
             tuples.get(Ordinal(4), &[0, 1]).unwrap(),
@@ -3364,7 +3442,11 @@ mod tests {
             let db = Db::open(dir.path(), &[cfg_meta(0, 2, 64)], manual_opts()).unwrap();
             let meta = db.metadata_reader(0).unwrap();
             let tuples = db.tuple_reader(0).unwrap();
-            assert_eq!(db.search(0, &[0.0, 1.0], 64).unwrap().len(), 3, "victim {victim}");
+            assert_eq!(
+                db.search(0, &[0.0, 1.0], 64).unwrap().len(),
+                3,
+                "victim {victim}"
+            );
             assert_eq!(meta.live_count(), 3, "victim {victim}");
             assert_eq!(
                 tuples.get(Ordinal(2), &[0]).unwrap(),
@@ -3400,11 +3482,17 @@ mod tests {
             let tuples = db.tuple_reader(0).unwrap();
             assert_eq!(meta.live_count(), 1, "victim {victim}");
             assert_eq!(
-                meta.lookup_eq(0, &Value::Int(2), &db.live_snapshot(0).unwrap()).unwrap().iter().collect::<Vec<u32>>(),
+                meta.lookup_eq(0, &Value::Int(2), &db.live_snapshot(0).unwrap())
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<u32>>(),
                 vec![1],
                 "victim {victim}"
             );
-            assert!(matches!(tuples.get(Ordinal(0), &[1]).unwrap(), RowGet::Live(_)));
+            assert!(matches!(
+                tuples.get(Ordinal(0), &[1]).unwrap(),
+                RowGet::Live(_)
+            ));
             assert_eq!(
                 tuples.get(Ordinal(1), &[1]).unwrap(),
                 RowGet::Live(vec![Value::Text("y".into())]),
@@ -3441,7 +3529,10 @@ mod tests {
         assert_eq!(db.search(1, &[1.0, 0.0, 0.0], 10).unwrap().len(), 1);
         let meta = db.metadata_reader(0).unwrap();
         assert_eq!(
-            meta.lookup_eq(0, &Value::Int(7), &db.live_snapshot(0).unwrap()).unwrap().iter().collect::<Vec<u32>>(),
+            meta.lookup_eq(0, &Value::Int(7), &db.live_snapshot(0).unwrap())
+                .unwrap()
+                .iter()
+                .collect::<Vec<u32>>(),
             vec![0]
         );
         // The re-emerged schema still validates inserts.
@@ -3536,10 +3627,24 @@ mod tests {
             )
             .unwrap();
             // Interleave records across the two collections in one WAL.
-            assert_eq!(db.insert(0, &[1.0, 0.0], meta_row(1, "a")).unwrap(), Ordinal(0));
-            assert_eq!(db.insert(1, &[1.0, 0.0, 0.0, 0.0], meta_row(10, "b")).unwrap(), Ordinal(0));
-            assert_eq!(db.insert(0, &[2.0, 0.0], meta_row(2, "a")).unwrap(), Ordinal(1));
-            assert_eq!(db.insert(1, &[2.0, 0.0, 0.0, 0.0], meta_row(20, "b")).unwrap(), Ordinal(1));
+            assert_eq!(
+                db.insert(0, &[1.0, 0.0], meta_row(1, "a")).unwrap(),
+                Ordinal(0)
+            );
+            assert_eq!(
+                db.insert(1, &[1.0, 0.0, 0.0, 0.0], meta_row(10, "b"))
+                    .unwrap(),
+                Ordinal(0)
+            );
+            assert_eq!(
+                db.insert(0, &[2.0, 0.0], meta_row(2, "a")).unwrap(),
+                Ordinal(1)
+            );
+            assert_eq!(
+                db.insert(1, &[2.0, 0.0, 0.0, 0.0], meta_row(20, "b"))
+                    .unwrap(),
+                Ordinal(1)
+            );
             db.delete(0, 0).unwrap(); // only collection 0's ordinal 0 dies
             // Drop without close: everything recovers from the WAL tail alone.
         }
@@ -3561,7 +3666,11 @@ mod tests {
         let meta1 = db.metadata_reader(1).unwrap();
         assert_eq!(meta1.live_count(), 2);
         assert_eq!(
-            meta1.lookup_eq(0, &Value::Int(20), &db.live_snapshot(0).unwrap()).unwrap().iter().collect::<Vec<u32>>(),
+            meta1
+                .lookup_eq(0, &Value::Int(20), &db.live_snapshot(0).unwrap())
+                .unwrap()
+                .iter()
+                .collect::<Vec<u32>>(),
             vec![1]
         );
         assert_eq!(
@@ -3570,9 +3679,13 @@ mod tests {
         );
 
         // Allocators resumed independently per collection.
-        assert_eq!(db.insert(0, &[3.0, 0.0], meta_row(3, "a")).unwrap(), Ordinal(2));
         assert_eq!(
-            db.insert(1, &[3.0, 0.0, 0.0, 0.0], meta_row(30, "b")).unwrap(),
+            db.insert(0, &[3.0, 0.0], meta_row(3, "a")).unwrap(),
+            Ordinal(2)
+        );
+        assert_eq!(
+            db.insert(1, &[3.0, 0.0, 0.0, 0.0], meta_row(30, "b"))
+                .unwrap(),
             Ordinal(2)
         );
         db.close().unwrap();
@@ -3614,8 +3727,10 @@ mod tests {
         let id = db.create_collection("docs", 16, schema).unwrap();
         assert_eq!(id, 0, "first collection gets id 0");
 
-        db.insert(id, &[1.0, 0.0, 0.0], vec![(0, Value::Int(7))]).unwrap();
-        db.insert(id, &[0.0, 1.0, 0.0], vec![(0, Value::Int(8))]).unwrap();
+        db.insert(id, &[1.0, 0.0, 0.0], vec![(0, Value::Int(7))])
+            .unwrap();
+        db.insert(id, &[0.0, 1.0, 0.0], vec![(0, Value::Int(8))])
+            .unwrap();
 
         let hits = db.search(id, &[1.0, 0.0, 0.0], 10).unwrap();
         assert_eq!(hits.len(), 2);
@@ -3665,7 +3780,10 @@ mod tests {
                 .unwrap();
             wal.shutdown();
         }
-        assert!(!dir.path().join("catalog.snap").exists(), "nothing applied yet");
+        assert!(
+            !dir.path().join("catalog.snap").exists(),
+            "nothing applied yet"
+        );
         assert!(!dir.path().join("collection-0").exists());
 
         let db = Db::open(dir.path(), &[], manual_opts()).unwrap();
@@ -3770,7 +3888,10 @@ mod tests {
             Err(Error::DuplicateColumn(_))
         ));
 
-        assert!(db.collections().is_empty(), "nothing registered by any failed attempt");
+        assert!(
+            db.collections().is_empty(),
+            "nothing registered by any failed attempt"
+        );
 
         // No id was burned by the failed attempts: the first real create
         // still gets id 0.
@@ -3827,11 +3948,19 @@ mod tests {
         // Scalars: ColumnId dense 0..N (vector excluded); ordinals vector-inclusive.
         assert_eq!(s.columns.len(), 2);
         assert_eq!(
-            (s.columns[0].id, s.columns[0].name.as_str(), s.columns[0].ordinal.get()),
+            (
+                s.columns[0].id,
+                s.columns[0].name.as_str(),
+                s.columns[0].ordinal.get()
+            ),
             (0, "author", 0)
         );
         assert_eq!(
-            (s.columns[1].id, s.columns[1].name.as_str(), s.columns[1].ordinal.get()),
+            (
+                s.columns[1].id,
+                s.columns[1].name.as_str(),
+                s.columns[1].ordinal.get()
+            ),
             (1, "year", 2)
         );
         db.close().unwrap();
@@ -3901,7 +4030,10 @@ mod tests {
         match analyze(parse("SELECT * FROM docs;").unwrap(), &db).unwrap() {
             BoundStatement::Select(sel) => {
                 assert_eq!(
-                    sel.projection.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                    sel.projection
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect::<Vec<_>>(),
                     vec!["author".to_string(), "title".to_string()]
                 );
                 assert!(!sel.include_vector);
@@ -4050,7 +4182,11 @@ mod tests {
         db.delete(0, 3).unwrap();
 
         let set = live.resolve();
-        assert_eq!(set.bitmap(), &meta.live(), "snapshot must match the authority");
+        assert_eq!(
+            set.bitmap(),
+            &meta.live(),
+            "snapshot must match the authority"
+        );
         assert_eq!(set.len(), 7);
         assert!(!set.contains(3));
         assert_eq!(set.version(), 9, "8 inserts + 1 delete");
@@ -4091,7 +4227,10 @@ mod tests {
 
         db.delete(0, 1).unwrap();
         let after = db.live_snapshot(0).unwrap();
-        assert!(!Arc::ptr_eq(&before, &after), "the delete moved the version");
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "the delete moved the version"
+        );
 
         // The OLD snapshot still sees ordinal 1 — a query that opened before
         // the delete must keep seeing the row it was promised, predicate or no

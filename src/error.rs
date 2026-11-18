@@ -45,7 +45,9 @@ pub enum Error {
     /// owners updated at three different moments; it is now a bug in the
     /// applier's ordering, and silently skipping it would hide exactly the
     /// class of defect this became an error to catch.
-    #[error("row {ordinal} of collection {collection} is in the liveness snapshot but absent from the tuple store")]
+    #[error(
+        "row {ordinal} of collection {collection} is in the liveness snapshot but absent from the tuple store"
+    )]
     SnapshotRowMissing { collection: u32, ordinal: u32 },
 
     /// The database is halted: a record was fsynced, then failed to apply to

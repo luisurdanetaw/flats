@@ -16,12 +16,11 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # ── Fast, non-blocking style feedback ──────────────────────────────────────
-  # Kept OFF the critical path for now: `cargo fmt --check` currently flags
-  # benches/simd.rs and clippy has 6 known lints (module-inception, etc.).
-  # Flip `continue-on-error` to false once those are cleared to make them gates.
+  # ── Style gates ───────────────────────────────────────────────────────────
+  # Blocking: a fmt diff or any clippy warning fails the run. Clippy covers
+  # x86_64 here; the NEON path is cfg-gated, so the aarch64 job clippies it.
   lint:
-    name: fmt + clippy (non-blocking)
+    name: fmt + clippy
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -35,10 +34,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: rustfmt
         run: cargo fmt --all --check
-        continue-on-error: true
       - name: clippy
-        run: cargo clippy --all-targets --locked
-        continue-on-error: true
+        run: cargo clippy --all-targets --locked -- -D warnings
 
   # ── Build → test → bench (the blocking pipeline) ───────────────────────────
   build-test-bench:
@@ -81,3 +78,37 @@ jobs:
       #    execute without panicking. Not a performance gate.
       - name: Benches (smoke run)
         run: cargo bench --locked
+
+  # ── aarch64: native ARM runner ─────────────────────────────────────────────
+  # Runs the suite where `simd::neon` is the dispatched kernel, so simd_parity
+  # actually exercises NEON against scalar (x86 never compiles that module).
+  # Also clippies it, since the x86 lint job cannot see aarch64-only code.
+  # No bench smoke run: build-test-bench already covers that on x86.
+  test-aarch64:
+    name: build · test (aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      # The arm64 runner image is younger than the x86 one; bootstrap rustup
+      # in case it is missing rather than depend on what the image ships.
+      - name: Install stable toolchain
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add clippy
+          rustc --version && cargo --version
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Build (all targets)
+        run: cargo build --all-targets --locked
+      - name: Test
+        run: cargo test --locked
+      - name: Doc tests
+        run: cargo test --doc --locked

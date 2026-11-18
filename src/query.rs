@@ -1953,7 +1953,10 @@ mod tests {
     #[test]
     fn a_where_clause_naming_an_unknown_column_is_a_bind_error() {
         let (_dir, db) = docs_db();
-        if db.execute("SELECT author FROM docs WHERE nope = 1;").is_ok() {
+        if db
+            .execute("SELECT author FROM docs WHERE nope = 1;")
+            .is_ok()
+        {
             panic!("an unknown column in WHERE must be refused");
         }
         db.close().unwrap();

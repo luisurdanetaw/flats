@@ -54,9 +54,7 @@ pub type ColumnId = u32;
 /// apart. Serde-transparent: a newtype struct serializes as its inner `usize`,
 /// so persisting these fields is wire-identical to the old raw `usize` — no
 /// format bump.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DeclarationOrdinal(usize);
 
 impl DeclarationOrdinal {
@@ -279,7 +277,9 @@ impl Schema {
             .filter(|c| matches!(c, ColumnSpec::Vector { .. }))
             .count();
         if vector_count != 1 {
-            return Err(Error::VectorColumnCount { found: vector_count });
+            return Err(Error::VectorColumnCount {
+                found: vector_count,
+            });
         }
 
         let mut columns = Vec::new();
@@ -433,10 +433,10 @@ impl Schema {
                 return Err(Error::IncompleteRow);
             }
             seen[*id as usize] = true;
-            if let Value::Float(f) = value {
-                if f.is_nan() {
-                    return Err(Error::NaNRejected { column: *id });
-                }
+            if let Value::Float(f) = value
+                && f.is_nan()
+            {
+                return Err(Error::NaNRejected { column: *id });
             }
         }
         Ok(())

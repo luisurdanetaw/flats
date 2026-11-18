@@ -985,11 +985,11 @@ impl Vm {
             return Ok(Arc::clone(set));
         }
         let id = db.collection_id(collection).map_err(ExecError::Engine)?;
-        let set = db.live_snapshot(id).ok_or(ExecError::Engine(
-            crate::Error::UnknownCollectionName {
-                name: collection.to_string(),
-            },
-        ))?;
+        let set =
+            db.live_snapshot(id)
+                .ok_or(ExecError::Engine(crate::Error::UnknownCollectionName {
+                    name: collection.to_string(),
+                }))?;
         self.live
             .borrow_mut()
             .insert(collection.to_string(), Arc::clone(&set));
@@ -998,11 +998,10 @@ impl Vm {
 
     fn metadata(&self, db: &Db, collection: &str) -> Result<meta::Reader, ExecError> {
         let id = db.collection_id(collection).map_err(ExecError::Engine)?;
-        db.metadata_reader(id).ok_or(ExecError::Engine(
-            crate::Error::UnknownCollectionName {
+        db.metadata_reader(id)
+            .ok_or(ExecError::Engine(crate::Error::UnknownCollectionName {
                 name: collection.to_string(),
-            },
-        ))
+            }))
     }
 
     /// Read a register as a metadata [`Value`] — a predicate's comparand.

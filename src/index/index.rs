@@ -190,7 +190,6 @@ impl FlatIndexInner {
             std::slice::from_raw_parts(p, floats)
         }
     }
-
 }
 
 /// Geometry helpers (independent of any handle).
@@ -207,7 +206,11 @@ fn bytes_for(dim: usize, capacity: usize) -> Result<usize> {
         .ok_or(Error::CapacityOverflow { dim, capacity })
 }
 fn slot_offset(slot: usize) -> usize {
-    if slot == 0 { SLOT0_OFFSET } else { SLOT1_OFFSET }
+    if slot == 0 {
+        SLOT0_OFFSET
+    } else {
+        SLOT1_OFFSET
+    }
 }
 
 /// Factory for the `(Writer, Reader)` pair. Holds no state itself.
@@ -474,7 +477,9 @@ impl Writer {
             Some(s) => s,
             None => return Ok(()),
         };
-        self.inner._mmap.flush_range(slot_offset(slot), SLOT_BYTES)?;
+        self.inner
+            ._mmap
+            .flush_range(slot_offset(slot), SLOT_BYTES)?;
         self.active_slot = slot;
         self.seq = seq;
         self.checkpoint_lsn = last_lsn;
@@ -701,13 +706,17 @@ fn crc32(bytes: &[u8]) -> u32 {
 // ---- little-endian primitives ----
 
 fn read_u32(buf: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(buf[offset..offset + 4].try_into().expect("4-byte read"))
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&buf[offset..offset + 4]);
+    u32::from_le_bytes(b)
 }
 fn write_u32(buf: &mut [u8], offset: usize, value: u32) {
     buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 fn read_u64(buf: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(buf[offset..offset + 8].try_into().expect("8-byte read"))
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&buf[offset..offset + 8]);
+    u64::from_le_bytes(b)
 }
 fn write_u64(buf: &mut [u8], offset: usize, value: u64) {
     buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
@@ -810,7 +819,11 @@ mod tests {
 
         // Refusal must not have touched the file — a failed open that resets
         // the index would destroy the only copy of the vectors.
-        assert_eq!(std::fs::read(&path).unwrap(), bytes, "open mutated the file");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "open mutated the file"
+        );
     }
 
     /// A retired row is still HERE — this index keeps the vector and has no
@@ -830,7 +843,9 @@ mod tests {
         // Retire ordinal 1 the only way it can now be retired — by leaving it
         // out of the snapshot.
         let live = bits(&[0]);
-        let hits = r.search_filtered(&[1.0, 0.0], 8, Some(&live), None).unwrap();
+        let hits = r
+            .search_filtered(&[1.0, 0.0], 8, Some(&live), None)
+            .unwrap();
         assert_eq!(ids(&hits), vec![0]);
 
         // ...and its vector is still readable, which is what lets a reader on an
@@ -904,7 +919,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = temp_path(&dir, "badmagic.bin");
         std::fs::write(&path, vec![0u8; 64]).unwrap();
-        assert!(matches!(FlatIndex::open(&path), Err(Error::BadMagic { .. })));
+        assert!(matches!(
+            FlatIndex::open(&path),
+            Err(Error::BadMagic { .. })
+        ));
     }
 
     // ---- vector_at --------------------------------------------------------
@@ -1027,7 +1045,9 @@ mod tests {
         // A snapshot that omits the two best matches. They are NOT tombstoned —
         // `search` must exclude them purely on the snapshot's say-so.
         let live = bits(&[2, 3]);
-        let filtered = r.search_filtered(&[1.0, 0.0], 4, Some(&live), None).unwrap();
+        let filtered = r
+            .search_filtered(&[1.0, 0.0], 4, Some(&live), None)
+            .unwrap();
         assert_eq!(ids(&filtered), vec![2, 3]);
         assert!(
             r.vector_at(Ordinal(0)).is_some(),
@@ -1037,7 +1057,11 @@ mod tests {
 
         // An empty snapshot admits nothing, however close the vectors are.
         let none: [u64; 0] = [];
-        assert!(r.search_filtered(&[1.0, 0.0], 4, Some(&none), None).unwrap().is_empty());
+        assert!(
+            r.search_filtered(&[1.0, 0.0], 4, Some(&none), None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The two prefilters compose: `k` counts rows that pass BOTH, and neither
@@ -1066,8 +1090,12 @@ mod tests {
         // With a snapshot covering everything, only the predicate bites — and
         // the result matches the predicate-only search exactly.
         let all_live = bits(&[0, 1, 2, 3]);
-        let a = r.search_filtered(&[1.0, 0.0], 4, Some(&all_live), Some(&allowed)).unwrap();
-        let b = r.search_filtered(&[1.0, 0.0], 4, None, Some(&allowed)).unwrap();
+        let a = r
+            .search_filtered(&[1.0, 0.0], 4, Some(&all_live), Some(&allowed))
+            .unwrap();
+        let b = r
+            .search_filtered(&[1.0, 0.0], 4, None, Some(&allowed))
+            .unwrap();
         assert_eq!(ids(&a), ids(&b));
         assert_eq!(ids(&a), vec![1, 2, 3]);
     }

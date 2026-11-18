@@ -421,7 +421,10 @@ impl Parser {
             // vectors — which no predicate can usefully compare, but rejecting
             // that HERE would mean the parser knowing what a comparison means.
             // The binder says so, in terms of the column's type.
-            Token::StrLit(_) | Token::Minus | Token::IntLit(_) | Token::FloatLit(_)
+            Token::StrLit(_)
+            | Token::Minus
+            | Token::IntLit(_)
+            | Token::FloatLit(_)
             | Token::LBracket => Ok(Expr::Literal(self.parse_literal()?)),
             Token::Eof => Err(self.error(ParseErrorKind::UnexpectedEof)),
             other => {
@@ -1207,7 +1210,8 @@ mod tests {
     #[test]
     fn search_takes_where_before_returning() {
         // Clause ORDER is fixed by the spec (CLAUDE.md §4).
-        let stmt = ok("SEARCH TOP 5 NEAREST TO [0.1, 0.2] FROM docs WHERE z < 2 RETURNING id, score;");
+        let stmt =
+            ok("SEARCH TOP 5 NEAREST TO [0.1, 0.2] FROM docs WHERE z < 2 RETURNING id, score;");
         let Statement::Search(search) = stmt else {
             panic!("expected a SEARCH");
         };

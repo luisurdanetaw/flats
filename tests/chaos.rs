@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flats::index::index::Ordinal;
 use flats::metadata::tuples::RowGet;
-use flats::{ColumnSpec, ColumnType, CollectionConfig, Db, DbOptions, RangeOp, Row, Schema, Value};
+use flats::{CollectionConfig, ColumnSpec, ColumnType, Db, DbOptions, RangeOp, Row, Schema, Value};
 
 /// xorshift64* — tiny, deterministic, good enough to drive the op stream.
 struct Rng(u64);
@@ -177,7 +177,11 @@ fn verify(db: &Db, model: &Model, query: &[f32]) {
         eprintln!("HISTORY (tail): {:?}", model.history);
         panic!(
             "search id set diverged: high_water={} k={} hits={} extra={:?} missing={:?}",
-            model.next_ordinal, k, hits.len(), extra, missing
+            model.next_ordinal,
+            k,
+            hits.len(),
+            extra,
+            missing
         );
     }
 
@@ -263,7 +267,9 @@ fn verify_metadata(db: &Db, model: &Model, rng: &mut Rng) {
         let pick = rng.below(model.live.len() as u64) as usize;
         let (&ord, row) = model.live.iter().nth(pick).unwrap();
         assert_eq!(
-            tuples.get(Ordinal(ord as u32), &[0, 1, 2]).expect("get live"),
+            tuples
+                .get(Ordinal(ord as u32), &[0, 1, 2])
+                .expect("get live"),
             RowGet::Live(vec![
                 Value::Int(row.a),
                 Value::Float(row.b),

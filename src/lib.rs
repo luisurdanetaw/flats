@@ -7,18 +7,22 @@
 //! ([`Db`], `insert`, `search`) lands in later milestones.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
+// No `unwrap()`/`expect()` in library code (CLAUDE.md §5): bubble a `Result`.
+// Tests are exempt. The few sites that genuinely cannot fail carry a local
+// `#[allow]` with the reason.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod compiler;
 pub mod engine;
 pub mod error;
 pub mod index;
-pub mod platform;
-pub mod simd;
-pub mod wal;
 pub mod metadata;
+pub mod platform;
+pub mod query;
+pub mod simd;
 pub mod sql;
 pub mod vm;
-pub mod compiler;
-pub mod query;
+pub mod wal;
 
 pub use crate::engine::cursor::Cursor;
 pub use crate::engine::{CollectionConfig, CompactionOptions, Db, DbOptions};
@@ -27,6 +31,6 @@ pub use crate::error::{Error, Result};
 // re-exported unqualified — `Error` above is the ENGINE's, and two types with
 // that name at the crate root would be exactly the confusion the stage-local
 // error split exists to prevent (CLAUDE.md §5).
-pub use crate::query::{Error as QueryError, RowStream};
 pub use crate::metadata::{ColumnSpec, ColumnType, RangeOp, Row, Schema, Value};
+pub use crate::query::{Error as QueryError, RowStream};
 pub use simd::dot;

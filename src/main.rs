@@ -909,7 +909,9 @@ mod tests {
         let mut table = Table::new(labels.iter().map(|s| s.to_string()).collect());
         for row in rows {
             let cells = row.iter().map(|s| s.to_string()).collect();
-            table.push(&mut out, cells).expect("a Vec never fails to write");
+            table
+                .push(&mut out, cells)
+                .expect("a Vec never fails to write");
         }
         table.finish(&mut out).expect("a Vec never fails to write");
         String::from_utf8(out).expect("output is utf-8")
@@ -1227,7 +1229,10 @@ mod tests {
                 .expect("a Vec never fails to write");
         }
         table
-            .push(&mut out, vec!["a much wider value".to_string(), "z".to_string()])
+            .push(
+                &mut out,
+                vec!["a much wider value".to_string(), "z".to_string()],
+            )
             .expect("a Vec never fails to write");
         table.finish(&mut out).expect("a Vec never fails to write");
 

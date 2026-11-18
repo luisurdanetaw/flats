@@ -96,7 +96,10 @@ fn concurrent_reads_never_torn_or_misindexed() {
     assert!(total > 0, "readers observed committed vectors");
     // Final consistency: everything the writer published is visible & correct.
     let final_len = reader.len();
-    assert_eq!(final_len, i, "reader sees exactly what the writer published");
+    assert_eq!(
+        final_len, i,
+        "reader sees exactly what the writer published"
+    );
 }
 
 #[test]

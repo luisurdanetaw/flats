@@ -33,16 +33,15 @@
 //! data types in `metadata::common` (`Record::Insert` carries the metadata
 //! row); the stores themselves are never imported here.
 
-
 use std::any::Any;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, OnceLock};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
 use roaring::RoaringBitmap;
@@ -53,7 +52,6 @@ use crate::metadata::common::{CollectionConfig, ColumnId, Value};
 // ---------------------------------------------------------------------------
 // Core types
 // ---------------------------------------------------------------------------
-
 
 /// Monotonic log sequence number. Assigned by the WAL thread, recorded in the
 /// frame, and returned to the writer on ack. Recovery resumes the counter from
@@ -154,7 +152,9 @@ pub enum Record {
     /// assigned on the logging side, like ordinals) so a dumb replay loop can
     /// materialize the collection with no catalog to consult. Apply is
     /// idempotent: if the id/name already exists, it's a no-op.
-    CreateCollection { config: CollectionConfig },
+    CreateCollection {
+        config: CollectionConfig,
+    },
     /// ONE STATEMENT, ONE RECORD (Phase 7): everything a `DELETE` or `UPDATE`
     /// changes, in a single frame with a single CRC behind a single fsync.
     ///
@@ -186,11 +186,11 @@ impl Record {
     ///
     /// Appends to `buf` rather than returning a fresh `Vec` so the commit loop
     /// can reuse one scratch buffer across the whole batch. Serializing our
-    /// plain data into an in-memory buffer has no fallible step (no IO, no size
-    /// cap), so a failure here is a logic bug, not a runtime condition.
-    fn encode(&self, buf: &mut Vec<u8>) {
-        bincode::serialize_into(buf, self)
-            .expect("Record serialization into an in-memory buffer cannot fail");
+    /// plain data into an in-memory buffer has no fallible step today (no IO,
+    /// no size cap), but the error is surfaced rather than unwrapped: the
+    /// commit loop fails the batch exactly as it would for a bad frame.
+    fn encode(&self, buf: &mut Vec<u8>) -> io::Result<()> {
+        bincode::serialize_into(buf, self).map_err(io::Error::other)
     }
 
     /// Inverse of `encode`. A malformed/garbage payload is a recoverable
@@ -393,6 +393,21 @@ fn write_frame(out: &mut impl Write, lsn: Lsn, payload: &[u8]) -> io::Result<()>
     Ok(())
 }
 
+/// Little-endian `u32` at `offset` of a fixed-size header buffer. Callers pass
+/// constant offsets inside the header, so the range is always in bounds.
+fn le_u32(buf: &[u8], offset: usize) -> u32 {
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&buf[offset..offset + 4]);
+    u32::from_le_bytes(b)
+}
+
+/// Little-endian `u64` at `offset`; see [`le_u32`].
+fn le_u64(buf: &[u8], offset: usize) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&buf[offset..offset + 8]);
+    u64::from_le_bytes(b)
+}
+
 // ---------------------------------------------------------------------------
 // Writer-facing handle
 // ---------------------------------------------------------------------------
@@ -419,9 +434,7 @@ enum Command {
     /// Run `Apply::checkpoint` on the commit thread (making the index durable),
     /// then truncate the log up to the watermark it returns. This keeps all
     /// index mutation on the single writer thread.
-    Checkpoint {
-        ack: Sender<io::Result<()>>,
-    },
+    Checkpoint { ack: Sender<io::Result<()>> },
     /// Run `Apply::control` on the commit thread, then truncate the log up to
     /// the watermark it returns.
     Control {
@@ -460,10 +473,7 @@ impl WalHandle {
     pub fn truncate(&self, up_to: u64) -> io::Result<()> {
         let (ack_tx, ack_rx) = mpsc::channel();
         self.tx
-            .send(Command::Truncate {
-                up_to,
-                ack: ack_tx,
-            })
+            .send(Command::Truncate { up_to, ack: ack_tx })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wal thread gone"))?;
         ack_rx
             .recv()
@@ -618,8 +628,7 @@ impl Wal {
                     loop_fail,
                     loop_poison,
                 )
-            })
-            .expect("spawn wal thread");
+            })?;
 
         Ok(Wal {
             handle: WalHandle { tx },
@@ -854,8 +863,10 @@ fn commit_batch<A: Apply>(
         assigned.push(lsn);
 
         payload.clear();
-        record.encode(payload);
-        if let Err(e) = write_frame(frame_buf, lsn, payload) {
+        if let Err(e) = record
+            .encode(payload)
+            .and_then(|()| write_frame(frame_buf, lsn, payload))
+        {
             frame_err = Some(e);
             break;
         }
@@ -934,18 +945,17 @@ fn truncate_wal(file: &mut File, path: &Path, up_to: u64) -> io::Result<()> {
         // Skip the file header (recovery validated it when this file was
         // opened); the temp file below gets a fresh copy.
         let mut file_header = [0u8; WAL_HEADER_BYTES];
-        match read_exact_or_eof(&mut reader, &mut file_header)? {
-            ReadOutcome::Full => {}
-            _ => {} // empty/short file: no frames to keep
-        }
+        // Either outcome is fine: an empty/short file has no frames to keep,
+        // and the frame loop below stops at the same EOF.
+        let _ = read_exact_or_eof(&mut reader, &mut file_header)?;
         loop {
             let mut header = [0u8; HEADER_BYTES];
             match read_exact_or_eof(&mut reader, &mut header)? {
                 ReadOutcome::Full => {}
                 _ => break, // clean EOF or torn tail: stop
             }
-            let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
-            let lsn = u64::from_le_bytes(header[8..16].try_into().unwrap());
+            let len = le_u32(&header, 0) as usize;
+            let lsn = le_u64(&header, 8);
             if len > MAX_FRAME_BYTES {
                 break; // impossible length: torn/corrupt tail, not an allocation
             }
@@ -1047,11 +1057,7 @@ fn recover<A: Apply>(path: &Path, applier: &mut A, skip_through: u64) -> io::Res
              into the indexes), then start this build",
         ));
     }
-    let version = u32::from_le_bytes(
-        file_header[4..8]
-            .try_into()
-            .expect("slice of fixed len 4"),
-    );
+    let version = le_u32(&file_header, 4);
     if !(WAL_MIN_VERSION..=WAL_VERSION).contains(&version) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1073,9 +1079,9 @@ fn recover<A: Apply>(path: &Path, applier: &mut A, skip_through: u64) -> io::Res
             ReadOutcome::Full => {}
         }
 
-        let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
-        let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
-        let lsn = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        let len = le_u32(&header, 0) as usize;
+        let crc = le_u32(&header, 4);
+        let lsn = le_u64(&header, 8);
 
         // A length no writer could have produced is corruption, and sizing a
         // buffer from it would turn one bad byte into a 4 GiB allocation.
@@ -1270,7 +1276,10 @@ mod tests {
     impl Apply for CollectingApplier {
         fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<Outcome> {
             if self.fail_at == Some(lsn.0) {
-                return Err(io::Error::other(format!("injected apply failure at {}", lsn.0)));
+                return Err(io::Error::other(format!(
+                    "injected apply failure at {}",
+                    lsn.0
+                )));
             }
             if self.conflict_at == Some(lsn.0) {
                 return Ok(Outcome::Conflicted);
@@ -1358,7 +1367,11 @@ mod tests {
         assert_eq!(next.lsn, Lsn(3));
         assert_eq!(next.outcome, Outcome::Applied);
         assert_eq!(
-            applier.snapshot().iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            applier
+                .snapshot()
+                .iter()
+                .map(|(l, _)| *l)
+                .collect::<Vec<_>>(),
             vec![1, 3],
             "the stale record was never folded in"
         );
@@ -1537,7 +1550,10 @@ mod tests {
         assert_eq!(decoded.0, dense);
 
         // Sparse and empty are the other two shapes the record carries.
-        for set in [RoaringBitmap::new(), (0..50_000u32).map(|i| i * 977).collect()] {
+        for set in [
+            RoaringBitmap::new(),
+            (0..50_000u32).map(|i| i * 977).collect(),
+        ] {
             let round: Bitmap =
                 bincode::deserialize(&bincode::serialize(&Bitmap(set.clone())).unwrap()).unwrap();
             assert_eq!(round.0, set);
@@ -1577,7 +1593,7 @@ mod tests {
         ];
         for (record, tag) in cases {
             let mut buf = Vec::new();
-            record.encode(&mut buf);
+            record.encode(&mut buf).unwrap();
             // bincode writes the variant index as a u32 LE prefix.
             assert_eq!(
                 u32::from_le_bytes(buf[0..4].try_into().unwrap()),
@@ -1627,7 +1643,7 @@ mod tests {
             bytes.extend_from_slice(&version.to_le_bytes());
             for (i, rec) in records.iter().enumerate() {
                 let mut payload = Vec::new();
-                rec.encode(&mut payload);
+                rec.encode(&mut payload).unwrap();
                 write_frame(&mut bytes, Lsn(i as u64 + 1), &payload).unwrap();
             }
             std::fs::write(&path, &bytes).unwrap();
@@ -1670,7 +1686,7 @@ mod tests {
         // One good frame first, to prove recovery keeps everything before the
         // garbage rather than discarding the whole log.
         let mut payload = Vec::new();
-        insert(0, 0, &[1.0]).encode(&mut payload);
+        insert(0, 0, &[1.0]).encode(&mut payload).unwrap();
         write_frame(&mut bytes, Lsn(1), &payload).unwrap();
         // Then a header claiming a preposterous payload.
         bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // len
@@ -1681,7 +1697,11 @@ mod tests {
         let applier = CollectingApplier::new();
         let wal = Wal::start(&path, applier.clone(), 0).unwrap();
         let seen = applier.snapshot();
-        assert_eq!(seen.len(), 1, "the good frame survives the garbage that follows");
+        assert_eq!(
+            seen.len(),
+            1,
+            "the good frame survives the garbage that follows"
+        );
         assert_eq!(seen[0].0, 1);
         wal.shutdown();
     }
@@ -1722,7 +1742,7 @@ mod tests {
             },
         ] {
             let mut buf = Vec::new();
-            record.encode(&mut buf);
+            record.encode(&mut buf).unwrap();
             let decoded = Record::decode(&buf).expect("decode clean payload");
             assert_eq!(record, decoded);
         }
@@ -1772,7 +1792,7 @@ mod tests {
             },
         ] {
             let mut buf = Vec::new();
-            record.encode(&mut buf);
+            record.encode(&mut buf).unwrap();
             let decoded = Record::decode(&buf).expect("decode clean payload");
             assert_eq!(record, decoded);
         }
@@ -1891,7 +1911,10 @@ mod tests {
             Ok(_) => panic!("bad magic must refuse, not misdecode"),
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("FWAL"), "error names the header: {err}");
+        assert!(
+            err.to_string().contains("FWAL"),
+            "error names the header: {err}"
+        );
     }
 
     #[test]
@@ -1907,7 +1930,10 @@ mod tests {
             Ok(_) => panic!("future version must refuse cleanly"),
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("99"), "error names the version: {err}");
+        assert!(
+            err.to_string().contains("99"),
+            "error names the version: {err}"
+        );
     }
 
     #[test]
@@ -1946,5 +1972,3 @@ mod tests {
         wal.shutdown();
     }
 }
-
-

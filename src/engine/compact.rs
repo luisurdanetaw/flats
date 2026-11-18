@@ -681,7 +681,11 @@ pub(super) struct Compactor {
 }
 
 impl Compactor {
-    pub(super) fn spawn(shared: Arc<Shared>, wal: WalHandle, interval: Duration) -> Compactor {
+    pub(super) fn spawn(
+        shared: Arc<Shared>,
+        wal: WalHandle,
+        interval: Duration,
+    ) -> io::Result<Compactor> {
         let (nudge, rx) = mpsc::channel::<u32>();
         let opts = shared.opts;
         let join = std::thread::Builder::new()
@@ -704,9 +708,8 @@ impl Compactor {
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
                 }
-            })
-            .expect("spawn compactor thread");
-        Compactor { nudge, join, opts }
+            })?;
+        Ok(Compactor { nudge, join, opts })
     }
 
     /// Called by a write that allocated ordinals `[from, to)`: wake the
@@ -1064,8 +1067,7 @@ mod tests {
             let wal = db.wal_handle().unwrap();
             let coll = catalog_snapshot(&shared.catalog).get(&0).cloned().unwrap();
             let live_x = coll.live.resolve();
-            let (writers, collection) =
-                build(&shared.dir, &coll, &live_x, &shared.stop).unwrap();
+            let (writers, collection) = build(&shared.dir, &coll, &live_x, &shared.stop).unwrap();
             drop(coll);
             {
                 let _closed = shared.gate.close();

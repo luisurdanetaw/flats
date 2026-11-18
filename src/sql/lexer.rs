@@ -618,7 +618,10 @@ mod tests {
             ]
         );
         // Same case-insensitivity every other keyword gets.
-        assert_eq!(lex("where and or"), vec![Token::Where, Token::And, Token::Or]);
+        assert_eq!(
+            lex("where and or"),
+            vec![Token::Where, Token::And, Token::Or]
+        );
     }
 
     #[test]
@@ -647,12 +650,10 @@ mod tests {
         // ... but a bare `<` followed by something else is still just `<`.
         assert_eq!(lex("a<1"), vec![ident("a"), Token::Lt, Token::IntLit(1)]);
         // `<` then a SPACE then `=` is two tokens, not `<=`.
-        assert_eq!(lex("a < = 1"), vec![
-            ident("a"),
-            Token::Lt,
-            Token::Eq,
-            Token::IntLit(1)
-        ]);
+        assert_eq!(
+            lex("a < = 1"),
+            vec![ident("a"), Token::Lt, Token::Eq, Token::IntLit(1)]
+        );
     }
 
     #[test]
