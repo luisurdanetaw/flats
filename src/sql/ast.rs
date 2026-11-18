@@ -56,6 +56,21 @@ pub enum Statement {
     Update(UpdateStmt),
     /// `DROP COLLECTION name`
     DropCollection(DropStmt),
+    /// A statement with a row window: `… LIMIT n [OFFSET m]` or `… OFFSET m`.
+    ///
+    /// A WRAPPER rather than fields on [`SelectStmt`]: the inner statement is
+    /// exactly the one written without the window, so every stage that knows
+    /// statements keeps the shape it always had, and the window is applied to
+    /// the result stream by the query layer. Only a SELECT takes one; a
+    /// SEARCH says how many rows it wants with `TOP k`.
+    Limited {
+        /// The statement the window applies to.
+        statement: Box<Statement>,
+        /// At most this many rows; `None` for no cap (an `OFFSET` alone).
+        limit: Option<u64>,
+        /// Skip this many rows first.
+        offset: u64,
+    },
 }
 
 /// `DROP COLLECTION name`.

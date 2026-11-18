@@ -652,6 +652,9 @@ pub fn analyze(stmt: Statement, catalog: &impl Catalog) -> Result<BoundStatement
         Statement::Search(s) => bind_search(s, catalog).map(BoundStatement::Search),
         Statement::Delete(d) => bind_delete(d, catalog).map(BoundStatement::Delete),
         Statement::Update(u) => bind_update(u, catalog).map(BoundStatement::Update),
+        // The query layer unwraps a window before binding and applies it to
+        // the result stream; binding sees the statement inside it.
+        Statement::Limited { statement, .. } => analyze(*statement, catalog),
         Statement::DropCollection(d) => {
             if catalog.get_collection(&d.name).is_none() {
                 return Err(BindError::CollectionNotFound(d.name));

@@ -67,6 +67,7 @@ extern "C" {
 typedef struct flats_db     flats_db;
 typedef struct flats_result flats_result;
 typedef struct flats_batch  flats_batch;
+typedef struct flats_cursor flats_cursor;
 
 /* ---- library ----------------------------------------------------------- */
 
@@ -127,6 +128,37 @@ typedef struct flats_param {
  * when n is 0. */
 int flats_execute_params(flats_db *db, const char *sql, const flats_param *params, size_t n,
                          flats_result **out);
+
+/* ---- cursors -------------------------------------------------------------
+ *
+ * flats_execute collects every row into one result. For a large read, stream
+ * it instead: flats_query runs the statement and returns a cursor, and each
+ * flats_cursor_next hands back the next chunk of at most max_rows rows as an
+ * ordinary flats_result (same accessors, same column names in every chunk). A
+ * chunk with 0 rows means the cursor is exhausted. Rows are read from storage
+ * as they are pulled, so memory stays bounded by the chunk size.
+ *
+ *   flats_cursor *cur;
+ *   flats_query(db, "SELECT id, title FROM docs WHERE year > ?;", p, 1, &cur);
+ *   for (;;) {
+ *       flats_result *chunk;
+ *       if (flats_cursor_next(cur, 1000, &chunk) != FLATS_OK) break;
+ *       size_t n = flats_result_row_count(chunk);
+ *       ...                                  // read rows 0..n
+ *       flats_result_free(chunk);
+ *       if (n == 0) break;
+ *   }
+ *   flats_cursor_free(cur);
+ *
+ * The cursor reads ONE snapshot: rows written after flats_query returns are
+ * not in it. Like a result, it does not depend on its flats_db once made. A
+ * write statement runs at flats_query and yields an exhausted cursor.
+ */
+int flats_query(flats_db *db, const char *sql, const flats_param *params, size_t n,
+                flats_cursor **out);
+/* The next chunk: at most max_rows (>= 1) rows; 0 rows when exhausted. */
+int flats_cursor_next(flats_cursor *cur, size_t max_rows, flats_result **out);
+void flats_cursor_free(flats_cursor *cur);
 
 /* Write a consistent copy of the database into directory `dest`, which must
  * not exist or must be empty. Restore by opening `dest`. */

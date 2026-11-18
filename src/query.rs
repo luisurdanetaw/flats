@@ -81,6 +81,25 @@ pub struct RowStream {
     vm: Vm,
     /// Set on `Halt` or on an error, so iteration cannot restart or re-error.
     done: bool,
+    /// The statement's `LIMIT`/`OFFSET`, applied as rows are pulled — so a
+    /// `LIMIT 10` stops the scan after ten rows instead of reading them all.
+    window: Window,
+}
+
+/// What is left of a `LIMIT n OFFSET m` as a stream is consumed.
+#[derive(Debug, Clone, Copy)]
+struct Window {
+    /// Rows still to skip before the first one returned.
+    skip: u64,
+    /// Rows still allowed out; `None` for no cap.
+    remaining: Option<u64>,
+}
+
+impl Window {
+    const ALL: Window = Window {
+        skip: 0,
+        remaining: None,
+    };
 }
 
 impl RowStream {
@@ -90,6 +109,7 @@ impl RowStream {
             labels,
             vm,
             done: false,
+            window: Window::ALL,
         }
     }
 
@@ -100,6 +120,7 @@ impl RowStream {
             labels: Vec::new(),
             vm: Vm::halted(),
             done: true,
+            window: Window::ALL,
         }
     }
 
@@ -125,6 +146,28 @@ impl Iterator for RowStream {
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
             return None;
+        }
+        // The cap is checked BEFORE pulling, so a satisfied LIMIT never reads
+        // the row after its last.
+        if self.window.remaining == Some(0) {
+            self.done = true;
+            return None;
+        }
+        while self.window.skip > 0 {
+            match self.vm.resume() {
+                Ok(Some(_)) => self.window.skip -= 1,
+                Ok(None) => {
+                    self.done = true;
+                    return None;
+                }
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e.into()));
+                }
+            }
+        }
+        if let Some(n) = &mut self.window.remaining {
+            *n -= 1;
         }
         match self.vm.resume() {
             Ok(Some(row)) => Some(Ok(row)),
@@ -277,6 +320,23 @@ impl Db {
         // 1. PARSE (lexing included — the parser wraps lex errors), with the
         //    parameters substituted between the two.
         let statement = parse_with_params(sql, params).map_err(Error::Parse)?;
+        // A row window belongs to the result stream, not to the statement the
+        // rest of the pipeline sees: unwrap it here and apply it as rows are
+        // pulled.
+        let (statement, window) = match statement {
+            Statement::Limited {
+                statement,
+                limit,
+                offset,
+            } => (
+                *statement,
+                Window {
+                    skip: offset,
+                    remaining: limit,
+                },
+            ),
+            statement => (statement, Window::ALL),
+        };
         // The compiler needs the TARGET collection's storage schema, and only
         // the statement says which collection that is — read it before `analyze`
         // consumes the statement.
@@ -392,7 +452,9 @@ impl Db {
                 let opened = vm.open_cursors(self);
                 if self.epoch().unchanged(seen) {
                     opened?;
-                    return Ok(RowStream::over(labels, vm));
+                    let mut stream = RowStream::over(labels, vm);
+                    stream.window = window;
+                    return Ok(stream);
                 }
                 vm = Vm::new(program.clone())?;
             }
@@ -433,6 +495,8 @@ impl Target {
             Statement::Search(s) => Target::Existing(s.collection.clone()),
             // A DELETE's predicate is resolved against the collection it names.
             Statement::Delete(d) => Target::Existing(d.from.clone()),
+            // A window changes which rows come back, not where they come from.
+            Statement::Limited { statement, .. } => Target::of(statement),
             // An UPDATE reads and rewrites rows of the collection it names.
             Statement::Update(u) => Target::Existing(u.collection.clone()),
             // A DROP names an existing collection; its schema is not read, but

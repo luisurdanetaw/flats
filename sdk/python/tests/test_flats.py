@@ -178,6 +178,44 @@ class TestSearch(Base):
             self.db.search("docs", [float("nan"), 0, 0], k=1)
 
 
+class TestStreaming(Base):
+    def setUp(self):
+        super().setUp()
+        self.db.insert(
+            "docs",
+            [{"id": f"d{i:04}", "vector": [1.0, 0.0, 0.0], "year": i, "score": 0.0} for i in range(2500)],
+        )
+
+    def test_query_streams_every_row_lazily(self):
+        everything = list(self.db.execute("SELECT id, year FROM docs;"))
+        cur = self.db.query("SELECT id, year FROM docs;", chunk_rows=300)
+        self.assertEqual(cur.columns, ("id", "year"))
+        self.assertEqual(list(cur), everything)
+        self.assertEqual(list(cur), [], "exhausted stays exhausted")
+
+    def test_query_takes_parameters_and_limit(self):
+        rows = list(self.db.query("SELECT id FROM docs WHERE year >= ? LIMIT ? OFFSET ?;", [100, 5, 10]))
+        self.assertEqual(len(rows), 5)
+
+    def test_query_can_be_abandoned_and_closed(self):
+        with self.db.query("SELECT id FROM docs;", chunk_rows=10) as cur:
+            first = next(iter(cur))
+            self.assertEqual(len(first), 1)
+        self.assertTrue(cur.closed)
+        self.assertEqual(list(cur), [])
+
+    def test_query_errors_raise_at_the_call(self):
+        with self.assertRaises(flats.QueryError):
+            self.db.query("SELECT nope FROM docs;")
+        with self.assertRaises(ValueError):
+            self.db.query("SELECT id FROM docs;", chunk_rows=0)
+
+    def test_limit_and_offset_through_execute(self):
+        all_ids = [r[0] for r in self.db.execute("SELECT id FROM docs;")]
+        page = [r[0] for r in self.db.execute("SELECT id FROM docs LIMIT 10 OFFSET 20;")]
+        self.assertEqual(page, all_ids[20:30])
+
+
 class TestLifecycle(unittest.TestCase):
     def test_context_manager_closes_and_data_survives(self):
         with tempfile.TemporaryDirectory() as d:

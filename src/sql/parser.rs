@@ -96,6 +96,11 @@ pub enum ParseErrorKind {
         /// What is wrong with it.
         reason: String,
     },
+    /// A `LIMIT` or `OFFSET` below zero (only a parameter can be).
+    NegativeWindow {
+        /// `"LIMIT"` or `"OFFSET"`.
+        what: &'static str,
+    },
     /// Input remained after a complete statement + its `;`.
     TrailingTokens,
     /// Input ended while a rule still expected more tokens.
@@ -137,6 +142,9 @@ impl fmt::Display for ParseError {
             ),
             ParseErrorKind::InvalidParam { index, reason } => {
                 write!(f, "parameter {} (for `?` #{}) {reason}", index, index + 1)
+            }
+            ParseErrorKind::NegativeWindow { what } => {
+                write!(f, "{what} at byte {} must not be negative", self.span.start)
             }
             ParseErrorKind::TrailingTokens => {
                 write!(f, "unexpected trailing tokens at byte {}", self.span.start)
@@ -370,7 +378,10 @@ impl Parser {
     /// `statement := (select | insert | create | search | delete | update) ';'`
     pub fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         let stmt = match self.peek() {
-            Token::Select => Statement::Select(self.parse_select()?),
+            Token::Select => {
+                let select = Statement::Select(self.parse_select()?);
+                self.parse_window(select)?
+            }
             Token::Insert => self.parse_insert_statement()?,
             Token::Create => Statement::CreateCollection(self.parse_create()?),
             Token::Search => Statement::Search(self.parse_search()?),
@@ -462,6 +473,42 @@ impl Parser {
     /// `where := WHERE expr` — the whole clause, absent when the keyword is not
     /// there. Shared by every statement that takes a predicate, so `SELECT` and
     /// `SEARCH` cannot end up accepting different expression grammars.
+    /// `window := [LIMIT int] [OFFSET int]` — wraps `statement` when either is
+    /// present. LIMIT comes first, as in SQL.
+    fn parse_window(&mut self, statement: Statement) -> Result<Statement, ParseError> {
+        let limit = if *self.peek() == Token::Limit {
+            self.advance();
+            Some(self.expect_count("LIMIT")?)
+        } else {
+            None
+        };
+        let offset = if *self.peek() == Token::Offset {
+            self.advance();
+            Some(self.expect_count("OFFSET")?)
+        } else {
+            None
+        };
+        Ok(match (limit, offset) {
+            (None, None) => statement,
+            (limit, offset) => Statement::Limited {
+                statement: Box::new(statement),
+                limit,
+                offset: offset.unwrap_or(0),
+            },
+        })
+    }
+
+    /// A non-negative integer for `LIMIT`/`OFFSET`. A literal can't be
+    /// negative here (the grammar has no sign), but a parameter can.
+    fn expect_count(&mut self, what: &'static str) -> Result<u64, ParseError> {
+        let at = self.pos;
+        let n = self.expect_int()?;
+        u64::try_from(n).map_err(|_| ParseError {
+            kind: ParseErrorKind::NegativeWindow { what },
+            span: self.tokens[at].span,
+        })
+    }
+
     fn parse_where(&mut self) -> Result<Option<Expr>, ParseError> {
         if *self.peek() != Token::Where {
             return Ok(None);
@@ -2055,5 +2102,74 @@ mod tests {
         let src = "SELECT id FROM docs WHERE a = 1 ?;";
         let e = with_err(src, &[Param::Int(1)]);
         assert_eq!(&src[e.span.start..e.span.end], "?");
+    }
+
+    // -- LIMIT / OFFSET ---------------------------------------------------------
+    //
+    // A SELECT may end `LIMIT n [OFFSET m]` or `OFFSET m`. The statement is
+    // wrapped, not changed: `Statement::Limited` holds the plain SELECT it
+    // would have been, so everything downstream sees the shape it always did.
+
+    #[test]
+    fn limit_and_offset_wrap_the_select() {
+        let plain = ok("SELECT id FROM docs WHERE n > 1;");
+        assert_eq!(
+            ok("SELECT id FROM docs WHERE n > 1 LIMIT 10 OFFSET 20;"),
+            Statement::Limited {
+                statement: Box::new(plain.clone()),
+                limit: Some(10),
+                offset: 20,
+            }
+        );
+        assert_eq!(
+            ok("SELECT id FROM docs WHERE n > 1 LIMIT 10;"),
+            Statement::Limited {
+                statement: Box::new(plain.clone()),
+                limit: Some(10),
+                offset: 0,
+            }
+        );
+        assert_eq!(
+            ok("SELECT id FROM docs WHERE n > 1 OFFSET 5;"),
+            Statement::Limited {
+                statement: Box::new(plain),
+                limit: None,
+                offset: 5,
+            }
+        );
+        // Case-insensitive, and parameters work like any integer.
+        assert_eq!(
+            with("select * from docs limit ? offset ?;", &[Param::Int(3), Param::Int(4)]),
+            Statement::Limited {
+                statement: Box::new(ok("SELECT * FROM docs;")),
+                limit: Some(3),
+                offset: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn a_select_without_a_window_is_unchanged() {
+        assert!(matches!(ok("SELECT id FROM docs;"), Statement::Select(_)));
+    }
+
+    #[test]
+    fn malformed_windows_are_errors() {
+        for src in [
+            "SELECT id FROM docs LIMIT;",
+            "SELECT id FROM docs LIMIT 'x';",
+            "SELECT id FROM docs LIMIT 1.5;",
+            "SELECT id FROM docs LIMIT -1;",
+            "SELECT id FROM docs OFFSET 1 LIMIT 2;",
+            "SELECT id FROM docs LIMIT 1 LIMIT 2;",
+            "SELECT id FROM docs LIMIT 1 WHERE n = 1;",
+            // A SEARCH already says how many rows: TOP k.
+            "SEARCH TOP 5 NEAREST TO [1] FROM docs LIMIT 2;",
+        ] {
+            err(src);
+        }
+        // A negative count arriving as a parameter is refused by name.
+        let e = with_err("SELECT id FROM docs LIMIT ?;", &[Param::Int(-1)]);
+        assert!(matches!(e.kind, ParseErrorKind::NegativeWindow { .. }), "{e:?}");
     }
 }

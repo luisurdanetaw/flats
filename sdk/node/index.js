@@ -97,6 +97,64 @@ class Result {
   }
 }
 
+/**
+ * The rows of one statement, read lazily in chunks — see Database#iterate.
+ * Iterate it once (`for…of`, spread, or `next()`); breaking out of a loop, or
+ * `close()`, releases it early. `columns` is known before the first row.
+ */
+class RowIterator {
+  constructor(cursor, chunkRows) {
+    this._cursor = cursor;
+    this._chunkRows = chunkRows;
+    this._buffer = [];
+    this._at = 0;
+    this._fill();
+  }
+
+  _fill() {
+    const [columns, rows] = call(native.cursorNext, this._cursor, this._chunkRows);
+    this.columns = columns;
+    this._buffer = rows;
+    this._at = 0;
+    if (rows.length === 0) this._release();
+  }
+
+  get closed() {
+    return this._cursor === null;
+  }
+
+  /** Release the cursor. Idempotent; iteration then simply ends. */
+  close() {
+    this._buffer = [];
+    this._at = 0;
+    this._release();
+  }
+
+  _release() {
+    const cursor = this._cursor;
+    this._cursor = null;
+    if (cursor) native.cursorFree(cursor);
+  }
+
+  next() {
+    for (;;) {
+      if (this._at < this._buffer.length) return { value: this._buffer[this._at++], done: false };
+      if (this._cursor === null) return { value: undefined, done: true };
+      this._fill();
+    }
+  }
+
+  /** Called by `for…of` on `break`/`throw`: release early. */
+  return() {
+    this.close();
+    return { value: undefined, done: true };
+  }
+
+  [Symbol.iterator]() {
+    return this;
+  }
+}
+
 // -- names --------------------------------------------------------------------
 
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -150,6 +208,20 @@ class Database {
     if (!Array.isArray(params)) throw new TypeError('params must be an array');
     const [columns, rows] = call(native.execute, this._handle(), sql, params);
     return new Result(columns, rows);
+  }
+
+  /**
+   * Run one V-SQL statement and iterate its rows lazily: they are read from
+   * storage `chunkRows` at a time as you go, so memory stays flat however
+   * many there are. The iterator reads one snapshot — rows written after this
+   * call are not in it. Use it for large reads; execute() collects everything.
+   */
+  iterate(sql, params = [], { chunkRows = 1000 } = {}) {
+    if (typeof sql !== 'string') throw new TypeError('sql must be a string');
+    if (!Array.isArray(params)) throw new TypeError('params must be an array');
+    if (!Number.isInteger(chunkRows) || chunkRows < 1) throw new RangeError('chunkRows must be a positive integer');
+    const cursor = call(native.query, this._handle(), sql, params);
+    return new RowIterator(cursor, chunkRows);
   }
 
   /**
@@ -212,6 +284,7 @@ function version() {
 module.exports = {
   Database,
   Result,
+  RowIterator,
   FlatsError,
   InvalidArgumentError,
   QueryError,

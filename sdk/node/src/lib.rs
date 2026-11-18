@@ -508,6 +508,19 @@ struct BatchHandle {
     batch: *mut flats_batch,
 }
 
+struct CursorHandle {
+    cursor: *mut flats_cursor,
+}
+
+unsafe extern "C" fn finalize_cursor(_env: napi_env, data: *mut c_void, _hint: *mut c_void) {
+    // SAFETY: `data` is the `Box<CursorHandle>` from `js_query`; runs once.
+    let handle = unsafe { Box::from_raw(data as *mut CursorHandle) };
+    if !handle.cursor.is_null() {
+        // SAFETY: a live cursor that `cursorFree` never released.
+        unsafe { flats_cursor_free(handle.cursor) };
+    }
+}
+
 unsafe extern "C" fn finalize_db(_env: napi_env, data: *mut c_void, _hint: *mut c_void) {
     // SAFETY: `data` is the `Box<DbHandle>` this addon created in `open`;
     // N-API runs the finalizer once.
@@ -804,6 +817,74 @@ unsafe fn result_to_js(env: napi_env, res: *const flats_result) -> Js<napi_value
     }
 }
 
+/// `query(handle, sql, params?) -> cursor`
+unsafe extern "C" fn js_query(env: napi_env, info: napi_callback_info) -> napi_value {
+    // SAFETY: see the section note.
+    unsafe {
+        run(env, || {
+            let [h, sql, params] = args::<3>(env, info)?;
+            let db = db_of(env, h)?;
+            let sql = get_cstring(env, sql, "sql")?;
+            let owned = get_params(env, params)?;
+            let c_params: Vec<flats_param> = owned.iter().map(OwnedParam::as_c).collect();
+            let mut cursor = ptr::null_mut();
+            check(flats_query(
+                db,
+                sql.as_ptr(),
+                c_params.as_ptr(),
+                c_params.len(),
+                &mut cursor,
+            ))?;
+            let handle = Box::into_raw(Box::new(CursorHandle { cursor })) as *mut c_void;
+            external(env, handle, finalize_cursor)
+        })
+    }
+}
+
+/// `cursorNext(cursor, maxRows) -> [columns, rows]` — no rows when exhausted.
+unsafe extern "C" fn js_cursor_next(env: napi_env, info: napi_callback_info) -> napi_value {
+    // SAFETY: see the section note.
+    unsafe {
+        run(env, || {
+            let [c, max] = args::<2>(env, info)?;
+            let handle = get_external::<CursorHandle>(env, c, "cursor")?;
+            let cursor = (*handle).cursor;
+            if cursor.is_null() {
+                return Err(Throw::Flats(
+                    FLATS_ERR_INVALID_ARGUMENT,
+                    "cursor is closed".into(),
+                ));
+            }
+            let max = get_f64(env, max)?;
+            if max.fract() != 0.0 || max < 1.0 {
+                return Err(Throw::Flats(
+                    FLATS_ERR_INVALID_ARGUMENT,
+                    "maxRows must be a positive integer".into(),
+                ));
+            }
+            let mut res = ptr::null_mut();
+            check(flats_cursor_next(cursor, max as usize, &mut res))?;
+            let out = result_to_js(env, res);
+            flats_result_free(res);
+            out
+        })
+    }
+}
+
+/// `cursorFree(cursor)` — idempotent.
+unsafe extern "C" fn js_cursor_free(env: napi_env, info: napi_callback_info) -> napi_value {
+    // SAFETY: see the section note.
+    unsafe {
+        run(env, || {
+            let [c] = args::<1>(env, info)?;
+            let handle = get_external::<CursorHandle>(env, c, "cursor")?;
+            let cursor = std::mem::replace(&mut (*handle).cursor, ptr::null_mut());
+            flats_cursor_free(cursor);
+            undefined(env)
+        })
+    }
+}
+
 /// `backup(handle, dest)`
 unsafe extern "C" fn js_backup(env: napi_env, info: napi_callback_info) -> napi_value {
     // SAFETY: see the section note.
@@ -971,7 +1052,10 @@ unsafe extern "C" fn js_batch_free(env: napi_env, info: napi_callback_info) -> n
 /// Called by Node with a live `env` and the module's `exports` object.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn napi_register_module_v1(env: napi_env, exports: napi_value) -> napi_value {
-    let functions: [(&str, napi_callback); 11] = [
+    let functions: [(&str, napi_callback); 14] = [
+        ("query", js_query),
+        ("cursorNext", js_cursor_next),
+        ("cursorFree", js_cursor_free),
         ("version", js_version),
         ("open", js_open),
         ("close", js_close),

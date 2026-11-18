@@ -156,6 +156,28 @@ Cells are numbers, strings, arrays of numbers (vectors), or `BigInt` for an
 INT too large to be a JS number exactly. Write statements return an empty
 `Result`.
 
+### Large reads: `iterate` streams
+
+`execute` collects every row into memory. For a read that might be big, use
+`iterate`, which reads rows from storage as you go, 1,000 at a time by
+default:
+
+```js
+const rows = db.iterate('SELECT doc_id, vector FROM docs WHERE published >= ?;', [2020]);
+console.log(rows.columns);              // known before the first row
+for (const [docId, vector] of rows) {
+  exportRow(docId, vector);             // `break` releases the cursor early
+}
+```
+
+Memory stays flat however many rows there are. An iterator sees one
+snapshot: rows written after `iterate` returns aren't in it. To page instead,
+use `LIMIT` and `OFFSET`:
+
+```js
+const page = db.execute('SELECT doc_id FROM docs LIMIT ? OFFSET ?;', [100, 300]);
+```
+
 ## Passing values: always use parameters
 
 Never build a statement by pasting values into the SQL string. Write `?`

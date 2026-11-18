@@ -158,6 +158,28 @@ res.dicts()          # [{'doc_id': 'd17', 'published': 2021}, ...]
 Cells are `int`, `float`, `str`, or `list[float]` for a vector. Write
 statements return an empty `Result`.
 
+### Large reads: `query` streams
+
+`execute` collects every row into memory. For a read that might be big, use
+`query`, which returns a `flats.Cursor` that reads rows from storage as you
+iterate, 1,000 at a time by default:
+
+```python
+with db.query("SELECT doc_id, vector FROM docs WHERE published >= ?;", [2020]) as cur:
+    print(cur.columns)                 # known before the first row
+    for doc_id, vector in cur:
+        export(doc_id, vector)
+```
+
+Memory stays flat however many rows there are. A cursor sees one snapshot:
+rows written after `query` returns aren't in it. Leaving the `with` block, or
+calling `cur.close()`, releases it early. To page instead, use `LIMIT` and
+`OFFSET`:
+
+```python
+page = db.execute("SELECT doc_id FROM docs LIMIT ? OFFSET ?;", [100, 300])
+```
+
 ## Passing values: always use parameters
 
 Never build a statement by pasting values into the SQL string. Write `?`

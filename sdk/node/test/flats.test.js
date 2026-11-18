@@ -364,3 +364,51 @@ describe('locking', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe('streaming', () => {
+  let dir, db;
+  beforeEach(() => {
+    dir = tmpdir();
+    db = new flats.Database(path.join(dir, 'db'));
+    db.execute(SCHEMA);
+    db.insert('docs', Array.from({ length: 2500 }, (_, i) => ({ id: `d${String(i).padStart(4, '0')}`, vector: [1, 0, 0], year: i, score: 0 })));
+  });
+  afterEach(() => {
+    db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('iterate streams every row lazily', () => {
+    const everything = db.execute('SELECT id, year FROM docs;').rows;
+    const it = db.iterate('SELECT id, year FROM docs;', [], { chunkRows: 300 });
+    assert.deepEqual(it.columns, ['id', 'year']);
+    assert.deepEqual([...it], everything);
+    assert.deepEqual([...it], [], 'exhausted stays exhausted');
+  });
+
+  test('iterate takes parameters and a limit', () => {
+    const rows = [...db.iterate('SELECT id FROM docs WHERE year >= ? LIMIT ? OFFSET ?;', [100, 5, 10])];
+    assert.equal(rows.length, 5);
+  });
+
+  test('breaking out of a loop releases the cursor', () => {
+    const it = db.iterate('SELECT id FROM docs;', [], { chunkRows: 10 });
+    for (const row of it) {
+      assert.equal(row.length, 1);
+      break;
+    }
+    assert.equal(it.closed, true);
+    assert.deepEqual([...it], []);
+  });
+
+  test('iterate errors throw at the call', () => {
+    assert.throws(() => db.iterate('SELECT nope FROM docs;'), flats.QueryError);
+    assert.throws(() => db.iterate('SELECT id FROM docs;', [], { chunkRows: 0 }), RangeError);
+  });
+
+  test('limit and offset through execute', () => {
+    const all = db.execute('SELECT id FROM docs;').rows.map((r) => r[0]);
+    const page = db.execute('SELECT id FROM docs LIMIT 10 OFFSET 20;').rows.map((r) => r[0]);
+    assert.deepEqual(page, all.slice(20, 30));
+  });
+});

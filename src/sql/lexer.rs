@@ -83,6 +83,10 @@ pub enum Token {
     Update,
     /// `DROP`
     Drop,
+    /// `LIMIT`
+    Limit,
+    /// `OFFSET`
+    Offset,
     /// `SET`
     Set,
     /// `NOT` — reserved so it can be refused by name; V-SQL has no negation
@@ -263,6 +267,8 @@ fn keyword(word: &str) -> Option<Token> {
         "delete" => Some(Token::Delete),
         "update" => Some(Token::Update),
         "drop" => Some(Token::Drop),
+        "limit" => Some(Token::Limit),
+        "offset" => Some(Token::Offset),
         "set" => Some(Token::Set),
         "not" => Some(Token::Not),
         "in" => Some(Token::In),
@@ -1076,5 +1082,10 @@ mod tests {
         );
         // Inside a string it is just a character.
         assert_eq!(lex("'?'"), vec![Token::StrLit("?".into())]);
+    }
+
+    #[test]
+    fn limit_and_offset_are_keywords() {
+        assert_eq!(lex("LIMIT 5 offset 2"), vec![Token::Limit, Token::IntLit(5), Token::Offset, Token::IntLit(2)]);
     }
 }

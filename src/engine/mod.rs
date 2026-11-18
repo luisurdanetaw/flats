@@ -2209,7 +2209,7 @@ impl Db {
     pub fn scan_over(
         &self,
         collection: u32,
-        ordinals: impl Iterator<Item = Ordinal> + 'static,
+        ordinals: impl Iterator<Item = Ordinal> + Send + 'static,
     ) -> Result<Cursor<'static>> {
         let coll = self.collection(collection)?;
         // Dense and ascending by construction (`Schema::columns` IS the

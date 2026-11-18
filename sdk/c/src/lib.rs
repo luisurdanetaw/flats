@@ -28,7 +28,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::ptr;
 
-use flats::{ColumnId, ColumnType, Db, DbOptions, Param, QueryError, RegValue, Row, Value};
+use flats::{
+    ColumnId, ColumnType, Db, DbOptions, OutputRow, Param, QueryError, RegValue, Row, RowStream,
+    Value,
+};
 
 // ---------------------------------------------------------------------------
 // Status codes and cell types — mirror flats.h exactly.
@@ -373,6 +376,91 @@ pub unsafe extern "C" fn flats_execute_params(
     })
 }
 
+/// A statement's rows, pulled on demand.
+pub struct flats_cursor {
+    stream: RowStream,
+    columns: Vec<CString>,
+}
+
+// A cursor may be created on one thread and read on another (one at a time,
+// as the header says); that needs the stream to be `Send`. Checked here, at
+// compile time, so a non-`Send` field added to the engine's stream breaks
+// this crate's build rather than a caller's thread.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<RowStream>();
+};
+
+/// `int flats_query(flats_db *db, const char *sql, const flats_param *params, size_t n, flats_cursor **out)`
+///
+/// # Safety
+/// As `flats_execute_params`; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flats_query(
+    db: *const flats_db,
+    sql: *const c_char,
+    params: *const flats_param,
+    n: usize,
+    out: *mut *mut flats_cursor,
+) -> i32 {
+    guard(|| {
+        if out.is_null() {
+            return Err(Fail::invalid("out is NULL"));
+        }
+        // SAFETY: forwarded from this function's own contract.
+        let handle = unsafe { arg_ref(db, "db") }?;
+        // SAFETY: as above.
+        let sql = unsafe { arg_str(sql, "sql") }?;
+        // SAFETY: as above.
+        let params = unsafe { read_params(params, n) }?;
+        let stream = handle.db.execute_with(sql, &params).map_err(Fail::query)?;
+        let columns = labels_of(&stream)?;
+        let cursor = Box::into_raw(Box::new(flats_cursor { stream, columns }));
+        // SAFETY: non-NULL and writable by contract.
+        unsafe { *out = cursor };
+        Ok(())
+    })
+}
+
+/// `int flats_cursor_next(flats_cursor *cur, size_t max_rows, flats_result **out)`
+///
+/// # Safety
+/// `cur` is NULL or a live cursor used by one thread at a time; `out` is
+/// NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flats_cursor_next(
+    cur: *mut flats_cursor,
+    max_rows: usize,
+    out: *mut *mut flats_result,
+) -> i32 {
+    guard(|| {
+        // SAFETY: forwarded from this function's own contract.
+        let cursor = unsafe { arg_mut(cur, "cursor") }?;
+        if out.is_null() {
+            return Err(Fail::invalid("out is NULL"));
+        }
+        if max_rows == 0 {
+            return Err(Fail::invalid("max_rows must be at least 1"));
+        }
+        let chunk = drain(&mut cursor.stream, cursor.columns.clone(), Some(max_rows))?;
+        // SAFETY: non-NULL and writable by contract.
+        unsafe { *out = Box::into_raw(Box::new(chunk)) };
+        Ok(())
+    })
+}
+
+/// `void flats_cursor_free(flats_cursor *cur)`
+///
+/// # Safety
+/// `cur` is NULL or a live cursor, not used again after.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flats_cursor_free(cur: *mut flats_cursor) {
+    if !cur.is_null() {
+        // SAFETY: a live cursor from `flats_query` (a `Box`), released once.
+        drop(unsafe { Box::from_raw(cur) });
+    }
+}
+
 /// `int flats_backup(flats_db *db, const char *dest)`
 ///
 /// # Safety
@@ -407,37 +495,54 @@ pub struct flats_result {
     rows: Vec<Vec<Cell>>,
 }
 
-fn collect(db: &Db, sql: &str, params: &[Param]) -> Result<flats_result, Fail> {
-    let stream = db.execute_with(sql, params).map_err(Fail::query)?;
-    let columns = stream
+fn labels_of(stream: &RowStream) -> Result<Vec<CString>, Fail> {
+    stream
         .labels()
         .iter()
         .map(|l| CString::new(l.as_str()).map_err(|_| Fail::invalid("column label holds a NUL")))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect()
+}
+
+fn cells_of(row: OutputRow) -> Result<Vec<Cell>, Fail> {
+    row.0
+        .into_iter()
+        .map(|cell| match cell {
+            RegValue::Int(n) => Ok(Cell::Int(n)),
+            RegValue::Real(f) => Ok(Cell::Float(f)),
+            RegValue::Str(s) => {
+                let mut bytes = s.into_bytes();
+                bytes.push(0);
+                Ok(Cell::Text(bytes))
+            }
+            RegValue::Vector(v) => Ok(Cell::Vector(v.to_vec())),
+            other => Err(Fail {
+                code: FLATS_ERR_INTERNAL,
+                message: format!("a result row held a non-value register: {other:?}"),
+            }),
+        })
+        .collect()
+}
+
+/// Pull up to `max` rows from `stream` into a result (all of them for `None`).
+fn drain(
+    stream: &mut RowStream,
+    columns: Vec<CString>,
+    max: Option<usize>,
+) -> Result<flats_result, Fail> {
     let mut rows = Vec::new();
-    for row in stream {
-        let row = row.map_err(Fail::query)?;
-        let cells = row
-            .0
-            .into_iter()
-            .map(|cell| match cell {
-                RegValue::Int(n) => Ok(Cell::Int(n)),
-                RegValue::Real(f) => Ok(Cell::Float(f)),
-                RegValue::Str(s) => {
-                    let mut bytes = s.into_bytes();
-                    bytes.push(0);
-                    Ok(Cell::Text(bytes))
-                }
-                RegValue::Vector(v) => Ok(Cell::Vector(v.to_vec())),
-                other => Err(Fail {
-                    code: FLATS_ERR_INTERNAL,
-                    message: format!("a result row held a non-value register: {other:?}"),
-                }),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.push(cells);
+    while max.is_none_or(|m| rows.len() < m) {
+        match stream.next() {
+            Some(row) => rows.push(cells_of(row.map_err(Fail::query)?)?),
+            None => break,
+        }
     }
     Ok(flats_result { columns, rows })
+}
+
+fn collect(db: &Db, sql: &str, params: &[Param]) -> Result<flats_result, Fail> {
+    let mut stream = db.execute_with(sql, params).map_err(Fail::query)?;
+    let columns = labels_of(&stream)?;
+    drain(&mut stream, columns, None)
 }
 
 /// The cell at `(row, col)`, if `res` is live and the indices are in range.

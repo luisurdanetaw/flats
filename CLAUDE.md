@@ -117,6 +117,8 @@ CREATE COLLECTION docs (
 -- Regular metadata queries:
 SELECT x, y FROM docs; 
 SELECT * FROM docs; -- NOTE: DOES NOT RETURN EMBEDDING BY DEFAULT!
+SELECT x, y FROM docs WHERE a < 4 LIMIT 100 OFFSET 200; -- paging; LIMIT first,
+                         -- either optional. SELECT only: SEARCH has TOP k.
 SELECT vector FROM docs; -- NAME the vector column to get the embedding back.
                          -- Opt-in, never part of `*` — same as Pinecone's
                          -- include_values / Qdrant's with_vector.

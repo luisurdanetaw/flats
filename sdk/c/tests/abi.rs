@@ -679,3 +679,147 @@ fn a_second_open_of_the_same_directory_is_refused() {
         last_error()
     );
 }
+
+// -- cursors ----------------------------------------------------------------
+
+struct Cur(*mut flats_cursor);
+
+impl Cur {
+    fn next(&self, max: usize) -> (i32, Option<Res>) {
+        let mut res = ptr::null_mut();
+        // SAFETY: live cursor, valid out-pointer.
+        let rc = unsafe { flats_cursor_next(self.0, max, &mut res) };
+        (rc, (rc == FLATS_OK).then_some(Res(res)))
+    }
+}
+
+impl Drop for Cur {
+    fn drop(&mut self) {
+        // SAFETY: released exactly once.
+        unsafe { flats_cursor_free(self.0) };
+    }
+}
+
+fn query(db: *mut flats_db, sql: &str, params: &[flats_param]) -> Result<Cur, i32> {
+    let sql = c(sql);
+    let mut cur = ptr::null_mut();
+    // SAFETY: live handle, valid string, params valid for their length.
+    match unsafe { flats_query(db, sql.as_ptr(), params.as_ptr(), params.len(), &mut cur) } {
+        FLATS_OK => Ok(Cur(cur)),
+        rc => Err(rc),
+    }
+}
+
+fn load(db: &Db, n: usize) {
+    let b = Batch::new(db, "docs").unwrap();
+    for i in 0..n {
+        b.row(&format!("d{i:04}"), i as i64);
+    }
+    assert_eq!(b.commit().0, FLATS_OK);
+}
+
+#[test]
+fn a_cursor_streams_every_row_in_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    load(&db, 100);
+    let all = db.query("SELECT id FROM docs;").rows();
+    let cur = query(db.0, "SELECT id FROM docs;", &[]).unwrap();
+    let mut streamed = Vec::new();
+    let mut chunks = 0;
+    loop {
+        let (rc, res) = cur.next(7);
+        assert_eq!(rc, FLATS_OK);
+        let res = res.unwrap();
+        assert_eq!(res.columns(), vec!["id"], "every chunk carries the labels");
+        let rows = res.rows();
+        assert!(rows.len() <= 7);
+        if rows.is_empty() {
+            break;
+        }
+        chunks += 1;
+        streamed.extend(rows);
+    }
+    assert_eq!(streamed, all);
+    assert_eq!(chunks, 15);
+    // Exhausted stays exhausted.
+    assert_eq!(cur.next(7).1.unwrap().rows().len(), 0);
+}
+
+#[test]
+fn a_cursor_takes_parameters_and_a_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    load(&db, 50);
+    let cur = query(
+        db.0,
+        "SELECT id FROM docs WHERE year >= ? LIMIT ?;",
+        &[p_int(10), p_int(5)],
+    )
+    .unwrap();
+    let (_, res) = cur.next(100);
+    assert_eq!(res.unwrap().rows().len(), 5);
+}
+
+#[test]
+fn a_cursor_outlives_its_database_handle() {
+    // Like a result, a cursor holds its own handles on the stores.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    load(&db, 20);
+    let cur = query(db.0, "SELECT id FROM docs;", &[]).unwrap();
+    let raw = db.0;
+    std::mem::forget(db);
+    // SAFETY: released exactly once (the wrapper was forgotten).
+    assert_eq!(unsafe { flats_close(raw) }, FLATS_OK);
+    let (rc, res) = cur.next(100);
+    assert_eq!(rc, FLATS_OK);
+    assert_eq!(res.unwrap().rows().len(), 20);
+}
+
+#[test]
+fn a_cursor_over_a_write_is_already_exhausted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let cur = query(
+        db.0,
+        "INSERT INTO docs (id, vector, year, score) VALUES ('a', [1, 0, 0], 1, 1.0);",
+        &[],
+    )
+    .unwrap();
+    assert!(cur.next(10).1.unwrap().rows().is_empty());
+    assert_eq!(
+        db.query("SELECT id FROM docs;").rows().len(),
+        1,
+        "the write ran"
+    );
+}
+
+#[test]
+fn cursor_errors_are_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    assert_eq!(
+        query(db.0, "SELECT nope FROM docs;", &[]).err(),
+        Some(FLATS_ERR_QUERY)
+    );
+    let cur = query(db.0, "SELECT id FROM docs;", &[]).unwrap();
+    assert_eq!(
+        cur.next(0).0,
+        FLATS_ERR_INVALID_ARGUMENT,
+        "max_rows must be positive"
+    );
+    // SAFETY: NULLs are part of the contract.
+    unsafe {
+        assert_eq!(
+            flats_cursor_next(ptr::null_mut(), 1, ptr::null_mut()),
+            FLATS_ERR_INVALID_ARGUMENT
+        );
+        flats_cursor_free(ptr::null_mut());
+    }
+}

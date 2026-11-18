@@ -28,6 +28,7 @@ from collections.abc import Mapping, Sequence
 __all__ = [
     "Database",
     "Result",
+    "Cursor",
     "FlatsError",
     "InvalidArgumentError",
     "QueryError",
@@ -121,6 +122,10 @@ class _Batch(ctypes.Structure):
     pass
 
 
+class _Cursor(ctypes.Structure):
+    pass
+
+
 class _Param(ctypes.Structure):
     """flats_param, field for field."""
 
@@ -150,6 +155,12 @@ def _declare(lib):
             [db_p, c_char_p, ctypes.POINTER(_Param), c_size, ctypes.POINTER(res_p)],
         ),
         "flats_backup": (c_int, [db_p, c_char_p]),
+        "flats_query": (
+            c_int,
+            [db_p, c_char_p, ctypes.POINTER(_Param), c_size, ctypes.POINTER(ctypes.POINTER(_Cursor))],
+        ),
+        "flats_cursor_next": (c_int, [ctypes.POINTER(_Cursor), c_size, ctypes.POINTER(res_p)]),
+        "flats_cursor_free": (None, [ctypes.POINTER(_Cursor)]),
         "flats_result_column_count": (c_size, [res_p]),
         "flats_result_column_name": (c_char_p, [res_p, c_size]),
         "flats_result_row_count": (c_size, [res_p]),
@@ -230,6 +241,11 @@ class Result(Sequence):
 
 
 def _collect(res):
+    columns, rows = _columns_and_rows(res)
+    return Result(columns, rows)
+
+
+def _columns_and_rows(res):
     lib = _lib
     ncols = lib.flats_result_column_count(res)
     columns = [lib.flats_result_column_name(res, c).decode("utf-8") for c in range(ncols)]
@@ -252,7 +268,76 @@ def _collect(res):
             else:
                 raise InternalError(f"unknown cell type {t} at row {r}, column {c}")
         rows.append(tuple(row))
-    return Result(columns, rows)
+    return columns, rows
+
+
+class Cursor:
+    """The rows of one statement, read lazily in chunks — see
+    :meth:`Database.query`. Iterate it once; close it (or use ``with``) to
+    release it early. ``columns`` is known before the first row.
+    """
+
+    def __init__(self, handle, chunk_rows):
+        self._cur = handle
+        self._chunk_rows = chunk_rows
+        self._buffer = []
+        self._at = 0
+        self._done = False
+        # The column names come with the first chunk.
+        self._fill()
+        self.columns = self._columns
+
+    def _fill(self):
+        res = ctypes.POINTER(_Result)()
+        _check(_lib.flats_cursor_next(self._cur, self._chunk_rows, ctypes.byref(res)))
+        try:
+            columns, rows = _columns_and_rows(res)
+        finally:
+            _lib.flats_result_free(res)
+        self._columns = tuple(columns)
+        self._buffer, self._at = rows, 0
+        if not rows:
+            self._release()
+
+    @property
+    def closed(self):
+        return self._cur is None
+
+    def close(self):
+        """Release the cursor. Idempotent; iteration then simply ends."""
+        self._buffer, self._at = [], 0
+        self._release()
+
+    def _release(self):
+        cur, self._cur = self._cur, None
+        self._done = True
+        if cur:
+            _lib.flats_cursor_free(cur)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while True:
+            if self._at < len(self._buffer):
+                row = self._buffer[self._at]
+                self._at += 1
+                return row
+            if self._done:
+                raise StopIteration
+            self._fill()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +473,24 @@ class Database:
             return _collect(res)
         finally:
             _lib.flats_result_free(res)
+
+    def query(self, sql, params=(), *, chunk_rows=1000):
+        """Run one V-SQL statement and return a :class:`Cursor` over its rows.
+
+        Like :meth:`execute`, but rows are read from storage as you iterate,
+        ``chunk_rows`` at a time, so memory stays flat however many there are.
+        The cursor reads one snapshot: rows written after this call are not in
+        it. Use it for large reads; :meth:`execute` collects everything.
+        """
+        if isinstance(chunk_rows, bool) or not isinstance(chunk_rows, int) or chunk_rows < 1:
+            raise ValueError("chunk_rows must be a positive int")
+        arr, keep = _params(params)
+        cur = ctypes.POINTER(_Cursor)()
+        _check(
+            _lib.flats_query(self._handle(), _utf8(sql, "sql"), arr, len(arr), ctypes.byref(cur))
+        )
+        del keep
+        return Cursor(cur, chunk_rows)
 
     def search(self, collection, vector, k=10, *, where=None, params=(), returning=None):
         """Top-``k`` rows of ``collection`` nearest ``vector`` (dot product).

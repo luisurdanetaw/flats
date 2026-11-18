@@ -23,11 +23,21 @@ export interface SearchOptions {
   returning?: string[];
 }
 
+export class RowIterator implements IterableIterator<Cell[]> {
+  readonly columns: string[];
+  readonly closed: boolean;
+  next(): IteratorResult<Cell[]>;
+  return(): IteratorResult<Cell[]>;
+  close(): void;
+  [Symbol.iterator](): RowIterator;
+}
+
 export class Database {
   constructor(path: string);
   readonly closed: boolean;
   close(): void;
   execute(sql: string, params?: Param[]): Result;
+  iterate(sql: string, params?: Param[], options?: { chunkRows?: number }): RowIterator;
   search(collection: string, vector: ArrayLike<number>, options?: SearchOptions): Result;
   insert(collection: string, rows: Iterable<Row>): number;
   backup(dest: string): void;

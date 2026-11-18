@@ -139,6 +139,18 @@ SELECT * FROM docs;                       -- every scalar column, never the vect
 SELECT id, vector FROM docs WHERE id = 7; -- name the vector column to get it
 ```
 
+`LIMIT n` and `OFFSET m` page through a SELECT (both optional, `LIMIT`
+first, each a non-negative integer or a `?`):
+
+```sql
+SELECT id, title FROM docs WHERE lang = 'en' LIMIT 100 OFFSET 200;
+```
+
+The scan stops as soon as the limit is met, so `LIMIT` is cheap even on a
+huge collection. Row order is stable for a given database state, so pages
+tile the result as long as nothing is written in between. A `SEARCH` takes no
+`LIMIT`: `TOP k` already says how many rows it wants.
+
 **Update** — `WHERE` is required. The primary key cannot be changed (delete
 and re-insert instead). Replacing the embedding needs the key, because one
 statement carries one vector and so must name one row.
@@ -169,7 +181,7 @@ WHERE lang = 'en' AND (year < 2010 OR rating >= 4.5)
   supports `=` and `!=` only.
 - `IN` and `NOT` are not supported, and say so: write `IN` as an `OR` chain
   and `NOT a = x` as `a != x`.
-- There is no `LIMIT`, `ORDER BY`, `GROUP BY` or join. `SEARCH … TOP k` is
+- There is no `ORDER BY`, `GROUP BY` or join. `SEARCH … TOP k` is
   the way to get "the best k".
 
 **Filtered search keeps k.** The filter runs *before* ranking: `TOP 10 …

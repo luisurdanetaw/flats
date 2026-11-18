@@ -166,6 +166,31 @@ case FLATS_TYPE_VECTOR: flats_result_vector(res, r, c, &len);     break;  /* flo
 The accessors never crash on a bad index: out of range, or the wrong type,
 gives `0` or `NULL`. Everything they return lives until `flats_result_free`.
 
+## Streaming large results
+
+`flats_execute` collects every row into one result. For a large read, use a
+cursor: `flats_query` runs the statement, and each `flats_cursor_next` returns
+the next chunk as an ordinary `flats_result`. A chunk with zero rows means
+the cursor is done:
+
+```c
+flats_cursor *cur;
+flats_query(db, "SELECT id, title FROM docs WHERE year > ?;", p, 1, &cur);
+for (;;) {
+    flats_result *chunk;
+    if (flats_cursor_next(cur, 1000, &chunk) != FLATS_OK) break;
+    size_t n = flats_result_row_count(chunk);
+    /* ... read rows 0..n with the usual accessors ... */
+    flats_result_free(chunk);
+    if (n == 0) break;
+}
+flats_cursor_free(cur);
+```
+
+Rows are read as they're pulled, so memory is bounded by the chunk size. A
+cursor reads one snapshot and, like a result, doesn't depend on the
+`flats_db` once you have it. For paging, use `LIMIT n OFFSET m` instead.
+
 ## Loading data with batches
 
 The batch API is the fast way in. It skips SQL parsing entirely and commits
