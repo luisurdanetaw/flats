@@ -9,8 +9,9 @@ default-members = ["."]
 name = "flats"
 version = "0.1.0"
 edition = "2024"
-# let-chains (`if let … && …`) are stable from 1.88.
-rust-version = "1.88"
+# let-chains (`if let … && …`) are stable from 1.88; `File::try_lock`, which
+# guards a database directory against a second handle, from 1.89.
+rust-version = "1.89"
 description = "A tiny embeddable vector database: exact search over mmap'd vectors, a WAL, metadata filters, and a small SQL dialect."
 repository = "https://github.com/luisurdanetaw/flats"
 readme = "README.md"

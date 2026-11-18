@@ -463,6 +463,7 @@ under the same `// SAFETY:` rule as the engine's quarantines.
 | **Gap-free monotonic LSNs** | assigned only by the single commit thread; reclaimed on failure |
 | **Catalog survives restarts** | `catalog.snap`, atomic-rename; conflicts refused loudly |
 | **Compaction is crash-safe and invisible to readers** | build off-thread, write gate + one-thread flip, rename commit point, `settle` on open, per-collection replay floors, epoch-checked reads (§6) |
+| **One handle per directory** | exclusive OS lock (`flock`) on `<dir>/LOCK`, taken first in `Db::open`, held by the `Db`, released by the OS on process death |
 
 **Not** guaranteed:
 

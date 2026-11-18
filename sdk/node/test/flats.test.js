@@ -352,3 +352,15 @@ describe('parameters', () => {
     assert.equal(db.execute('SELECT id FROM docs;').length, 0);
   });
 });
+
+describe('locking', () => {
+  test('a second open of the same directory is refused', () => {
+    const dir = tmpdir();
+    const p = path.join(dir, 'db');
+    const first = new flats.Database(p);
+    assert.throws(() => new flats.Database(p), (e) => e instanceof flats.EngineError && /locked/.test(e.message));
+    first.close();
+    new flats.Database(p).close(); // free again once closed
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});

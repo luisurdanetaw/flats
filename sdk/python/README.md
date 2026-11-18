@@ -236,8 +236,10 @@ collection or column name that isn't a plain identifier, raises `ValueError`.
 
 A `Database` can be shared by any number of threads. Every call releases the
 GIL while Flats works, so searches on different threads really run in
-parallel, and writes are serialized internally. Keep one `Database` per
-directory per process.
+parallel, and writes are serialized internally. A directory can be open in
+only one `Database` at a time: a second `flats.Database(path)` on the same
+path — in this process or another — raises `EngineError` ("locked"). Share
+the one you have instead.
 
 ## Running the tests
 

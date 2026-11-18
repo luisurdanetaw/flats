@@ -662,3 +662,20 @@ fn bad_parameters_are_refused() {
     let rc = unsafe { flats_execute_params(db.0, s.as_ptr(), ptr::null(), 0, ptr::null_mut()) };
     assert_eq!(rc, FLATS_OK);
 }
+
+#[test]
+fn a_second_open_of_the_same_directory_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let _first = Db::open(dir.path());
+    let path = c(dir.path().to_str().unwrap());
+    let mut second = ptr::null_mut();
+    // SAFETY: valid string and out-pointer.
+    let rc = unsafe { flats_open(path.as_ptr(), &mut second) };
+    assert_eq!(rc, FLATS_ERR_ENGINE);
+    assert!(second.is_null());
+    assert!(
+        last_error().unwrap().contains("locked"),
+        "{:?}",
+        last_error()
+    );
+}

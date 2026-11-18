@@ -1190,6 +1190,37 @@ pub struct Db {
     /// One past the highest collection id ever issued; shared with the
     /// applier, which advances it as creates land. Ids are never reused.
     next_id: Arc<AtomicU32>,
+    /// The exclusive lock on `<dir>/LOCK`. LAST on purpose: fields drop in
+    /// declaration order, after `Drop::drop` has shut everything down, so the
+    /// directory is released only once nothing can touch it any more.
+    _lock: std::fs::File,
+}
+
+/// Name of the lock file in a database directory.
+const LOCK_FILE: &str = "LOCK";
+
+/// Take the exclusive lock that makes this the only handle on `dir`.
+///
+/// An OS advisory lock (`flock` on Linux) on `<dir>/LOCK`, held by the
+/// returned file for the life of the `Db`. It belongs to the open file, not
+/// to the process, so a second `Db::open` of the same directory in the SAME
+/// process is refused too; and the OS drops it when the process dies, so a
+/// crash never leaves a database locked. The file's contents are unused.
+fn lock_directory(dir: &Path) -> Result<std::fs::File> {
+    let path = dir.join(LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(Error::DatabaseLocked {
+            path: path.display().to_string(),
+        }),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
 }
 
 impl Db {
@@ -1210,6 +1241,8 @@ impl Db {
     ) -> Result<Db> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
+        // FIRST, before reading or writing anything: one handle per directory.
+        let lock = lock_directory(dir)?;
 
         // 0. The registry: persisted catalog ∪ caller-supplied configs.
         //    (Runtime registration goes through the WAL — `create_collection`;
@@ -1397,6 +1430,7 @@ impl Db {
             compaction,
             compactor,
             next_id,
+            _lock: lock,
         })
     }
 

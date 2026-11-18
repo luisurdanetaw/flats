@@ -8,7 +8,10 @@ Flats database well. For language specifics see the SDK guides:
 ## The model in two minutes
 
 - **A database is a directory.** Open it from your process; there is no
-  server. One process should own a directory at a time.
+  server. Only one handle can have a directory open at a time: a second open
+  — from another process or the same one — fails with a "locked" error
+  rather than risk two writers corrupting the files. The lock is the
+  operating system's, so it goes away with the process, crash included.
 - **A collection** is a fixed-shape table with exactly one `VECTOR(dim)`
   column, any number of `TEXT`, `INT` and `FLOAT` columns, and exactly one
   `PRIMARY KEY` (`TEXT` or `INT`). Its `capacity` — the most rows it will

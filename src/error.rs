@@ -260,6 +260,15 @@ pub enum Error {
     #[error("corrupt snapshot: {0}")]
     CorruptSnapshot(String),
 
+    /// The database directory is already open — by another process, or by
+    /// another handle in this one. One handle per directory: two would each
+    /// act as the single writer and corrupt the files between them.
+    #[error("database {path} is locked: another handle already has it open")]
+    DatabaseLocked {
+        /// The lock file that could not be taken.
+        path: String,
+    },
+
     /// A persisted snapshot's schema contradicts the one the caller supplied.
     #[error("snapshot schema does not match the schema supplied by the caller")]
     SchemaMismatch,

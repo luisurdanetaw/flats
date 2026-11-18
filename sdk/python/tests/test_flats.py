@@ -243,6 +243,16 @@ class TestLifecycle(unittest.TestCase):
                     t.join()
                 self.assertEqual(len(db.execute("SELECT id FROM docs;")), 800)
 
+    def test_a_second_open_of_the_same_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "db")
+            with flats.Database(path):
+                with self.assertRaises(flats.EngineError) as cm:
+                    flats.Database(path)
+                self.assertIn("locked", str(cm.exception))
+            with flats.Database(path):  # free again once closed
+                pass
+
     def test_version(self):
         self.assertEqual(flats.version(), "0.1.0")
 
