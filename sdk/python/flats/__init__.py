@@ -19,10 +19,12 @@ package directory, then a Flats checkout's ``target/release`` and
 ``target/debug``.
 """
 
+import contextlib
 import ctypes
 import math
 import os
 import re
+import threading
 from collections.abc import Mapping, Sequence
 
 __all__ = [
@@ -314,6 +316,15 @@ class Cursor:
         if cur:
             _lib.flats_cursor_free(cur)
 
+    def _take_chunk(self):
+        """Every buffered row plus, if those are used up, the next chunk —
+        blocking. ``[]`` once exhausted. (``flats.aio`` runs this on a thread.)
+        """
+        if self._at >= len(self._buffer) and not self._done:
+            self._fill()
+        rows, self._buffer, self._at = self._buffer[self._at:], [], 0
+        return rows
+
     def __iter__(self):
         return self
 
@@ -417,6 +428,11 @@ class Database:
     BATCH_ROWS = 10_000
 
     def __init__(self, path):
+        # Calls in flight, so close() can wait for them instead of freeing the
+        # handle under a call running on another thread.
+        self._lock = threading.Condition()
+        self._active = 0
+        self._db = None
         handle = ctypes.POINTER(_Db)()
         _check(_lib.flats_open(_utf8(os.fspath(path), "path"), ctypes.byref(handle)))
         self._db = handle
@@ -428,8 +444,14 @@ class Database:
         return self._db is None
 
     def close(self):
-        """Checkpoint and close. Idempotent."""
-        db, self._db = getattr(self, "_db", None), None
+        """Checkpoint and close. Idempotent. Waits for calls still running on
+        other threads; calls made after it raise ``FlatsError``."""
+        lock = getattr(self, "_lock", None)
+        if lock is None:  # __init__ failed before the lock existed
+            return
+        with lock:
+            db, self._db = self._db, None
+            lock.wait_for(lambda: self._active == 0)
         if db:
             _check(_lib.flats_close(db))
 
@@ -445,10 +467,20 @@ class Database:
         except Exception:
             pass
 
-    def _handle(self):
-        if self._db is None:
-            raise FlatsError("database is closed")
-        return self._db
+    @contextlib.contextmanager
+    def _use(self):
+        """The open handle, held for one call: close() waits for it."""
+        with self._lock:
+            if self._db is None:
+                raise FlatsError("database is closed", 1)
+            self._active += 1
+            db = self._db
+        try:
+            yield db
+        finally:
+            with self._lock:
+                self._active -= 1
+                self._lock.notify_all()
 
     # -- statements -------------------------------------------------------
 
@@ -463,11 +495,8 @@ class Database:
         """
         arr, keep = _params(params)
         res = ctypes.POINTER(_Result)()
-        _check(
-            _lib.flats_execute_params(
-                self._handle(), _utf8(sql, "sql"), arr, len(arr), ctypes.byref(res)
-            )
-        )
+        with self._use() as db:
+            _check(_lib.flats_execute_params(db, _utf8(sql, "sql"), arr, len(arr), ctypes.byref(res)))
         del keep
         try:
             return _collect(res)
@@ -486,9 +515,8 @@ class Database:
             raise ValueError("chunk_rows must be a positive int")
         arr, keep = _params(params)
         cur = ctypes.POINTER(_Cursor)()
-        _check(
-            _lib.flats_query(self._handle(), _utf8(sql, "sql"), arr, len(arr), ctypes.byref(cur))
-        )
+        with self._use() as db:
+            _check(_lib.flats_query(db, _utf8(sql, "sql"), arr, len(arr), ctypes.byref(cur)))
         del keep
         return Cursor(cur, chunk_rows)
 
@@ -519,24 +547,26 @@ class Database:
         ``str``. Rows go in batches of :attr:`BATCH_ROWS`, each all-or-nothing.
         """
         _ident(collection, "collection")
-        batch = ctypes.POINTER(_Batch)()
-        _check(_lib.flats_batch_new(self._handle(), _utf8(collection, "collection"), ctypes.byref(batch)))
-        total = 0
-        try:
-            for row in rows:
-                self._add_row(batch, row)
-                if _lib.flats_batch_len(batch) >= self.BATCH_ROWS:
+        with self._use() as db:
+            batch = ctypes.POINTER(_Batch)()
+            _check(_lib.flats_batch_new(db, _utf8(collection, "collection"), ctypes.byref(batch)))
+            total = 0
+            try:
+                for row in rows:
+                    self._add_row(batch, row)
+                    if _lib.flats_batch_len(batch) >= self.BATCH_ROWS:
+                        total += self._commit(batch)
+                if _lib.flats_batch_len(batch):
                     total += self._commit(batch)
-            if _lib.flats_batch_len(batch):
-                total += self._commit(batch)
-        finally:
-            _lib.flats_batch_free(batch)
+            finally:
+                _lib.flats_batch_free(batch)
         return total
 
     def backup(self, dest):
         """Write a consistent copy into ``dest`` (absent or an empty
         directory). Restore with ``Database(dest)``."""
-        _check(_lib.flats_backup(self._handle(), _utf8(os.fspath(dest), "dest")))
+        with self._use() as db:
+            _check(_lib.flats_backup(db, _utf8(os.fspath(dest), "dest")))
 
     # -- batch plumbing ---------------------------------------------------
 

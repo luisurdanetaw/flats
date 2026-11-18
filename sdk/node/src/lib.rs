@@ -33,6 +33,11 @@ type napi_callback_info = *mut c_void;
 type napi_status = i32;
 type napi_callback = unsafe extern "C" fn(napi_env, napi_callback_info) -> napi_value;
 type napi_finalize = unsafe extern "C" fn(napi_env, *mut c_void, *mut c_void);
+type napi_deferred = *mut c_void;
+type napi_async_work = *mut c_void;
+type napi_ref = *mut c_void;
+type napi_async_execute_callback = unsafe extern "C" fn(napi_env, *mut c_void);
+type napi_async_complete_callback = unsafe extern "C" fn(napi_env, napi_status, *mut c_void);
 
 const NAPI_OK: napi_status = 0;
 const NAPI_AUTO_LENGTH: usize = usize::MAX;
@@ -137,6 +142,51 @@ unsafe extern "C" {
     ) -> napi_status;
     fn napi_get_undefined(env: napi_env, result: *mut napi_value) -> napi_status;
     fn napi_throw_error(env: napi_env, code: *const c_char, msg: *const c_char) -> napi_status;
+    fn napi_create_error(
+        env: napi_env,
+        code: napi_value,
+        msg: napi_value,
+        result: *mut napi_value,
+    ) -> napi_status;
+    fn napi_create_type_error(
+        env: napi_env,
+        code: napi_value,
+        msg: napi_value,
+        result: *mut napi_value,
+    ) -> napi_status;
+    fn napi_create_promise(
+        env: napi_env,
+        deferred: *mut napi_deferred,
+        promise: *mut napi_value,
+    ) -> napi_status;
+    fn napi_resolve_deferred(
+        env: napi_env,
+        deferred: napi_deferred,
+        value: napi_value,
+    ) -> napi_status;
+    fn napi_reject_deferred(
+        env: napi_env,
+        deferred: napi_deferred,
+        value: napi_value,
+    ) -> napi_status;
+    fn napi_create_async_work(
+        env: napi_env,
+        async_resource: napi_value,
+        async_resource_name: napi_value,
+        execute: napi_async_execute_callback,
+        complete: napi_async_complete_callback,
+        data: *mut c_void,
+        result: *mut napi_async_work,
+    ) -> napi_status;
+    fn napi_queue_async_work(env: napi_env, work: napi_async_work) -> napi_status;
+    fn napi_delete_async_work(env: napi_env, work: napi_async_work) -> napi_status;
+    fn napi_create_reference(
+        env: napi_env,
+        value: napi_value,
+        initial_refcount: u32,
+        result: *mut napi_ref,
+    ) -> napi_status;
+    fn napi_delete_reference(env: napi_env, reference: napi_ref) -> napi_status;
     fn napi_throw_type_error(env: napi_env, code: *const c_char, msg: *const c_char)
     -> napi_status;
 }
@@ -1046,13 +1096,394 @@ unsafe extern "C" fn js_batch_free(env: napi_env, info: napi_callback_info) -> n
     }
 }
 
+// ---------------------------------------------------------------------------
+// Async: the same calls, run on libuv's thread pool, settling a Promise.
+//
+// A job's `run` closure executes on a pool thread and touches NO N-API — it
+// only calls the C ABI, which is thread-safe for a flats_db and used one
+// thread at a time for a cursor or batch (index.js serializes those). The
+// `complete` callback runs back on the JS thread, turns the outcome into
+// JavaScript and settles the Promise. Every JS handle the job uses is held by
+// a reference until then, so the garbage collector cannot finalize — and
+// free — a database or cursor that a pool thread is still using.
+// ---------------------------------------------------------------------------
+
+/// A raw handle moved to a pool thread.
+struct SendPtr<T>(*mut T);
+// SAFETY: the C ABI permits a flats_db on any thread, and a cursor, batch or
+// result on one thread at a time; the job owns its use of the handle until
+// `complete` runs.
+unsafe impl<T> Send for SendPtr<T> {}
+
+/// What a pool-thread run produced, still in C terms.
+enum Done {
+    Unit,
+    Count(usize),
+    Result(SendPtr<flats_result>),
+    Db(SendPtr<flats_db>),
+    Cursor(SendPtr<flats_cursor>),
+}
+
+type Run = Box<dyn FnOnce() -> Js<Done> + Send>;
+
+struct Job {
+    run: Option<Run>,
+    outcome: Option<Js<Done>>,
+    deferred: napi_deferred,
+    work: napi_async_work,
+    keep: Vec<napi_ref>,
+}
+
+unsafe extern "C" fn job_execute(_env: napi_env, data: *mut c_void) {
+    // SAFETY: `data` is the `Job` `spawn` boxed; only this callback touches it
+    // until `job_complete`.
+    let job = unsafe { &mut *(data as *mut Job) };
+    if let Some(run) = job.run.take() {
+        job.outcome = Some(catch_unwind(AssertUnwindSafe(run)).unwrap_or_else(|_| {
+            Err(Throw::Flats(
+                FLATS_ERR_INTERNAL,
+                "internal error (panic)".into(),
+            ))
+        }));
+    }
+}
+
+unsafe extern "C" fn job_complete(env: napi_env, _status: napi_status, data: *mut c_void) {
+    // SAFETY: `data` is the boxed `Job`; `complete` runs once, on the JS thread.
+    let job = unsafe { Box::from_raw(data as *mut Job) };
+    // SAFETY: live env on the JS thread for every call below.
+    unsafe {
+        let outcome = job
+            .outcome
+            .unwrap_or(Err(Throw::Napi("async work was cancelled")));
+        let settled = outcome.and_then(|done| done_to_js(env, done));
+        match settled {
+            Ok(v) => {
+                napi_resolve_deferred(env, job.deferred, v);
+            }
+            Err(t) => {
+                let err = error_value(env, t);
+                napi_reject_deferred(env, job.deferred, err);
+            }
+        }
+        for r in job.keep {
+            napi_delete_reference(env, r);
+        }
+        napi_delete_async_work(env, job.work);
+    }
+}
+
+/// # Safety
+/// Live env, on the JS thread.
+unsafe fn done_to_js(env: napi_env, done: Done) -> Js<napi_value> {
+    // SAFETY: per this function's contract.
+    unsafe {
+        match done {
+            Done::Unit => undefined(env),
+            Done::Count(n) => number(env, n as f64),
+            Done::Result(res) => {
+                let v = result_to_js(env, res.0);
+                flats_result_free(res.0);
+                v
+            }
+            Done::Db(db) => {
+                let handle = Box::into_raw(Box::new(DbHandle { db: db.0 })) as *mut c_void;
+                external(env, handle, finalize_db)
+            }
+            Done::Cursor(cursor) => {
+                let handle =
+                    Box::into_raw(Box::new(CursorHandle { cursor: cursor.0 })) as *mut c_void;
+                external(env, handle, finalize_cursor)
+            }
+        }
+    }
+}
+
+/// A rejection value: an `Error` (or `TypeError`) with `code`, like `throw`.
+///
+/// # Safety
+/// Live env, on the JS thread.
+unsafe fn error_value(env: napi_env, t: Throw) -> napi_value {
+    let (code, message, is_type) = match t {
+        Throw::Flats(rc, m) => (rc.to_string(), m, false),
+        Throw::Type(m) => ("ERR_INVALID_ARG_TYPE".to_string(), m, true),
+        Throw::Napi(what) => (
+            FLATS_ERR_INTERNAL.to_string(),
+            format!("N-API call failed: {what}"),
+            false,
+        ),
+    };
+    let (code, message) = (cstring(&code), cstring(&message));
+    // SAFETY: per this function's contract.
+    unsafe {
+        let (mut c, mut m, mut e) = (ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+        napi_create_string_utf8(env, code.as_ptr(), NAPI_AUTO_LENGTH, &mut c);
+        napi_create_string_utf8(env, message.as_ptr(), NAPI_AUTO_LENGTH, &mut m);
+        if is_type {
+            napi_create_type_error(env, c, m, &mut e);
+        } else {
+            napi_create_error(env, c, m, &mut e);
+        }
+        e
+    }
+}
+
+/// Queue `run` on the thread pool, holding `keep` alive until it settles, and
+/// return its Promise.
+///
+/// # Safety
+/// Live env, on the JS thread; `keep` are values of this callback.
+unsafe fn spawn(env: napi_env, keep: &[napi_value], run: Run) -> Js<napi_value> {
+    // SAFETY: per this function's contract, for every call below.
+    unsafe {
+        let (mut deferred, mut promise) = (ptr::null_mut(), ptr::null_mut());
+        napi(
+            napi_create_promise(env, &mut deferred, &mut promise),
+            "napi_create_promise",
+        )?;
+        let mut refs = Vec::with_capacity(keep.len());
+        for v in keep {
+            let mut r = ptr::null_mut();
+            napi(
+                napi_create_reference(env, *v, 1, &mut r),
+                "napi_create_reference",
+            )?;
+            refs.push(r);
+        }
+        let job = Box::into_raw(Box::new(Job {
+            run: Some(run),
+            outcome: None,
+            deferred,
+            work: ptr::null_mut(),
+            keep: refs,
+        }));
+        let name = string(env, c"flats".as_ptr(), NAPI_AUTO_LENGTH)?;
+        let mut work = ptr::null_mut();
+        let created = napi_create_async_work(
+            env,
+            ptr::null_mut(),
+            name,
+            job_execute,
+            job_complete,
+            job as *mut c_void,
+            &mut work,
+        );
+        if created != NAPI_OK {
+            let job = Box::from_raw(job);
+            for r in job.keep {
+                napi_delete_reference(env, r);
+            }
+            return Err(Throw::Napi("napi_create_async_work"));
+        }
+        (*job).work = work;
+        if napi_queue_async_work(env, work) != NAPI_OK {
+            let job = Box::from_raw(job);
+            for r in job.keep {
+                napi_delete_reference(env, r);
+            }
+            napi_delete_async_work(env, work);
+            return Err(Throw::Napi("napi_queue_async_work"));
+        }
+        Ok(promise)
+    }
+}
+
+/// `openAsync(path) -> Promise<handle>`
+unsafe extern "C" fn js_open_async(env: napi_env, info: napi_callback_info) -> napi_value {
+    // SAFETY: see the section note.
+    unsafe {
+        run(env, || {
+            let [path] = args::<1>(env, info)?;
+            let path = get_cstring(env, path, "path")?;
+            spawn(
+                env,
+                &[],
+                Box::new(move || {
+                    let mut db = ptr::null_mut();
+                    check(flats_open(path.as_ptr(), &mut db))?;
+                    Ok(Done::Db(SendPtr(db)))
+                }),
+            )
+        })
+    }
+}
+
+/// `closeAsync(handle) -> Promise<void>` — idempotent.
+unsafe extern "C" fn js_close_async(env: napi_env, info: napi_callback_info) -> napi_value {
+    // SAFETY: see the section note.
+    unsafe {
+        run(env, || {
+            let [h] = args::<1>(env, info)?;
+            let handle = get_external::<DbHandle>(env, h, "database")?;
+            // Taken on the JS thread, so no later call can see it.
+            let db = SendPtr(std::mem::replace(&mut (*handle).db, ptr::null_mut()));
+            spawn(
+                env,
+                &[h],
+                Box::new(move || {
+                    let db = db;
+                    if !db.0.is_null() {
+                        check(flats_close(db.0))?;
+                    }
+                    Ok(Done::Unit)
+                }),
+            )
+        })
+    }
+}
+
+/// `executeAsync(handle, sql, params?) -> Promise<[columns, rows]>`
+unsafe extern "C" fn js_execute_async(env: napi_env, info: napi_callback_info) -> napi_value {
+    // SAFETY: see the section note.
+    unsafe {
+        run(env, || {
+            let [h, sql, params] = args::<3>(env, info)?;
+            let db = SendPtr(db_of(env, h)?);
+            let sql = get_cstring(env, sql, "sql")?;
+            let owned = get_params(env, params)?;
+            spawn(
+                env,
+                &[h],
+                Box::new(move || {
+                    let db = db;
+                    let c_params: Vec<flats_param> = owned.iter().map(OwnedParam::as_c).collect();
+                    let mut res = ptr::null_mut();
+                    check(flats_execute_params(
+                        db.0,
+                        sql.as_ptr(),
+                        c_params.as_ptr(),
+                        c_params.len(),
+                        &mut res,
+                    ))?;
+                    Ok(Done::Result(SendPtr(res)))
+                }),
+            )
+        })
+    }
+}
+
+/// `queryAsync(handle, sql, params?) -> Promise<cursor>`
+unsafe extern "C" fn js_query_async(env: napi_env, info: napi_callback_info) -> napi_value {
+    // SAFETY: see the section note.
+    unsafe {
+        run(env, || {
+            let [h, sql, params] = args::<3>(env, info)?;
+            let db = SendPtr(db_of(env, h)?);
+            let sql = get_cstring(env, sql, "sql")?;
+            let owned = get_params(env, params)?;
+            spawn(
+                env,
+                &[h],
+                Box::new(move || {
+                    let db = db;
+                    let c_params: Vec<flats_param> = owned.iter().map(OwnedParam::as_c).collect();
+                    let mut cursor = ptr::null_mut();
+                    check(flats_query(
+                        db.0,
+                        sql.as_ptr(),
+                        c_params.as_ptr(),
+                        c_params.len(),
+                        &mut cursor,
+                    ))?;
+                    Ok(Done::Cursor(SendPtr(cursor)))
+                }),
+            )
+        })
+    }
+}
+
+/// `cursorNextAsync(cursor, maxRows) -> Promise<[columns, rows]>`
+unsafe extern "C" fn js_cursor_next_async(env: napi_env, info: napi_callback_info) -> napi_value {
+    // SAFETY: see the section note.
+    unsafe {
+        run(env, || {
+            let [c, max] = args::<2>(env, info)?;
+            let handle = get_external::<CursorHandle>(env, c, "cursor")?;
+            let cursor = (*handle).cursor;
+            if cursor.is_null() {
+                return Err(Throw::Flats(
+                    FLATS_ERR_INVALID_ARGUMENT,
+                    "cursor is closed".into(),
+                ));
+            }
+            let max = get_f64(env, max)?;
+            if max.fract() != 0.0 || max < 1.0 {
+                return Err(Throw::Flats(
+                    FLATS_ERR_INVALID_ARGUMENT,
+                    "maxRows must be a positive integer".into(),
+                ));
+            }
+            let cursor = SendPtr(cursor);
+            spawn(
+                env,
+                &[c],
+                Box::new(move || {
+                    let cursor = cursor;
+                    let mut res = ptr::null_mut();
+                    check(flats_cursor_next(cursor.0, max as usize, &mut res))?;
+                    Ok(Done::Result(SendPtr(res)))
+                }),
+            )
+        })
+    }
+}
+
+/// `batchCommitAsync(batch) -> Promise<number>`
+unsafe extern "C" fn js_batch_commit_async(env: napi_env, info: napi_callback_info) -> napi_value {
+    // SAFETY: see the section note.
+    unsafe {
+        run(env, || {
+            let [b] = args::<1>(env, info)?;
+            let batch = SendPtr(batch_of(env, b)?);
+            spawn(
+                env,
+                &[b],
+                Box::new(move || {
+                    let batch = batch;
+                    let mut n = 0;
+                    check(flats_batch_commit(batch.0, &mut n))?;
+                    Ok(Done::Count(n))
+                }),
+            )
+        })
+    }
+}
+
+/// `backupAsync(handle, dest) -> Promise<void>`
+unsafe extern "C" fn js_backup_async(env: napi_env, info: napi_callback_info) -> napi_value {
+    // SAFETY: see the section note.
+    unsafe {
+        run(env, || {
+            let [h, dest] = args::<2>(env, info)?;
+            let db = SendPtr(db_of(env, h)?);
+            let dest = get_cstring(env, dest, "dest")?;
+            spawn(
+                env,
+                &[h],
+                Box::new(move || {
+                    let db = db;
+                    check(flats_backup(db.0, dest.as_ptr()))?;
+                    Ok(Done::Unit)
+                }),
+            )
+        })
+    }
+}
+
 /// Node's entry point for an N-API addon.
 ///
 /// # Safety
 /// Called by Node with a live `env` and the module's `exports` object.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn napi_register_module_v1(env: napi_env, exports: napi_value) -> napi_value {
-    let functions: [(&str, napi_callback); 14] = [
+    let functions: [(&str, napi_callback); 21] = [
+        ("openAsync", js_open_async),
+        ("closeAsync", js_close_async),
+        ("executeAsync", js_execute_async),
+        ("queryAsync", js_query_async),
+        ("cursorNextAsync", js_cursor_next_async),
+        ("batchCommitAsync", js_batch_commit_async),
+        ("backupAsync", js_backup_async),
         ("query", js_query),
         ("cursorNext", js_cursor_next),
         ("cursorFree", js_cursor_free),

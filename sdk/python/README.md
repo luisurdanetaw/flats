@@ -258,10 +258,39 @@ collection or column name that isn't a plain identifier, raises `ValueError`.
 
 A `Database` can be shared by any number of threads. Every call releases the
 GIL while Flats works, so searches on different threads really run in
-parallel, and writes are serialized internally. A directory can be open in
-only one `Database` at a time: a second `flats.Database(path)` on the same
-path — in this process or another — raises `EngineError` ("locked"). Share
-the one you have instead.
+parallel, and writes are serialized internally. `close()` waits for calls
+still running on other threads, and later calls raise `FlatsError`. A
+directory can be open in only one `Database` at a time: a second
+`flats.Database(path)` on the same path, in this process or another, raises
+`EngineError` ("locked"). Share the one you have instead.
+
+## asyncio
+
+For async apps (FastAPI, aiohttp, …) use `flats.aio`. It's the same
+database, with every call run on a worker thread so the event loop keeps
+serving while Flats works:
+
+```python
+import flats.aio
+
+db = await flats.aio.open("./my-db")
+
+hits = await db.search("docs", query_vector, k=10, where="lang = ?", params=["en"])
+res = await db.execute("SELECT doc_id FROM docs WHERE published > ?;", [2020])
+await db.insert("docs", rows)
+
+async with await db.query("SELECT doc_id, vector FROM docs;") as cur:
+    async for doc_id, vector in cur:
+        ...
+
+await db.backup("./my-db-backup")
+await db.close()           # waits for calls in flight
+```
+
+`flats.aio.AsyncDatabase` mirrors `flats.Database` method for method, with the
+same arguments and the same exceptions. Many tasks can call it at once. It
+uses the event loop's default thread pool; use `loop.set_default_executor` to
+size it.
 
 ## Running the tests
 

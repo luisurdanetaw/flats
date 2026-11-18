@@ -168,6 +168,29 @@ function ident(name, what) {
   return name;
 }
 
+/** The SEARCH statement `search` runs; its first `?` is the query vector. */
+function searchSql(collection, vector, { k, where, returning }) {
+  if (!Number.isInteger(k)) throw new TypeError('k must be an integer');
+  for (const x of vector) {
+    if (!Number.isFinite(x)) throw new RangeError(`vector components must be finite, got ${x}`);
+  }
+  let sql = `SEARCH TOP ${k} NEAREST TO ? FROM ${ident(collection, 'collection')}`;
+  if (where) sql += ` WHERE ${where}`;
+  if (returning && returning.length) {
+    sql += ` RETURNING ${returning.map((c) => ident(c, 'column')).join(', ')}`;
+  }
+  return `${sql};`;
+}
+
+/** Add one row object to a native batch. */
+function addRow(batch, row) {
+  if (row === null || typeof row !== 'object') throw new TypeError('each row must be an object');
+  for (const [column, value] of Object.entries(row)) {
+    call(native.batchSet, batch, column, value);
+  }
+  call(native.batchEndRow, batch);
+}
+
 // -- the database -------------------------------------------------------------
 
 /** Rows sent per insert statement; each batch is atomic. */
@@ -232,16 +255,7 @@ class Database {
    * parameter, exactly.
    */
   search(collection, vector, { k = 10, where, params = [], returning } = {}) {
-    if (!Number.isInteger(k)) throw new TypeError('k must be an integer');
-    for (const x of vector) {
-      if (!Number.isFinite(x)) throw new RangeError(`vector components must be finite, got ${x}`);
-    }
-    let sql = `SEARCH TOP ${k} NEAREST TO ? FROM ${ident(collection, 'collection')}`;
-    if (where) sql += ` WHERE ${where}`;
-    if (returning && returning.length) {
-      sql += ` RETURNING ${returning.map((c) => ident(c, 'column')).join(', ')}`;
-    }
-    return this.execute(`${sql};`, [vector, ...params]);
+    return this.execute(searchSql(collection, vector, { k, where, returning }), [vector, ...params]);
   }
 
   /**
@@ -255,11 +269,7 @@ class Database {
     let total = 0;
     try {
       for (const row of rows) {
-        if (row === null || typeof row !== 'object') throw new TypeError('each row must be an object');
-        for (const [column, value] of Object.entries(row)) {
-          call(native.batchSet, batch, column, value);
-        }
-        call(native.batchEndRow, batch);
+        addRow(batch, row);
         if (call(native.batchLen, batch) >= BATCH_ROWS) total += call(native.batchCommit, batch);
       }
       if (call(native.batchLen, batch) > 0) total += call(native.batchCommit, batch);
@@ -276,12 +286,204 @@ class Database {
   }
 }
 
+// -- the Promise API ------------------------------------------------------------
+
+/** Like call(), for a native function that returns a Promise. */
+async function callAsync(fn, ...args) {
+  try {
+    return await fn(...args);
+  } catch (e) {
+    if (e instanceof TypeError) throw e;
+    const code = Number(e.code);
+    const Cls = CLASSES[code];
+    if (Cls) throw new Cls(e.message, code);
+    throw e;
+  }
+}
+
+/**
+ * The rows of one statement, read lazily in chunks on the thread pool — see
+ * AsyncDatabase#query. Use `for await…of`; breaking out releases it.
+ */
+class AsyncRowIterator {
+  constructor(cursor, chunkRows, columns, rows) {
+    this._cursor = cursor;
+    this._chunkRows = chunkRows;
+    this.columns = columns;
+    this._buffer = rows;
+    this._at = 0;
+    if (rows.length === 0) this._release();
+  }
+
+  get closed() {
+    return this._cursor === null;
+  }
+
+  close() {
+    this._buffer = [];
+    this._at = 0;
+    this._release();
+  }
+
+  _release() {
+    const cursor = this._cursor;
+    this._cursor = null;
+    if (cursor) native.cursorFree(cursor);
+  }
+
+  async next() {
+    for (;;) {
+      if (this._at < this._buffer.length) return { value: this._buffer[this._at++], done: false };
+      if (this._cursor === null) return { value: undefined, done: true };
+      // One chunk at a time: a cursor is used by one thread at a time.
+      if (this._pending) await this._pending;
+      else {
+        this._pending = callAsync(native.cursorNextAsync, this._cursor, this._chunkRows);
+        try {
+          const [, rows] = await this._pending;
+          this._buffer = rows;
+          this._at = 0;
+          if (rows.length === 0) this._release();
+        } finally {
+          this._pending = null;
+        }
+      }
+    }
+  }
+
+  async return() {
+    this.close();
+    return { value: undefined, done: true };
+  }
+
+  [Symbol.asyncIterator]() {
+    return this;
+  }
+}
+
+/**
+ * The Promise API: every call runs on libuv's thread pool and returns a
+ * Promise, so the event loop keeps turning while Flats works. Get one with
+ * `await flats.open(path)`. `close()` waits for calls still in flight.
+ */
+class AsyncDatabase {
+  constructor(handle) {
+    this._db = handle;
+    this._inFlight = new Set();
+    this._closing = null;
+  }
+
+  get closed() {
+    return this._db === null;
+  }
+
+  /** Track a call so close() can wait for it. */
+  _run(start) {
+    if (this._db === null || this._closing) {
+      return Promise.reject(new FlatsError('database is closed', 1));
+    }
+    const p = (async () => start(this._db))();
+    this._inFlight.add(p);
+    const done = () => this._inFlight.delete(p);
+    p.then(done, done);
+    return p;
+  }
+
+  /** Wait for calls in flight, then checkpoint and close. Idempotent. */
+  close() {
+    if (!this._closing) {
+      this._closing = (async () => {
+        await Promise.allSettled([...this._inFlight]);
+        const db = this._db;
+        this._db = null;
+        if (db) await callAsync(native.closeAsync, db);
+      })();
+    }
+    return this._closing;
+  }
+
+  /** Run one V-SQL statement; resolves to a Result. Values go in `params`. */
+  execute(sql, params = []) {
+    if (typeof sql !== 'string') return Promise.reject(new TypeError('sql must be a string'));
+    if (!Array.isArray(params)) return Promise.reject(new TypeError('params must be an array'));
+    return this._run(async (db) => {
+      const [columns, rows] = await callAsync(native.executeAsync, db, sql, params);
+      return new Result(columns, rows);
+    });
+  }
+
+  /** Stream a statement's rows: resolves to an async iterator. */
+  query(sql, params = [], { chunkRows = 1000 } = {}) {
+    if (typeof sql !== 'string') return Promise.reject(new TypeError('sql must be a string'));
+    if (!Array.isArray(params)) return Promise.reject(new TypeError('params must be an array'));
+    if (!Number.isInteger(chunkRows) || chunkRows < 1) {
+      return Promise.reject(new RangeError('chunkRows must be a positive integer'));
+    }
+    return this._run(async (db) => {
+      const cursor = await callAsync(native.queryAsync, db, sql, params);
+      const [columns, rows] = await callAsync(native.cursorNextAsync, cursor, chunkRows);
+      return new AsyncRowIterator(cursor, chunkRows, columns, rows);
+    });
+  }
+
+  /** Top-k nearest `vector`; the same options as Database#search. */
+  search(collection, vector, { k = 10, where, params = [], returning } = {}) {
+    let sql;
+    try {
+      sql = searchSql(collection, vector, { k, where, returning });
+    } catch (e) {
+      return Promise.reject(e);
+    }
+    return this.execute(sql, [vector, ...params]);
+  }
+
+  /** Insert row objects; resolves to the count. Batches of BATCH_ROWS, each atomic. */
+  insert(collection, rows) {
+    try {
+      ident(collection, 'collection');
+    } catch (e) {
+      return Promise.reject(e);
+    }
+    return this._run(async (db) => {
+      const batch = call(native.batchNew, db, collection);
+      let total = 0;
+      try {
+        for (const row of rows) {
+          addRow(batch, row);
+          if (call(native.batchLen, batch) >= BATCH_ROWS) {
+            total += await callAsync(native.batchCommitAsync, batch);
+          }
+        }
+        if (call(native.batchLen, batch) > 0) total += await callAsync(native.batchCommitAsync, batch);
+      } finally {
+        native.batchFree(batch);
+      }
+      return total;
+    });
+  }
+
+  /** Write a consistent copy into `dest`. */
+  backup(dest) {
+    if (typeof dest !== 'string') return Promise.reject(new TypeError('dest must be a string'));
+    return this._run((db) => callAsync(native.backupAsync, db, dest));
+  }
+}
+
+/** Open (creating if missing) the database in `path`; resolves to an AsyncDatabase. */
+async function open(dbPath) {
+  if (typeof dbPath !== 'string') throw new TypeError('path must be a string');
+  return new AsyncDatabase(await callAsync(native.openAsync, dbPath));
+}
+
 /** The library version, e.g. "0.1.0". */
 function version() {
   return native.version();
 }
 
 module.exports = {
+  open,
+  AsyncDatabase,
+  AsyncRowIterator,
   Database,
   Result,
   RowIterator,

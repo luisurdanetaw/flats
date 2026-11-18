@@ -43,6 +43,31 @@ export class Database {
   backup(dest: string): void;
 }
 
+/** Rows of one statement, read lazily on the thread pool: use `for await`. */
+export class AsyncRowIterator implements AsyncIterableIterator<Cell[]> {
+  readonly columns: string[];
+  readonly closed: boolean;
+  next(): Promise<IteratorResult<Cell[]>>;
+  return(): Promise<IteratorResult<Cell[]>>;
+  close(): void;
+  [Symbol.asyncIterator](): AsyncRowIterator;
+}
+
+/** The Promise API: every call runs on libuv's thread pool. */
+export class AsyncDatabase {
+  readonly closed: boolean;
+  /** Waits for calls in flight, then checkpoints and closes. */
+  close(): Promise<void>;
+  execute(sql: string, params?: Param[]): Promise<Result>;
+  query(sql: string, params?: Param[], options?: { chunkRows?: number }): Promise<AsyncRowIterator>;
+  search(collection: string, vector: ArrayLike<number>, options?: SearchOptions): Promise<Result>;
+  insert(collection: string, rows: Iterable<Row>): Promise<number>;
+  backup(dest: string): Promise<void>;
+}
+
+/** Open (creating if missing) a database; resolves to an AsyncDatabase. */
+export function open(path: string): Promise<AsyncDatabase>;
+
 export class FlatsError extends Error {
   readonly code: number;
 }

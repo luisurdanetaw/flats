@@ -256,15 +256,42 @@ try {
 a plain identifier, throw `TypeError`; a non-finite query vector in `search`
 throws `RangeError`.
 
-## Blocking and threads
+## The Promise API (use this in servers)
 
-Calls are **synchronous**, like `better-sqlite3`: a search holds the event
-loop for its duration — about 2 ms over 20,000 vectors of 768 dimensions,
-~100 ms over a million. For a server under load, open the database inside a
-`worker_threads` worker and send it queries by message, or keep collections
-small enough that searches stay in the low milliseconds. Either way, open
-each directory from exactly one place in the process: one `Database` per
-directory.
+`new flats.Database(path)` is synchronous, like `better-sqlite3`: each call
+holds the event loop until it returns. That's fine for scripts and CLIs, but
+a search over a million vectors takes about 100 ms. In a server, use the
+Promise API instead. Every call runs on libuv's thread pool, so the event
+loop keeps serving requests while Flats works:
+
+```js
+const flats = require('flats');
+
+const db = await flats.open('./my-db');            // an AsyncDatabase
+
+await db.execute('CREATE COLLECTION docs (id TEXT PRIMARY KEY, vector VECTOR(3)) WITH (capacity = 1000);');
+await db.insert('docs', [{ id: 'a', vector: [0.1, 0.9, 0] }]);
+
+const hits = await db.search('docs', queryVector, { k: 10, where: 'id != ?', params: ['a'] });
+const res = await db.execute('SELECT id FROM docs WHERE id = ?;', [id]);
+
+for await (const [docId] of await db.query('SELECT id FROM docs;')) {
+  // rows stream in chunks, each fetched on the thread pool
+}
+
+await db.backup('./my-db-backup');
+await db.close();                                  // waits for calls in flight
+```
+
+`AsyncDatabase` has the same methods and arguments as `Database`; each
+returns a Promise and rejects with the same error classes. Concurrent calls
+from many requests are fine: reads run in parallel on the pool, and writes
+are serialized inside Flats. `close()` waits for every call already started,
+then closes; calls made after it reject with `FlatsError`. The pool has 4
+threads by default; raise `UV_THREADPOOL_SIZE` to run more searches at once.
+
+Open each directory once per process: a second `open` of the same path is
+refused with `EngineError` ("locked").
 
 ## Running the tests
 

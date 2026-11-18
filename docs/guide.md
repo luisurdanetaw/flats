@@ -232,7 +232,9 @@ exist or must be empty.
 
 **Concurrency.** One database handle can be shared by many threads. Reads run
 in parallel and never block; writes are serialized. Each statement sees one
-consistent snapshot. There are no multi-statement transactions.
+consistent snapshot. There are no multi-statement transactions. Async apps
+have non-blocking APIs: `flats.aio` in Python and `await flats.open()` in
+Node.js. Both run each call off the event loop.
 
 **Listing collections.** V-SQL has no `SHOW` statement. The Rust API has
 `Db::collections()`; the bundled shell (`cargo run --release -- DIR`) has

@@ -14,6 +14,7 @@ import os
 import struct
 import tempfile
 import threading
+import time
 import unittest
 
 import flats
@@ -290,6 +291,33 @@ class TestLifecycle(unittest.TestCase):
                 self.assertIn("locked", str(cm.exception))
             with flats.Database(path):  # free again once closed
                 pass
+
+    def test_close_waits_for_calls_running_on_other_threads(self):
+        # Closing must not free the handle under a call still running on
+        # another thread; later calls are refused, never a crash.
+        with tempfile.TemporaryDirectory() as d:
+            db = flats.Database(os.path.join(d, "db"))
+            db.execute(SCHEMA)
+            db.insert("docs", [{"id": f"d{i}", "vector": [1, 0, 0], "year": i, "score": 0.0} for i in range(2000)])
+            errors, done = [], []
+
+            def reader():
+                try:
+                    for _ in range(200):
+                        db.search("docs", [1, 0, 0], k=5)
+                        done.append(1)
+                except flats.FlatsError as e:
+                    errors.append(e)
+
+            threads = [threading.Thread(target=reader) for _ in range(4)]
+            for t in threads:
+                t.start()
+            time.sleep(0.01)
+            db.close()
+            for t in threads:
+                t.join()
+            self.assertTrue(done, "some searches ran")
+            self.assertTrue(all("closed" in str(e) for e in errors), errors)
 
     def test_version(self):
         self.assertEqual(flats.version(), "0.1.0")
