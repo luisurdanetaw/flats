@@ -265,6 +265,7 @@ impl Db {
                 | BoundStatement::CreateCollection(_)
                 | BoundStatement::Delete(_)
                 | BoundStatement::Update(_)
+                | BoundStatement::DropCollection(_)
         );
 
         // 3. PLAN — infallible: binding already validated everything, so this
@@ -399,6 +400,9 @@ impl Target {
             Statement::Delete(d) => Target::Existing(d.from.clone()),
             // An UPDATE reads and rewrites rows of the collection it names.
             Statement::Update(u) => Target::Existing(u.collection.clone()),
+            // A DROP names an existing collection; its schema is not read, but
+            // the statement is about that collection like any other.
+            Statement::DropCollection(d) => Target::Existing(d.name.clone()),
         }
     }
 }
@@ -432,7 +436,8 @@ fn labels_of(bound: &BoundStatement) -> Vec<String> {
         | BoundStatement::InsertMany(_)
         | BoundStatement::CreateCollection(_)
         | BoundStatement::Delete(_)
-        | BoundStatement::Update(_) => Vec::new(),
+        | BoundStatement::Update(_)
+        | BoundStatement::DropCollection(_) => Vec::new(),
     }
 }
 

@@ -179,6 +179,15 @@ pub enum Record {
         retire: Bitmap,
         install: Vec<Install>,
     },
+    /// DROP COLLECTION (WAL v6): retire a whole collection — its catalog
+    /// entry, its stores, its files. Carries only the id: the name is the
+    /// catalog's to resolve on the logging side, and ids are never reused, so
+    /// the id alone names exactly one collection for the life of the log.
+    ///
+    /// APPENDED, never inserted: bincode tags variants positionally, so every
+    /// earlier variant keeps its tag and a v5 log is a strict subset of a v6
+    /// one.
+    DropCollection { id: u32 },
 }
 
 impl Record {
@@ -238,6 +247,10 @@ pub enum Outcome {
 pub enum RejectReason {
     /// The row carries a primary key some live row already holds.
     DuplicateKey,
+    /// The record names a collection that has been dropped. A write that
+    /// resolved the collection before a DROP committed, and was logged after
+    /// it, lands here — as does every replayed record of a dropped collection.
+    CollectionDropped,
 }
 
 /// A durable record plus what became of it.
@@ -329,8 +342,8 @@ pub trait Apply {
 const WAL_MAGIC: &[u8; 4] = b"FWAL";
 /// Version written to new logs. 2 = metadata-carrying Insert (Phase 4c);
 /// 3 = + CreateCollection (Phase 6); 4 = + Mutate (Phase 7); 5 = `Schema`
-/// carries a PRIMARY KEY.
-const WAL_VERSION: u32 = 5;
+/// carries a PRIMARY KEY; 6 = + DropCollection.
+const WAL_VERSION: u32 = 6;
 /// Oldest version this build still reads.
 ///
 /// THE 5 BUMP IS THE FIRST THAT IS NOT AN APPEND. Every earlier one only added
@@ -341,6 +354,9 @@ const WAL_VERSION: u32 = 5;
 /// shape, so a v3 or v4 log carrying a create would decode into the wrong
 /// fields rather than fail. Nothing below 5 may be replayed, and recovery says
 /// so plainly instead of guessing.
+///
+/// Version 6 is an append again (`DropCollection`), so a v5 log still replays:
+/// the floor stays at 5.
 const WAL_MIN_VERSION: u32 = 5;
 const WAL_HEADER_BYTES: usize = 8;
 
@@ -1622,15 +1638,16 @@ mod tests {
         // tell it to (CLAUDE.md §6). Pinned as a literal so appending a variant
         // without bumping fails here rather than in production.
         assert_eq!(
-            WAL_VERSION, 5,
-            "Schema gained a primary key; the written version must bump with it"
+            WAL_VERSION, 6,
+            "DropCollection was appended; the written version must bump with it"
         );
-        // And this bump, unlike every earlier one, is NOT backward-readable:
+        // The 5 bump, unlike every earlier one, was NOT backward-readable:
         // `Schema` sits inside `Record::CreateCollection`, so adding a field to
-        // it re-shapes an existing variant's bytes.
+        // it re-shaped an existing variant's bytes. 6 is a plain append, so
+        // the floor stays at 5.
         assert_eq!(
-            WAL_MIN_VERSION, WAL_VERSION,
-            "a field added inside an existing variant breaks older logs"
+            WAL_MIN_VERSION, 5,
+            "a field added inside an existing variant broke logs older than 5"
         );
 
         // Every version this build claims to accept must actually replay.

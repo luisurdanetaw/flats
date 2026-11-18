@@ -398,6 +398,37 @@ reopens.
 
 ---
 
+## 7. DROP COLLECTION and backup
+
+**DROP** is DDL on the log, like CREATE: `Record::DropCollection { id }` (WAL
+v6 — an append, so v5 logs still replay). Apply, on the commit thread:
+
+1. persist `catalog.snap` without the collection — **the commit point**;
+2. unpublish it from the read path (reads already holding it finish against
+   their own handles; unlinked files stay mapped until released);
+3. release its writers;
+4. delete `collection-{id}/` and any `.compact` / `.old` sibling.
+
+**Ids are never reused.** `catalog.snap` v4 carries `next_id`, one past the
+highest id ever issued, so "below `next_id` and not registered" means
+*dropped*. That is what keeps replay sound with the dropped collection's
+records still in the log: a data record for a dropped id gets the
+deterministic verdict `Rejected(CollectionDropped)` (never an apply failure,
+so never a halt), a replayed `CreateCollection` of it is skipped, and an
+open-time config cannot revive it. A crash between steps 1 and 4 leaves files
+that `Db::open` deletes before opening anything. An insert that resolved the
+collection before the drop and logged after it is refused with
+`UnknownCollection`.
+
+**Backup** (`Db::backup(dest)`) is a control job on the commit thread, like a
+compaction flip: checkpoint, then copy `catalog.snap`, every registered
+collection directory (no staging copies, no `.tmp`), and `wal.log`, fsyncing
+each. Nothing applies while it runs, so the copy is the database as of one
+point in the log — whole statements only — and restoring is `Db::open(dest)`.
+Reads continue throughout; writes wait for the copy.
+
+---
+
 ## What is and isn't guaranteed
 
 | Guaranteed | How |

@@ -54,6 +54,15 @@ pub enum Statement {
     Delete(DeleteStmt),
     /// `UPDATE … SET … WHERE …`
     Update(UpdateStmt),
+    /// `DROP COLLECTION name`
+    DropCollection(DropStmt),
+}
+
+/// `DROP COLLECTION name`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropStmt {
+    /// The collection to drop.
+    pub name: String,
 }
 
 /// `UPDATE ident SET col = literal, … WHERE expr`.

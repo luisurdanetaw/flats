@@ -519,6 +519,11 @@ pub enum Op {
         /// Requested capacity.
         capacity: u64,
     },
+    /// Drop a collection. One fat op, like `CreateCollection`.
+    DropCollection {
+        /// The collection's name.
+        name: String,
+    },
     /// Stop execution.
     Halt,
 }
@@ -643,7 +648,7 @@ impl Program {
                 Op::CreateCollection { schema, .. } => {
                     self.check_const(at, *schema)?;
                 }
-                Op::Halt => {}
+                Op::DropCollection { .. } | Op::Halt => {}
             }
         }
         Ok(())

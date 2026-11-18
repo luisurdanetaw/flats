@@ -44,6 +44,9 @@ pub fn plan(bound: BoundStatement) -> LogicalPlan {
         BoundStatement::Search(s) => plan_search(s),
         BoundStatement::Delete(d) => plan_delete(d),
         BoundStatement::Update(u) => plan_update(u),
+        BoundStatement::DropCollection(d) => {
+            LogicalPlan::DropCollection(crate::sql::plan::DropCollection { name: d.name })
+        }
     }
 }
 

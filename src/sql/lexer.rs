@@ -81,6 +81,8 @@ pub enum Token {
     Delete,
     /// `UPDATE`
     Update,
+    /// `DROP`
+    Drop,
     /// `SET`
     Set,
     /// `NOT` — reserved so it can be refused by name; V-SQL has no negation
@@ -257,6 +259,7 @@ fn keyword(word: &str) -> Option<Token> {
         "or" => Some(Token::Or),
         "delete" => Some(Token::Delete),
         "update" => Some(Token::Update),
+        "drop" => Some(Token::Drop),
         "set" => Some(Token::Set),
         "not" => Some(Token::Not),
         "in" => Some(Token::In),
@@ -1045,5 +1048,11 @@ mod tests {
         let toks = Lexer::new("x < 1.5e-3;").tokenize().unwrap();
         assert_eq!(toks[2].token, Token::FloatLit(1.5e-3));
         assert_eq!(toks[2].span, Span { start: 4, end: 10 });
+    }
+
+    #[test]
+    fn drop_is_a_keyword() {
+        assert_eq!(lex("drop"), vec![Token::Drop]);
+        assert_eq!(lex("DROP COLLECTION"), vec![Token::Drop, Token::Collection]);
     }
 }

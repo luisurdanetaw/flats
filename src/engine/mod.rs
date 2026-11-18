@@ -46,7 +46,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -386,6 +386,15 @@ struct IndexApplier {
     /// generation a collection is. Every later apply and checkpoint refuses,
     /// and the log halts (`Apply::halted`) before writing another frame.
     halted: Option<String>,
+    /// One past the highest collection id EVER registered — shared with the
+    /// `Db`, which assigns ids from it, and persisted in `catalog.snap`.
+    ///
+    /// Ids are never reused, so this is also how the applier knows a
+    /// collection was DROPPED rather than never existing: an id below it that
+    /// is not registered. That distinction is what lets replay pass over the
+    /// records a dropped collection left in the log instead of halting on
+    /// them, and what stops a replayed `CreateCollection` from resurrecting it.
+    next_id: Arc<AtomicU32>,
 }
 
 /// The collection a data record writes to; `None` for DDL.
@@ -394,7 +403,7 @@ fn data_collection(record: &Record) -> Option<u32> {
         Record::Insert { collection, .. }
         | Record::Delete { collection, .. }
         | Record::Mutate { collection, .. } => Some(*collection),
-        Record::CreateCollection { .. } => None,
+        Record::CreateCollection { .. } | Record::DropCollection { .. } => None,
     }
 }
 
@@ -429,6 +438,17 @@ impl Apply for IndexApplier {
     fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<Outcome> {
         if let Some(cause) = &self.halted {
             return Err(io::Error::other(cause.clone()));
+        }
+        // A data record for a DROPPED collection: a write that resolved it
+        // before the drop committed and was logged after, or a record of it
+        // that replay meets again. Either way there is nothing to apply it
+        // to, and the verdict is the same on every replay — a refusal, not an
+        // apply failure, so it must not halt the log.
+        if let Some(collection) = data_collection(record)
+            && self.is_dropped(collection)
+        {
+            self.last_applied = self.last_applied.max(lsn.0);
+            return Ok(Outcome::Rejected(RejectReason::CollectionDropped));
         }
         // Already reflected in every store of its collection — see `floors`.
         if let Some(collection) = data_collection(record)
@@ -509,6 +529,9 @@ impl Apply for IndexApplier {
             }
             Record::CreateCollection { config } => {
                 self.apply_create(lsn, config)?;
+            }
+            Record::DropCollection { id } => {
+                self.apply_drop(*id)?;
             }
             Record::Mutate {
                 collection,
@@ -618,7 +641,7 @@ impl Apply for IndexApplier {
         // truncation from ever dropping a CreateCollection record whose
         // registration isn't durably on disk yet.
         let cat_lsn = self.catalog_watermark();
-        persist_catalog(&self.dir, &self.registry, cat_lsn).map_err(to_io)?;
+        persist_catalog(&self.dir, &self.registry, cat_lsn, self.next_id()).map_err(to_io)?;
         min_durable = min_durable.min(cat_lsn);
 
         Ok(if min_durable == u64::MAX || min_durable == 0 {
@@ -712,6 +735,91 @@ impl IndexApplier {
         Ok(None)
     }
 
+    /// Whether `id` names a collection that existed and was dropped: issued
+    /// (below `next_id`, since ids are never reused) but no longer registered.
+    fn is_dropped(&self, id: u32) -> bool {
+        id < self.next_id() && !self.writers.contains_key(&id)
+    }
+
+    fn next_id(&self) -> u32 {
+        self.next_id.load(Ordering::Acquire)
+    }
+
+    /// Apply a `Record::DropCollection`.
+    ///
+    /// ORDER, and why:
+    ///   1. persist `catalog.snap` without the collection — the COMMIT POINT.
+    ///      From here a restart never opens it again: `next_id` still covers
+    ///      its id, so it reads as dropped, and replay passes over every
+    ///      record of it.
+    ///   2. unpublish it from the read path, so new statements cannot find it.
+    ///      A read already holding it keeps its own handles; unlinked files
+    ///      stay mapped until the last one lets go.
+    ///   3. release its writers.
+    ///   4. delete its files. A crash before this leaves them behind, and
+    ///      `Db::open` removes leftovers of dropped ids before anything opens.
+    ///
+    /// A drop of a collection that is not registered — replay of a drop the
+    /// catalog already reflects — only makes sure no files of it remain.
+    fn apply_drop(&mut self, id: u32) -> io::Result<()> {
+        if self.registry.iter().any(|c| c.id == id) {
+            let registry: Vec<CollectionConfig> =
+                self.registry.iter().filter(|c| c.id != id).cloned().collect();
+            persist_catalog(&self.dir, &registry, self.catalog_watermark(), self.next_id())
+                .map_err(to_io)?;
+            self.registry = registry;
+
+            let mut guard = self.catalog.write().unwrap_or_else(|e| e.into_inner());
+            let mut map: CatalogMap = (**guard).clone();
+            map.remove(&id);
+            *guard = Arc::new(map);
+            drop(guard);
+
+            self.writers.remove(&id);
+            self.floors.remove(&id);
+        }
+        // Best effort: the catalog no longer names it, so a file that will not
+        // go now is a leftover the next open clears — not a reason to halt a
+        // healthy database.
+        if let Err(e) = remove_collection_files(&self.dir, id) {
+            eprintln!("flats: dropped collection {id}: files left for the next open to clear: {e}");
+        }
+        Ok(())
+    }
+
+    /// The backup control job: checkpoint, then copy every file a `Db::open`
+    /// needs into `dest`. Runs on the commit thread, between records, so no
+    /// apply, checkpoint or compaction flip can touch a file mid-copy.
+    ///
+    /// The copy holds the log as well as the checkpointed stores, so it is the
+    /// database as of THIS point in the log even if a store is behind it. The
+    /// returned truncation point is applied to the source log after the copy.
+    pub(super) fn backup_into(&mut self, dest: &Path) -> io::Result<Option<u64>> {
+        let up_to = self.checkpoint()?;
+        copy_file_synced(&self.dir.join(CATALOG_FILE), &dest.join(CATALOG_FILE))?;
+        for cfg in &self.registry {
+            let from = collection_dir(&self.dir, cfg.id);
+            let to = collection_dir(dest, cfg.id);
+            std::fs::create_dir_all(&to)?;
+            for entry in std::fs::read_dir(&from)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                // A `.tmp` is a snapshot write that never renamed into place.
+                if !entry.file_type()?.is_file() || name.to_string_lossy().ends_with(".tmp") {
+                    continue;
+                }
+                copy_file_synced(&entry.path(), &to.join(&name))?;
+            }
+            std::fs::File::open(&to)?.sync_all()?;
+        }
+        let wal = Db::wal_path(&self.dir);
+        if wal.exists() {
+            copy_file_synced(&wal, &Db::wal_path(dest))?;
+        }
+        std::fs::File::open(dest)?.sync_all()?;
+        Ok(up_to)
+    }
+
     fn writers(&mut self, id: u32) -> io::Result<&mut CollectionWriters> {
         self.writers.get_mut(&id).ok_or_else(|| {
             io::Error::new(
@@ -741,6 +849,13 @@ impl IndexApplier {
     /// persisted. On any failure the record stays > `catalog_watermark`, so
     /// it survives truncation and restart replays it.
     fn apply_create(&mut self, lsn: Lsn, config: &CollectionConfig) -> io::Result<()> {
+        // Replay meeting the create of a collection that was later dropped.
+        // Materializing it only for the drop further down the log to delete
+        // it again would be correct but wasteful — and briefly re-register
+        // its name, which a newcomer may hold by now.
+        if self.is_dropped(config.id) {
+            return Ok(());
+        }
         if self.writers.contains_key(&config.id)
             || self.registry.iter().any(|c| c.name == config.name)
         {
@@ -770,7 +885,13 @@ impl IndexApplier {
             let mut registry = self.registry.clone();
             registry.push(config.clone());
             registry.sort_by_key(|c| c.id);
-            persist_catalog(&self.dir, &registry, self.catalog_watermark())?;
+            self.next_id.fetch_max(config.id.saturating_add(1), Ordering::AcqRel);
+            persist_catalog(
+                &self.dir,
+                &registry,
+                self.catalog_watermark(),
+                self.next_id(),
+            )?;
             self.registry = registry;
             Ok((writers, collection))
         })();
@@ -874,15 +995,21 @@ impl Flusher {
 // make the operator decide.
 
 const CATALOG_MAGIC: &[u8; 4] = b"CAT0";
-const CATALOG_VERSION: u32 = 3;
+/// 4 = + `next_id` (DROP COLLECTION: ids are never reused, so the catalog must
+/// remember the highest it ever issued even after that collection is gone).
+/// Version 3 files still read: nothing was ever dropped under them, so their
+/// `next_id` is one past the highest registered id.
+const CATALOG_VERSION: u32 = 4;
+const CATALOG_V3: u32 = 3;
 const CATALOG_FILE: &str = "catalog.snap";
 const CATALOG_TMP: &str = "catalog.snap.tmp";
 
-fn encode_catalog(registry: &[CollectionConfig], last_lsn: u64) -> Result<Vec<u8>> {
+fn encode_catalog(registry: &[CollectionConfig], last_lsn: u64, next_id: u32) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     buf.extend_from_slice(CATALOG_MAGIC);
     buf.extend_from_slice(&CATALOG_VERSION.to_le_bytes());
     buf.extend_from_slice(&last_lsn.to_le_bytes());
+    buf.extend_from_slice(&next_id.to_le_bytes());
 
     // Plain data into memory — no fallible step today, but surfaced rather
     // than unwrapped (same reasoning as Record::encode in wal.rs).
@@ -895,11 +1022,37 @@ fn encode_catalog(registry: &[CollectionConfig], last_lsn: u64) -> Result<Vec<u8
     Ok(buf)
 }
 
-/// Inverse of `encode_catalog`. Trailing CRC verified FIRST, like the stores.
-fn decode_catalog(bytes: &[u8]) -> Result<(Vec<CollectionConfig>, u64)> {
-    let corrupt = |why: &str| Error::CorruptSnapshot(format!("catalog: {why}"));
+/// What `catalog.snap` holds: the registry, its LSN stamp, and one past the
+/// highest collection id ever issued.
+struct LoadedCatalog {
+    registry: Vec<CollectionConfig>,
+    last_lsn: u64,
+    next_id: u32,
+}
 
-    // magic + version + last_lsn + body_len + trailing crc.
+/// One past the highest id in `registry`: the `next_id` of a catalog that
+/// never dropped anything.
+fn next_id_after(registry: &[CollectionConfig]) -> u32 {
+    registry
+        .iter()
+        .map(|c| c.id.saturating_add(1))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Inverse of `encode_catalog`, for versions 3 and 4. Trailing CRC verified
+/// FIRST, like the stores.
+fn decode_catalog(bytes: &[u8]) -> Result<LoadedCatalog> {
+    let corrupt = |why: &str| Error::CorruptSnapshot(format!("catalog: {why}"));
+    let u32_at = |at: usize| -> Result<u32> {
+        bytes
+            .get(at..at + 4)
+            .and_then(|b| b.try_into().ok())
+            .map(u32::from_le_bytes)
+            .ok_or_else(|| corrupt("truncated"))
+    };
+
+    // magic + version + last_lsn + body_len + trailing crc (v3's minimum).
     const MIN_LEN: usize = 4 + 4 + 8 + 4 + 4;
     if bytes.len() < MIN_LEN {
         return Err(corrupt("truncated"));
@@ -913,46 +1066,103 @@ fn decode_catalog(bytes: &[u8]) -> Result<(Vec<CollectionConfig>, u64)> {
     if &head[0..4] != CATALOG_MAGIC {
         return Err(corrupt("bad magic"));
     }
-    let version = u32::from_le_bytes(head[4..8].try_into().map_err(|_| corrupt("truncated"))?);
-    if version != CATALOG_VERSION {
+    let version = u32_at(4)?;
+    if version != CATALOG_VERSION && version != CATALOG_V3 {
         return Err(Error::CorruptSnapshot(format!(
             "catalog: unsupported version {version}"
         )));
     }
     let last_lsn = u64::from_le_bytes(head[8..16].try_into().map_err(|_| corrupt("truncated"))?);
-    let body_len =
-        u32::from_le_bytes(head[16..20].try_into().map_err(|_| corrupt("truncated"))?) as usize;
+    // v4 carries next_id between the stamp and the body length.
+    let (stored_next_id, body_at) = if version == CATALOG_VERSION {
+        (Some(u32_at(16)?), 20)
+    } else {
+        (None, 16)
+    };
+    let body_len = u32_at(body_at)? as usize;
+    let body_start = body_at + 4;
     let body = head
-        .get(20..20 + body_len)
+        .get(body_start..body_start + body_len)
         .ok_or_else(|| corrupt("body length overruns file"))?;
-    if head.len() != 20 + body_len {
+    if head.len() != body_start + body_len {
         return Err(corrupt("trailing bytes"));
     }
 
-    let registry = bincode::deserialize(body)
+    let registry: Vec<CollectionConfig> = bincode::deserialize(body)
         .map_err(|e| Error::CorruptSnapshot(format!("catalog body: {e}")))?;
-    Ok((registry, last_lsn))
+    // Never below what the registry itself proves was issued.
+    let next_id = stored_next_id
+        .unwrap_or(0)
+        .max(next_id_after(&registry));
+    Ok(LoadedCatalog {
+        registry,
+        last_lsn,
+        next_id,
+    })
 }
 
 /// Load the persisted registry + its watermark. Missing file = fresh database
 /// (empty at 0); corrupt file = Err — see the corruption-policy note above.
-fn load_catalog(dir: &Path) -> Result<(Vec<CollectionConfig>, u64)> {
+fn load_catalog(dir: &Path) -> Result<LoadedCatalog> {
     match std::fs::read(dir.join(CATALOG_FILE)) {
         Ok(bytes) => decode_catalog(&bytes),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((Vec::new(), 0)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(LoadedCatalog {
+            registry: Vec::new(),
+            last_lsn: 0,
+            next_id: 0,
+        }),
         Err(e) => Err(e.into()),
     }
 }
 
 /// Persist the registry with the shared tmp → fsync → rename → dir-fsync
 /// dance (a leftover garbage .tmp from a crash is overwritten, never read).
-fn persist_catalog(dir: &Path, registry: &[CollectionConfig], last_lsn: u64) -> Result<()> {
+fn persist_catalog(
+    dir: &Path,
+    registry: &[CollectionConfig],
+    last_lsn: u64,
+    next_id: u32,
+) -> Result<()> {
     write_snapshot_atomic(
         dir,
         CATALOG_TMP,
         CATALOG_FILE,
-        &encode_catalog(registry, last_lsn)?,
+        &encode_catalog(registry, last_lsn, next_id)?,
     )
+}
+
+/// Delete everything of collection `id` from `dir`: its canonical directory
+/// and any compaction staging or retired copy. Missing ones are fine.
+fn remove_collection_files(dir: &Path, id: u32) -> io::Result<()> {
+    for path in [
+        collection_dir(dir, id),
+        compact::staging_dir(dir, id),
+        compact::retired_dir(dir, id),
+    ] {
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// The collection id a `collection-{id}` directory entry (or its `.compact` /
+/// `.old` sibling) belongs to; `None` for anything else.
+fn collection_id_of_entry(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("collection-")?;
+    let digits = rest
+        .strip_suffix(".compact")
+        .or_else(|| rest.strip_suffix(".old"))
+        .unwrap_or(rest);
+    digits.parse().ok()
+}
+
+/// Copy `from` to `to` and make the copy durable before returning.
+fn copy_file_synced(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::copy(from, to)?;
+    std::fs::File::open(to)?.sync_all()
 }
 
 // ---------------------------------------------------------------------------
@@ -977,6 +1187,9 @@ pub struct Db {
     compaction: Arc<Shared>,
     /// The background compactor, unless `CompactionOptions::enabled` is off.
     compactor: Option<Compactor>,
+    /// One past the highest collection id ever issued; shared with the
+    /// applier, which advances it as creates land. Ids are never reused.
+    next_id: Arc<AtomicU32>,
 }
 
 impl Db {
@@ -1004,12 +1217,22 @@ impl Db {
         //    collections up front.) Persist changes before touching any store,
         //    preserving the loaded watermark: registering a collection doesn't
         //    change which WAL records the file reflects.
-        let (mut registry, cat_lsn) = load_catalog(dir)?;
+        let LoadedCatalog {
+            mut registry,
+            last_lsn: cat_lsn,
+            mut next_id,
+        } = load_catalog(dir)?;
         let mut dirty = !dir.join(CATALOG_FILE).exists();
         for cfg in collections {
             match registry.iter().find(|c| c.id == cfg.id) {
                 Some(existing) if existing == cfg => {}
                 Some(_) => return Err(Error::CollectionConfigMismatch { id: cfg.id }),
+                // An id below `next_id` that is not registered was DROPPED.
+                // Reviving it would hand the newcomer every record the old
+                // collection left in the log.
+                None if cfg.id < next_id => {
+                    return Err(Error::CollectionConfigMismatch { id: cfg.id });
+                }
                 None => {
                     if registry.iter().any(|c| c.name == cfg.name) {
                         return Err(Error::CollectionExists {
@@ -1017,14 +1240,33 @@ impl Db {
                         });
                     }
                     registry.push(cfg.clone());
+                    next_id = next_id.max(cfg.id.saturating_add(1));
                     dirty = true;
                 }
             }
         }
         registry.sort_by_key(|c| c.id);
         if dirty {
-            persist_catalog(dir, &registry, cat_lsn)?;
+            persist_catalog(dir, &registry, cat_lsn, next_id)?;
         }
+
+        // 0b. Clear what an interrupted DROP left behind: directories of ids
+        //     that were issued but are no longer registered. The catalog
+        //     stopped naming them at the drop's commit point, so nothing will
+        //     ever open them again. Ids at or above `next_id` are left alone —
+        //     that is a CREATE whose registration did not land, and replay
+        //     materializes it over whatever is there.
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if let Some(id) = collection_id_of_entry(&entry.file_name().to_string_lossy())
+                && id < next_id
+                && !registry.iter().any(|c| c.id == id)
+                && entry.file_type()?.is_dir()
+            {
+                std::fs::remove_dir_all(entry.path())?;
+            }
+        }
+        let next_id = Arc::new(AtomicU32::new(next_id));
 
         // 1. Open/create every registered collection's three stores (flat
         //    vector index, metadata index, tuple store), splitting each into
@@ -1095,6 +1337,7 @@ impl Db {
             floors,
             epoch: Arc::clone(&epoch),
             halted: None,
+            next_id: Arc::clone(&next_id),
         };
         let wal = Wal::start(&wal_path, applier, skip_through)?;
 
@@ -1153,6 +1396,7 @@ impl Db {
             epoch,
             compaction,
             compactor,
+            next_id,
         })
     }
 
@@ -1223,6 +1467,12 @@ impl Db {
             // An insert has exactly one way to be refused, so the reason needs
             // no inspection; a keyless collection has no way at all, which is
             // why the `None` arm cannot be reached from a rejection.
+            // The collection was dropped between our lookup and the commit.
+            Ok(committed)
+                if committed.outcome == Outcome::Rejected(RejectReason::CollectionDropped) =>
+            {
+                Err(Error::UnknownCollection { id: collection })
+            }
             Ok(committed) if !committed.applied() => match key_described {
                 Some((column, value)) => Err(Error::DuplicateKey { column, value }),
                 None => Err(Error::DuplicateKey {
@@ -1359,6 +1609,9 @@ impl Db {
         };
         match self.mutate(collection, RoaringBitmap::new(), install)? {
             Outcome::Applied => Ok(ordinals),
+            Outcome::Rejected(RejectReason::CollectionDropped) => {
+                Err(Error::UnknownCollection { id: collection })
+            }
             Outcome::Rejected(RejectReason::DuplicateKey) | Outcome::Conflicted => {
                 // Another writer took one of these keys between our check and
                 // the commit. Name it: by now the winner is live, so the same
@@ -1715,9 +1968,13 @@ impl Db {
         if snapshot.values().any(|c| c.config.name == name) {
             return Err(Error::CollectionExists { name: name.into() });
         }
-        // Assign the id on the logging side (like ordinals): max + 1. No DROP
-        // means ids are never reused.
-        let id = snapshot.keys().max().map_or(0, |m| m + 1);
+        // Assign the id on the logging side (like ordinals). Never reused: a
+        // dropped collection's id stays retired, because the log may still
+        // hold its records and they must never apply to a newcomer.
+        let id = self
+            .next_id
+            .load(Ordering::Acquire)
+            .max(snapshot.keys().max().map_or(0, |m| m + 1));
 
         let config = CollectionConfig {
             id,
@@ -1730,6 +1987,78 @@ impl Db {
             .append(Record::CreateCollection { config })
             .map_err(|e| self.wal_err(e))?;
         Ok(id)
+    }
+
+    /// Drop the collection named `name`: its rows, its stores and its files.
+    /// Blocks until durable. The name is free again as soon as this returns;
+    /// the id is never reused.
+    ///
+    /// Logged as one `Record::DropCollection`, so it survives a crash and
+    /// replay never brings the collection back. Reads already running against
+    /// it finish against what they started with; a write that loses the race
+    /// is refused with [`Error::UnknownCollection`].
+    pub fn drop_collection(&self, name: &str) -> Result<()> {
+        // Serialized with CREATE: a drop and a create of the same name must
+        // not interleave their checks.
+        let _ddl = self.ddl.lock().unwrap_or_else(|e| e.into_inner());
+        let id = self.collection_id(name)?;
+        self.check_poison()?;
+        self.wal_handle()?
+            .append(Record::DropCollection { id })
+            .map_err(|e| self.wal_err(e))?;
+        Ok(())
+    }
+
+    /// Write a consistent copy of the whole database into `dest`, which must
+    /// not exist yet or be an empty directory. Restore by passing `dest` to
+    /// [`Db::open`].
+    ///
+    /// The copy is taken on the commit thread, between records: it is the
+    /// database as of one point in the log, holding every statement
+    /// acknowledged before that point whole and none after it. Reads carry on
+    /// throughout; writes wait for the copy, which is a full file copy of
+    /// every live collection — plan for it on large databases.
+    ///
+    /// On failure, whatever was written into `dest` is removed again.
+    pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
+        let dest = dest.as_ref();
+        let created = match std::fs::read_dir(dest) {
+            Ok(mut entries) => {
+                if entries.next().is_some() {
+                    return Err(Error::Io(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("backup destination {} is not empty", dest.display()),
+                    )));
+                }
+                false
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(dest)?;
+                true
+            }
+            Err(e) => return Err(e.into()),
+        };
+        self.check_poison()?;
+        let res = self
+            .wal_handle()
+            .and_then(|wal| {
+                wal.control(Box::new(compact::Backup {
+                    dest: dest.to_path_buf(),
+                }))
+                .map_err(|e| self.wal_err(e))
+            });
+        if res.is_err() {
+            // Leave the destination as we found it.
+            if created {
+                let _ = std::fs::remove_dir_all(dest);
+            } else if let Ok(entries) = std::fs::read_dir(dest) {
+                for entry in entries.flatten() {
+                    let _ = std::fs::remove_dir_all(entry.path())
+                        .or_else(|_| std::fs::remove_file(entry.path()));
+                }
+            }
+        }
+        res
     }
 
     /// The current liveness snapshot for `collection`, materializing it if no
@@ -3837,6 +4166,53 @@ mod tests {
             Db::open(dir.path(), &[], manual_opts()),
             Err(Error::CorruptSnapshot(_))
         ));
+    }
+
+    /// A version-3 catalog — written before DROP existed, so with no
+    /// `next_id` — still opens, and its `next_id` is one past the highest id
+    /// it registers: nothing was ever dropped under it.
+    #[test]
+    fn a_version_3_catalog_still_opens_and_derives_next_id() {
+        let registry = vec![cfg(0, 2, 8), cfg(4, 2, 8)];
+        let mut v3 = Vec::new();
+        v3.extend_from_slice(CATALOG_MAGIC);
+        v3.extend_from_slice(&3u32.to_le_bytes());
+        v3.extend_from_slice(&7u64.to_le_bytes());
+        let body = bincode::serialize(&registry).unwrap();
+        v3.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        v3.extend_from_slice(&body);
+        let crc = crc32(&v3);
+        v3.extend_from_slice(&crc.to_le_bytes());
+
+        let loaded = decode_catalog(&v3).expect("v3 decodes");
+        assert_eq!(loaded.registry, registry);
+        assert_eq!(loaded.last_lsn, 7);
+        assert_eq!(loaded.next_id, 5);
+
+        // And a database whose catalog is v3 opens and assigns the next id.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(CATALOG_FILE), &v3).unwrap();
+        let db = Db::open(dir.path(), &[], manual_opts()).unwrap();
+        let schema = cfg(9, 2, 8).schema;
+        assert_eq!(db.create_collection("fresh", 8, schema).unwrap(), 5);
+    }
+
+    /// The catalog remembers ids it issued even once nothing registers them.
+    #[test]
+    fn next_id_round_trips_through_the_catalog() {
+        let bytes = encode_catalog(&[cfg(1, 2, 8)], 3, 42).unwrap();
+        let loaded = decode_catalog(&bytes).unwrap();
+        assert_eq!(loaded.next_id, 42);
+        // Never below what the registry proves.
+        let bytes = encode_catalog(&[cfg(50, 2, 8)], 3, 42).unwrap();
+        assert_eq!(decode_catalog(&bytes).unwrap().next_id, 51);
+        // An unknown future version is refused, not guessed at.
+        let mut future = encode_catalog(&[], 0, 0).unwrap();
+        future[4..8].copy_from_slice(&5u32.to_le_bytes());
+        let n = future.len();
+        let crc = crc32(&future[..n - 4]);
+        future[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(decode_catalog(&future), Err(Error::CorruptSnapshot(_))));
     }
 
     /// WAL records for different collections dispatch to the right writers,

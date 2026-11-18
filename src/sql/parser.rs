@@ -29,8 +29,8 @@
 use std::fmt;
 
 use crate::sql::ast::{
-    Assignment, CollectionOption, ColumnDef, ColumnType, CompareOp, CreateStmt, DeleteStmt, Expr,
-    InsertManyStmt, InsertStmt, Literal, Projection, SearchStmt, SelectStmt, Statement, UpdateStmt,
+    Assignment, CollectionOption, ColumnDef, ColumnType, CompareOp, CreateStmt, DeleteStmt,
+    DropStmt, Expr, InsertManyStmt, InsertStmt, Literal, Projection, SearchStmt, SelectStmt, Statement, UpdateStmt,
 };
 use crate::sql::lexer::{LexError, Lexer, Span, SpannedToken, Token};
 
@@ -253,11 +253,12 @@ impl Parser {
             Token::Search => Statement::Search(self.parse_search()?),
             Token::Delete => Statement::Delete(self.parse_delete()?),
             Token::Update => Statement::Update(self.parse_update()?),
+            Token::Drop => Statement::DropCollection(self.parse_drop()?),
             Token::Eof => return Err(self.error(ParseErrorKind::UnexpectedEof)),
             _ => {
                 let found = format!("{:?}", self.peek());
                 return Err(self.error(ParseErrorKind::UnexpectedToken {
-                    expected: "SELECT, INSERT, CREATE, SEARCH, DELETE, or UPDATE".to_string(),
+                    expected: "SELECT, INSERT, CREATE, SEARCH, DELETE, UPDATE, or DROP".to_string(),
                     found,
                 }));
             }
@@ -512,6 +513,14 @@ impl Parser {
     }
 
     /// `create := CREATE COLLECTION ident '(' col_def (',' col_def)* ')' WITH '(' opt (',' opt)* ')'`
+    /// `drop := DROP COLLECTION ident`
+    fn parse_drop(&mut self) -> Result<DropStmt, ParseError> {
+        self.expect(Token::Drop)?;
+        self.expect(Token::Collection)?;
+        let name = self.expect_ident()?;
+        Ok(DropStmt { name })
+    }
+
     fn parse_create(&mut self) -> Result<CreateStmt, ParseError> {
         self.expect(Token::Create)?;
         self.expect(Token::Collection)?;
@@ -1733,6 +1742,33 @@ mod tests {
             "INSERT INTO docs (a) VALUES (1) (2);",
             "INSERT INTO docs (a) VALUES (1), 2;",
             "INSERT INTO docs (a) VALUES (1), ();",
+        ] {
+            err(src);
+        }
+    }
+
+    // -- DROP COLLECTION ----------------------------------------------------
+
+    #[test]
+    fn parses_drop_collection() {
+        assert_eq!(
+            ok("DROP COLLECTION docs;"),
+            Statement::DropCollection(DropStmt {
+                name: "docs".to_string(),
+            })
+        );
+        // Keywords are case-insensitive like every other.
+        assert!(matches!(ok("drop collection docs;"), Statement::DropCollection(_)));
+    }
+
+    #[test]
+    fn malformed_drops_are_errors() {
+        for src in [
+            "DROP docs;",
+            "DROP COLLECTION;",
+            "DROP COLLECTION docs",
+            "DROP COLLECTION docs, more;",
+            "DROP COLLECTION 'docs';",
         ] {
             err(src);
         }

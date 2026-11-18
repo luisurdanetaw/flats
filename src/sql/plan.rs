@@ -47,6 +47,15 @@ pub enum LogicalPlan {
     Delete(Delete),
     /// Rewrite every row a predicate admits, as one statement.
     Update(Update),
+    /// Retire a whole collection.
+    DropCollection(DropCollection),
+}
+
+/// Retire a whole collection — a leaf, one fat op, like `CreateCollection`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropCollection {
+    /// The collection to drop.
+    pub name: String,
 }
 
 // NOTE: there is deliberately no `Filter` node. A `WHERE` predicate in V-SQL is

@@ -79,7 +79,9 @@ impl Apply for WriterApplier {
             // The flat index no longer participates in a delete: retiring a
             // row clears a bit in the metadata index and nothing else.
             Record::Delete { .. } => {}
-            Record::CreateCollection { .. } | Record::Mutate { .. } => {
+            Record::CreateCollection { .. }
+            | Record::Mutate { .. }
+            | Record::DropCollection { .. } => {
                 unreachable!("this test only logs Insert and Delete records")
             }
         }
@@ -102,7 +104,7 @@ fn log_and_apply(h: &WalHandle, w: &mut Writer, rec: Record) {
             ordinal, vector, ..
         } => w.write_at(*ordinal, vector).expect("write_at"),
         Record::Delete { .. } => {}
-        Record::CreateCollection { .. } | Record::Mutate { .. } => {
+        Record::CreateCollection { .. } | Record::Mutate { .. } | Record::DropCollection { .. } => {
             unreachable!("this test only logs Insert and Delete records")
         }
     }

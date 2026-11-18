@@ -209,6 +209,7 @@ fn needs_db(op: &Op) -> bool {
             | Op::InsertMany { .. }
             | Op::Mutate { .. }
             | Op::CreateCollection { .. }
+            | Op::DropCollection { .. }
             // Every bitmap op reads the collection's metadata index.
             | Op::BitmapEq { .. }
             | Op::BitmapRange { .. }
@@ -237,6 +238,7 @@ fn mnemonic(op: &Op) -> &'static str {
         Op::RowId { .. } => "RowId",
         Op::Score { .. } => "Score",
         Op::CreateCollection { .. } => "CreateCollection",
+        Op::DropCollection { .. } => "DropCollection",
         Op::BitmapEq { .. } => "BitmapEq",
         Op::BitmapRange { .. } => "BitmapRange",
         Op::BitmapAnd { .. } => "BitmapAnd",
@@ -918,6 +920,13 @@ impl Vm {
                     db.create_collection(name, capacity, schema)
                         .map_err(ExecError::Engine)?;
                 }
+                Op::DropCollection { name } => {
+                    let db = db.ok_or(ExecError::Detached {
+                        op: "DropCollection",
+                    })?;
+                    // Blocks until durable AND applied.
+                    db.drop_collection(name).map_err(ExecError::Engine)?;
+                }
             }
         }
         // Fall-through ops advance by one. A jump sets `pc` itself and returns
@@ -1308,6 +1317,9 @@ impl fmt::Display for ExecError {
             }
             ExecError::Rejected(RejectReason::DuplicateKey) => {
                 write!(f, "a live row already holds this primary key")
+            }
+            ExecError::Rejected(RejectReason::CollectionDropped) => {
+                write!(f, "the collection was dropped while this statement ran")
             }
             ExecError::NotABitmap { reg } => {
                 write!(f, "register r{reg} does not hold a bitmap")

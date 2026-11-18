@@ -139,6 +139,11 @@ DELETE FROM <collection> WHERE <predicate>;
 -- UPDATE (WHERE is mandatory; the PRIMARY KEY itself cannot be assigned)
 UPDATE <collection> SET <col> = <expr>, <col> = <expr>, ... WHERE <predicate>;
 
+-- DROP: the collection, its rows and its files. The name is free at once; the
+-- id is never reused. (Rust API: Db::drop_collection. Backup: Db::backup(dir),
+-- a consistent copy that Db::open restores.)
+DROP COLLECTION docs;
+
 -- UPDATE replacing the embedding: needs the key, because one statement carries
 -- one vector and so must name one row.
 UPDATE docs SET vector = [...], title = 'v2' WHERE id = 'd1';

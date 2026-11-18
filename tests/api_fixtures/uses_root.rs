@@ -38,6 +38,8 @@ fn workflow(dir: &std::path::Path) -> Result<()> {
         }
     }
     let _ = flats::dot(&[1.0], &[1.0]);
+    db.backup(dir.join("backup"))?;
+    db.drop_collection("raw")?;
     db.checkpoint()?;
     db.close()
 }

@@ -203,6 +203,15 @@ pub enum BoundStatement {
     Delete(BoundDelete),
     /// A resolved `UPDATE`.
     Update(BoundUpdate),
+    /// A resolved `DROP COLLECTION`.
+    DropCollection(BoundDrop),
+}
+
+/// A resolved `DROP COLLECTION` — the collection confirmed to exist.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundDrop {
+    /// The collection to drop.
+    pub name: String,
 }
 
 /// A resolved `UPDATE collection SET assignments WHERE filter`.
@@ -643,6 +652,12 @@ pub fn analyze(stmt: Statement, catalog: &impl Catalog) -> Result<BoundStatement
         Statement::Search(s) => bind_search(s, catalog).map(BoundStatement::Search),
         Statement::Delete(d) => bind_delete(d, catalog).map(BoundStatement::Delete),
         Statement::Update(u) => bind_update(u, catalog).map(BoundStatement::Update),
+        Statement::DropCollection(d) => {
+            if catalog.get_collection(&d.name).is_none() {
+                return Err(BindError::CollectionNotFound(d.name));
+            }
+            Ok(BoundStatement::DropCollection(BoundDrop { name: d.name }))
+        }
     }
 }
 

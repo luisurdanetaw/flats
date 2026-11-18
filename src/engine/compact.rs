@@ -259,11 +259,19 @@ impl Epoch {
 // Directories
 // ---------------------------------------------------------------------------
 
-fn staging_dir(dir: &Path, id: u32) -> PathBuf {
+/// A `Db::backup` request, run on the commit thread like a flip — see
+/// `IndexApplier::backup_into`. Lives beside `Flip` because the commit thread
+/// dispatches both from `run_control`.
+pub(super) struct Backup {
+    /// Where the copy goes; already created and empty.
+    pub(super) dest: PathBuf,
+}
+
+pub(super) fn staging_dir(dir: &Path, id: u32) -> PathBuf {
     dir.join(format!("collection-{id}.compact"))
 }
 
-fn retired_dir(dir: &Path, id: u32) -> PathBuf {
+pub(super) fn retired_dir(dir: &Path, id: u32) -> PathBuf {
     dir.join(format!("collection-{id}.old"))
 }
 
@@ -414,8 +422,12 @@ struct Retired {
 impl IndexApplier {
     /// Run a control job. The only kind there is: a compaction's flip.
     pub(super) fn run_control(&mut self, job: Box<dyn Any + Send>) -> io::Result<Option<u64>> {
-        match job.downcast::<Flip>() {
-            Ok(flip) => self.flip(*flip),
+        let job = match job.downcast::<Flip>() {
+            Ok(flip) => return self.flip(*flip),
+            Err(job) => job,
+        };
+        match job.downcast::<Backup>() {
+            Ok(backup) => self.backup_into(&backup.dest),
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "unknown control job",

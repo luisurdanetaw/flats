@@ -611,6 +611,13 @@ impl<'a> Compiler<'a> {
                 });
             }
 
+            LogicalPlan::DropCollection(drop) => {
+                // LEAF: one fat op, like CREATE.
+                self.emit(Op::DropCollection {
+                    name: drop.name.clone(),
+                });
+            }
+
             LogicalPlan::Update(update) => {
                 // LEAF, exactly like `Delete`: the predicate's bitmap, then ONE
                 // Mutate over it — with the SET list attached, which is what

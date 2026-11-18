@@ -516,6 +516,8 @@ statements end with `;` and may span several lines
   UPDATE docs SET author = 'bob' WHERE doc_id = 'd1';
   UPDATE docs SET vector = [0.4, 0.5, 0.6] WHERE doc_id = 'd1';
   DELETE FROM docs WHERE doc_id = 'd1';
+  INSERT INTO docs (doc_id, vector, author) VALUES ('d2', [1e-5, 0, 1], 'a'), ('d3', [0, 1, 0], 'b');
+  DROP COLLECTION docs;
 
 every collection declares one PRIMARY KEY column (TEXT or INT); it is how
 UPDATE and DELETE name a row, and SET vector requires it
