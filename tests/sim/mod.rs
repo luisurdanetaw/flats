@@ -1606,7 +1606,7 @@ fn check_search(expect: &ReadExpect, labels: &[String], got: &[Vec<Lit>]) -> Res
 
 /// A database under test, its directory, and the model it must match.
 pub struct Sim {
-    root: tempfile::TempDir,
+    root: PathBuf,
     db: Option<Db>,
     pub model: Model,
     rng: Rng,
@@ -1615,6 +1615,10 @@ pub struct Sim {
     pub param_pct: u64,
     /// What the workload actually exercised; see [`Stats`].
     pub stats: Stats,
+    /// Owns the directory when the simulator made it (`new`), so it is
+    /// removed afterwards; `None` for one someone else owns (`at`). Last, so
+    /// it drops after the database is shut down.
+    _tmp: Option<tempfile::TempDir>,
 }
 
 /// Coverage of a run, so a generator that drifts into testing nothing shows
@@ -1632,10 +1636,18 @@ pub struct Stats {
 
 impl Sim {
     pub fn new(seed: u64) -> Sim {
-        let root = tempfile::tempdir().expect("tempdir");
-        let db = Db::open(root.path().join("db"), &[], opts()).expect("open");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut sim = Sim::at(tmp.path(), seed);
+        sim._tmp = Some(tmp);
+        sim
+    }
+
+    /// A simulator over `root/db`, which may already hold a database.
+    pub fn at(root: &Path, seed: u64) -> Sim {
+        let db = Db::open(root.join("db"), &[], opts()).expect("open");
         Sim {
-            root,
+            _tmp: None,
+            root: root.to_path_buf(),
             db: Some(db),
             model: Model::default(),
             rng: Rng::new(seed ^ 0xA5A5),
@@ -1646,10 +1658,10 @@ impl Sim {
     }
 
     pub fn path(&self) -> PathBuf {
-        self.root.path().join("db")
+        self.root.join("db")
     }
 
-    fn db(&self) -> &Db {
+    pub fn db(&self) -> &Db {
         self.db.as_ref().expect("open")
     }
 
@@ -1662,6 +1674,15 @@ impl Sim {
         }
         self.db = Some(Db::open(self.path(), &[], opts()).map_err(|e| format!("reopen: {e}"))?);
         self.verify_all()
+    }
+
+    /// Crash (drop without closing; a no-op if a failed close already took
+    /// the handle) and reopen, WITHOUT checking the result against the model:
+    /// the caller decides what the recovered state may be.
+    pub fn crash_and_reopen(&mut self) -> Result<(), String> {
+        drop(self.db.take());
+        self.db = Some(Db::open(self.path(), &[], opts()).map_err(|e| format!("reopen: {e}"))?);
+        Ok(())
     }
 
     /// Every collection and every row, compared with the model.
@@ -1724,7 +1745,7 @@ impl Sim {
             }
             Op::Backup => {
                 self.backups += 1;
-                let dest = self.root.path().join(format!("backup-{}", self.backups));
+                let dest = self.root.join(format!("backup-{}", self.backups));
                 self.db()
                     .backup(&dest)
                     .map_err(|e| format!("backup: {e}"))?;

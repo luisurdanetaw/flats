@@ -39,6 +39,9 @@ roaring = "0.11.4"
 # semver: it exists so the test suite and benches can reach the layers they
 # exercise directly. Library users should never need it.
 internals = []
+# Fault injection for the crash tests (`src/failpoint.rs`). Off by default and
+# zero-cost when off: every point compiles to nothing.
+failpoints = []
 
 [dev-dependencies]
 # The crate's own tests and benches see the internals (see `internals` above).
@@ -56,3 +59,9 @@ harness = false
 [[bench]]
 name = "parallel_search"
 harness = false
+
+# Crash-at-every-step tests: need the fault points compiled in.
+#   cargo test --release --features failpoints --test failpoints
+[[test]]
+name = "failpoints"
+required-features = ["failpoints"]

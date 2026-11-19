@@ -88,6 +88,20 @@
 // `flats::wal::…` at all; `tests/public_api.rs` holds that line.
 // ---------------------------------------------------------------------------
 
+/// A fault-injection point: with the `failpoints` feature, fails the
+/// enclosing function with an I/O error when a test arms `$site` (see
+/// `failpoint`). Without the feature it expands to nothing at all.
+macro_rules! fail_point {
+    ($site:literal) => {
+        #[cfg(feature = "failpoints")]
+        $crate::failpoint::hit($site)?;
+    };
+}
+
+#[cfg(feature = "failpoints")]
+#[doc(hidden)]
+pub mod failpoint;
+
 macro_rules! internal_modules {
     ($($name:ident),* $(,)?) => {$(
         #[cfg(feature = "internals")]

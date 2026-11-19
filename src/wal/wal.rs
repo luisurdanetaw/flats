@@ -895,18 +895,61 @@ fn commit_batch<A: Apply>(
         return;
     }
 
-    // --- one write + ONE fsyncclaude for the whole batch (group commit) ---
+    // --- one write + ONE fsync for the whole batch (group commit) ---
+    // Where this batch starts. If it doesn't become durable, the file is cut
+    // back to here (see below).
+    let start = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(e) => {
+            *next_lsn = batch_start_lsn;
+            fail_batch(batch, &e);
+            return;
+        }
+    };
     let durable: io::Result<()> = (|| {
+        fail_point!("wal.before_write");
+        #[cfg(feature = "failpoints")]
+        if let Err(e) = crate::failpoint::hit("wal.torn_write") {
+            // A short write: half the batch reaches the file, then the error.
+            file.write_all(&frame_buf[..frame_buf.len() / 2])?;
+            return Err(e);
+        }
         file.write_all(frame_buf)?;
+        fail_point!("wal.before_fsync");
         // fdatasync: we need the data + the file-size growth, not mtime.
         // NOTE: on macOS sync_data/fsync does NOT flush the drive cache; use
         // F_FULLFSYNC there if you want real power-loss durability.
         file.sync_data()?;
+        fail_point!("wal.after_fsync");
         Ok(())
     })();
     if let Err(e) = durable {
-        // Not durable -> these writes did NOT commit. Ack every waiter with the
-        // error so callers do NOT ack their clients.
+        // Not durable -> these writes did NOT commit, and the caller is about
+        // to be told so. That has to stay TRUE, which means getting the
+        // batch's bytes back out of the file: a failed write or fsync can
+        // leave all of them there (and the next restart would replay a write
+        // its caller was told failed), or half of them (and the next batch,
+        // appended after a torn frame, would be cut off by recovery, which
+        // stops at the first bad frame: every later acknowledged write
+        // silently gone). So cut the file back to where the batch started and
+        // make THAT durable. Then the batch never happened, its LSNs are
+        // reused, and the log carries on.
+        //
+        // If even that fails, nothing about the file's tail can be promised:
+        // poison the log (the Postgres answer to fsync failure) so every later
+        // write is refused until a reopen recovers from what's really on disk.
+        match file.set_len(start).and_then(|()| file.sync_data()) {
+            Ok(()) => *next_lsn = batch_start_lsn,
+            Err(rollback) => {
+                let _ = poison.set(Poison {
+                    lsn: Lsn(batch_start_lsn),
+                    cause: format!(
+                        "a write to the log failed ({e}) and so did removing it ({rollback}); \
+                         reopen the database"
+                    ),
+                });
+            }
+        }
         fail_batch(batch, &e);
         return;
     }
@@ -999,6 +1042,7 @@ fn truncate_wal(file: &mut File, path: &Path, up_to: u64) -> io::Result<()> {
         tf.write_all(&kept)?;
         tf.sync_all()?;
     }
+    fail_point!("wal.truncate.before_rename");
     std::fs::rename(&tmp, path)?;
 
     // The old fd points at the now-unlinked inode; reopen on the new file.

@@ -526,6 +526,7 @@ impl IndexApplier {
         let live = collection_dir(&self.dir, id);
         let staged = staging_dir(&self.dir, id);
         let retired = retired_dir(&self.dir, id);
+        fail_point!("compact.before_flip");
 
         if let Err(e) = fs::rename(&live, &retired).and_then(|()| sync_dir(&self.dir)) {
             // If the rename itself landed, put it back; the old generation's
@@ -540,6 +541,11 @@ impl IndexApplier {
         if crash {
             let e = io::Error::other("injected crash between the renames");
             self.halt(id, "test fault point", &e);
+            return Err(e);
+        }
+        #[cfg(feature = "failpoints")]
+        if let Err(e) = crate::failpoint::hit("compact.between_renames") {
+            self.halt(id, "failpoint", &e);
             return Err(e);
         }
         if let Err(e) = fs::rename(&staged, &live) {

@@ -89,6 +89,7 @@ pub(crate) fn write_snapshot_atomic(
         // would be silently lost).
         f.sync_all()?;
     }
+    fail_point!("snapshot.before_rename");
     std::fs::rename(&tmp, dir.join(snap_name))?;
     // The rename is a directory-entry mutation; fsync the dir or it can
     // evaporate on crash.

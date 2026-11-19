@@ -487,13 +487,27 @@ impl CollectionWriters {
         // covers bytes the sync didn't flush.
         let (count, flat_lsn) = self.flat.begin_checkpoint();
         self.flat.sync_data().map_err(to_io)?; // a
+        fail_point!("checkpoint.before_flat_header");
         self.flat.stage_watermark(count, flat_lsn).map_err(to_io)?; // b
         self.flat.sync_header().map_err(to_io)?; // c
 
-        let meta_lsn = self.meta.applied_lsn();
-        self.meta.checkpoint(meta_lsn).map_err(to_io)?;
+        // THE METADATA INDEX GOES LAST. Its watermark must never be ahead of
+        // the other stores': replay starts at the collection's slowest store
+        // (`floors`), and the apply-time verdicts — is this key taken, has
+        // this row been retired — are read off the metadata index. With it
+        // the slowest, a crash mid-checkpoint replays from exactly the state
+        // it holds, so every verdict comes out as it did the first time,
+        // while the stores already ahead just absorb idempotent re-applies.
+        // The other order let a crash leave the index one statement ahead:
+        // replay then judged an INSERT against a later UPDATE's copy of the
+        // same key, refused it as a duplicate, and the tuple store never got
+        // the row (`tests/failpoints.rs`).
+        fail_point!("checkpoint.before_tuples");
         let tuple_lsn = self.tuple.applied_lsn();
         self.tuple.checkpoint(tuple_lsn).map_err(to_io)?;
+        fail_point!("checkpoint.before_metadata");
+        let meta_lsn = self.meta.applied_lsn();
+        self.meta.checkpoint(meta_lsn).map_err(to_io)?;
 
         Ok(flat_lsn.min(meta_lsn.0).min(tuple_lsn.0))
     }
@@ -643,7 +657,7 @@ impl Apply for IndexApplier {
                 // every replay of this frame reaches the same verdict, because
                 // the winner's row is live by then — which is exactly the
                 // determinism replay needs.
-                if let Some(reason) = self.duplicate_key(*collection, metadata)? {
+                if let Some(reason) = self.duplicate_key(*collection, metadata, *ordinal)? {
                     // The watermarks still advance, for the same reason a
                     // conflicted Mutate's do: a refused record IS fully
                     // reflected (it changed nothing), and the verdict is
@@ -821,6 +835,7 @@ impl Apply for IndexApplier {
         // truncation from ever dropping a CreateCollection record whose
         // registration isn't durably on disk yet.
         let cat_lsn = self.catalog_watermark();
+        fail_point!("checkpoint.before_catalog");
         persist_catalog(&self.dir, &self.registry, cat_lsn, self.next_id()).map_err(to_io)?;
         min_durable = min_durable.min(cat_lsn);
 
@@ -850,7 +865,21 @@ impl IndexApplier {
     ///
     /// Reads the key column off the REGISTERED schema rather than the record,
     /// so a frame cannot nominate its own key column.
-    fn duplicate_key(&mut self, collection: u32, row: &Row) -> io::Result<Option<RejectReason>> {
+    ///
+    /// `own` is the ordinal this record installs. A key held by THAT row is
+    /// the record itself, already applied by a store that was checkpointed
+    /// further than the others: a crash between a checkpoint's metadata and
+    /// tuple snapshots leaves exactly that, and recovery replays the record
+    /// to catch the lagging store up. Counting its own row as a rival would
+    /// refuse the replay and leave the tuple store without the row. The
+    /// verdict is still deterministic: a real duplicate is held by a
+    /// DIFFERENT ordinal, which every replay sees the same way.
+    fn duplicate_key(
+        &mut self,
+        collection: u32,
+        row: &Row,
+        own: u64,
+    ) -> io::Result<Option<RejectReason>> {
         let Some(key) = self
             .registry
             .iter()
@@ -870,7 +899,12 @@ impl IndexApplier {
             return Ok(None);
         };
         let w = self.writers(collection)?;
-        if w.meta.is_key_taken(key, &value).map_err(to_io)? {
+        let mut own_rows = RoaringBitmap::new();
+        own_rows.insert(ordinal32(own)?.0);
+        if w.meta
+            .any_key_held_outside(key, &[&value], &own_rows)
+            .map_err(to_io)?
+        {
             return Ok(Some(RejectReason::DuplicateKey));
         }
         Ok(None)
@@ -905,9 +939,16 @@ impl IndexApplier {
         if values.iter().any(|v| !seen.insert(render_key(v))) {
             return Ok(Some(RejectReason::DuplicateKey));
         }
+        // Keys held by rows this record retires are freed by it; keys held
+        // by rows it INSTALLS are the record itself, already applied by a
+        // store checkpointed ahead of the others (see `duplicate_key`).
+        let mut own_rows = retire.clone();
+        for r in install {
+            own_rows.insert(ordinal32(r.ordinal)?.0);
+        }
         let w = self.writers(collection)?;
         if w.meta
-            .any_key_held_outside(key, &values, retire)
+            .any_key_held_outside(key, &values, &own_rows)
             .map_err(to_io)?
         {
             return Ok(Some(RejectReason::DuplicateKey));
@@ -1303,6 +1344,7 @@ fn persist_catalog(
     last_lsn: u64,
     next_id: u32,
 ) -> Result<()> {
+    fail_point!("catalog.before_write");
     write_snapshot_atomic(
         dir,
         CATALOG_TMP,

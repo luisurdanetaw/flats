@@ -16,7 +16,11 @@ fn last_error() -> String {
     // SAFETY: NULL or a NUL-terminated string, copied at once.
     unsafe {
         let p = flats_last_error();
-        if p.is_null() { String::new() } else { CStr::from_ptr(p).to_string_lossy().into_owned() }
+        if p.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
     }
 }
 
@@ -29,7 +33,9 @@ fn an_int_goes_into_a_float_column_as_a_float() {
     unsafe {
         let mut db = ptr::null_mut();
         assert_eq!(flats_open(path.as_ptr(), &mut db), FLATS_OK);
-        let ddl = c("CREATE COLLECTION t (id INT PRIMARY KEY, vector VECTOR(1), f FLOAT) WITH (capacity = 10);");
+        let ddl = c(
+            "CREATE COLLECTION t (id INT PRIMARY KEY, vector VECTOR(1), f FLOAT) WITH (capacity = 10);",
+        );
         assert_eq!(flats_execute(db, ddl.as_ptr(), ptr::null_mut()), FLATS_OK);
 
         let mut b = ptr::null_mut();
@@ -39,7 +45,12 @@ fn an_int_goes_into_a_float_column_as_a_float() {
         for (key, value) in [(1, 3i64), (2, i64::MAX), (3, -7)] {
             assert_eq!(flats_batch_vector(b, [1.0f32].as_ptr(), 1), FLATS_OK);
             assert_eq!(flats_batch_int(b, id.as_ptr(), key), FLATS_OK);
-            assert_eq!(flats_batch_int(b, f.as_ptr(), value), FLATS_OK, "{}", last_error());
+            assert_eq!(
+                flats_batch_int(b, f.as_ptr(), value),
+                FLATS_OK,
+                "{}",
+                last_error()
+            );
             assert_eq!(flats_batch_end_row(b), FLATS_OK);
         }
         let mut n = 0;
@@ -70,13 +81,18 @@ fn a_float_still_does_not_go_into_an_int_column() {
     unsafe {
         let mut db = ptr::null_mut();
         assert_eq!(flats_open(path.as_ptr(), &mut db), FLATS_OK);
-        let ddl = c("CREATE COLLECTION t (id INT PRIMARY KEY, vector VECTOR(1), n INT) WITH (capacity = 10);");
+        let ddl = c(
+            "CREATE COLLECTION t (id INT PRIMARY KEY, vector VECTOR(1), n INT) WITH (capacity = 10);",
+        );
         assert_eq!(flats_execute(db, ddl.as_ptr(), ptr::null_mut()), FLATS_OK);
         let mut b = ptr::null_mut();
         let coll = c("t");
         assert_eq!(flats_batch_new(db, coll.as_ptr(), &mut b), FLATS_OK);
         let n = c("n");
-        assert_eq!(flats_batch_float(b, n.as_ptr(), 1.0), FLATS_ERR_INVALID_ARGUMENT);
+        assert_eq!(
+            flats_batch_float(b, n.as_ptr(), 1.0),
+            FLATS_ERR_INVALID_ARGUMENT
+        );
         flats_batch_free(b);
         assert_eq!(flats_close(db), FLATS_OK);
     }
