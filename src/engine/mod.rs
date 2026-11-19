@@ -2884,6 +2884,14 @@ fn to_io(e: Error) -> io::Error {
     }
 }
 
+/// Fuzzing hook: decode `data` as a `catalog.snap` body that passed every
+/// framing check. Must return for any input, never panic.
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub fn fuzz_decode_catalog(data: &[u8]) -> bool {
+    decode_catalog(&crate::metadata::frame_for_fuzz(CATALOG_MAGIC, CATALOG_VERSION, data)).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5287,12 +5295,4 @@ mod tests {
 
         db.close().unwrap();
     }
-}
-
-/// Fuzzing hook: decode `data` as a `catalog.snap` body that passed every
-/// framing check. Must return for any input, never panic.
-#[cfg(feature = "internals")]
-#[doc(hidden)]
-pub fn fuzz_decode_catalog(data: &[u8]) -> bool {
-    decode_catalog(&crate::metadata::frame_for_fuzz(CATALOG_MAGIC, CATALOG_VERSION, data)).is_ok()
 }
