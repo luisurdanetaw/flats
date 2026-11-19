@@ -1,0 +1,167 @@
+name: Fuzz
+
+# Randomized testing, at two sizes:
+#
+#   * every pull request: a quick pass of every harness (a few minutes);
+#   * nightly, and on demand: an 8-shard matrix on FRESH seeds every night
+#     (the seed range moves with the run number), for as long as a CI job
+#     reasonably runs.
+#
+# The harnesses (see each file's header):
+#   tests/differential.rs  random workloads vs a reference model, shrunk on failure
+#   fuzz/sqlite_diff.py    the same WHERE text through Flats and SQLite (Python SDK)
+#   tests/crash_kill.rs    SIGKILL at random moments; acknowledged writes survive
+#   tests/failpoints.rs    fail and crash at every step of every durability path
+#   tests/fuzz.rs          hostile statement text and damaged files: never panic
+#
+# A failure uploads target/sim-failures (each report has the seed, a minimal
+# reproduction and the replay command) and, nightly, opens an issue.
+
+on:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: "Multiplier on the nightly iteration counts"
+        default: "1"
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FLATS_SIM_OUT: ${{ github.workspace }}/target/sim-failures
+
+jobs:
+  quick:
+    name: fuzz (quick)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        run: rustup update stable --no-self-update && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: differential (model)
+        run: cargo test --release --locked --test differential
+        env: { FLATS_SIM_SEEDS: "20", FLATS_SIM_OPS: "300" }
+      - name: crash (kill -9)
+        run: cargo test --release --locked --test crash_kill
+        env: { FLATS_CRASH_ITERS: "20" }
+      - name: crash (fault points)
+        run: cargo test --release --locked --features failpoints --test failpoints
+        env: { FLATS_FP_SEEDS: "20" }
+      - name: differential (SQLite, via the Python SDK)
+        run: |
+          cargo build --release --locked -p flats-c
+          python3 fuzz/sqlite_diff.py --seeds 20 --ops 250
+      - name: hostile input
+        run: cargo test --release --locked --test fuzz
+        env: { FLATS_FUZZ_ITERS: "2000" }
+      - name: upload failure reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-failures-quick
+          path: target/sim-failures
+          if-no-files-found: ignore
+
+  nightly:
+    name: fuzz (nightly, shard ${{ matrix.shard }})
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      SCALE: ${{ github.event.inputs.scale || '1' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        run: rustup update stable --no-self-update && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Pick this shard's seeds
+        # Fresh seeds every night: run N, shard S covers its own range, so
+        # the matrix never repeats a seed it already ran clean.
+        run: |
+          base=$(( (${{ github.run_number }} * 8 + ${{ matrix.shard }}) * 100000 ))
+          echo "FLATS_SIM_SEED_BASE=$base" >> "$GITHUB_ENV"
+          echo "seed base $base, scale $SCALE"
+      - name: differential (model)
+        run: |
+          FLATS_SIM_SEEDS=$(( 400 * SCALE )) FLATS_SIM_OPS=500 \
+            cargo test --release --locked --test differential
+      - name: crash (kill -9)
+        run: FLATS_CRASH_ITERS=$(( 300 * SCALE )) cargo test --release --locked --test crash_kill
+      - name: crash (fault points)
+        run: |
+          FLATS_FP_SEEDS=$(( 150 * SCALE )) \
+            cargo test --release --locked --features failpoints --test failpoints
+      - name: differential (SQLite, via the Python SDK)
+        run: |
+          cargo build --release --locked -p flats-c
+          python3 fuzz/sqlite_diff.py --seeds $(( 300 * SCALE )) --ops 400 \
+            --seed-base "$FLATS_SIM_SEED_BASE"
+      - name: hostile input
+        run: FLATS_FUZZ_ITERS=$(( 20000 * SCALE )) cargo test --release --locked --test fuzz
+      - name: chaos and compaction models
+        run: |
+          CHAOS_ITERS=$(( 30000 * SCALE )) COMPACTION_ITERS=$(( 30000 * SCALE )) \
+            cargo test --release --locked --test chaos --test compaction
+      - name: upload failure reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-failures-shard-${{ matrix.shard }}
+          path: target/sim-failures
+          if-no-files-found: ignore
+
+  report:
+    name: open an issue for nightly failures
+    needs: nightly
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: failures
+          pattern: sim-failures-*
+      - name: File (or update) one issue per failing report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          shopt -s nullglob
+          files=(failures/*/*.txt)
+          if [ ${#files[@]} -eq 0 ]; then
+            title="Nightly fuzz failed (no report file; see the run log)"
+            gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[].number' | grep -q . \
+              || gh issue create --title "$title" --label fuzz --body "$RUN_URL" \
+              || gh issue create --title "$title" --body "$RUN_URL"
+            exit 0
+          fi
+          for f in "${files[@]}"; do
+            name=$(basename "$f" .txt)
+            title="Fuzz: $name"
+            body=$(printf 'Found by %s\n\n```\n%s\n```\n' "$RUN_URL" "$(head -c 60000 "$f")")
+            existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body "$body"
+            else
+              gh issue create --title "$title" --label fuzz --body "$body" \
+                || gh issue create --title "$title" --body "$body"
+            fi
+          done

@@ -12,6 +12,7 @@ attack surface is the input the embedding application hands it.
 | Database files | Corrupt or crafted WAL, catalog, snapshots, index | CRCs, version checks, size-capped frames, no panics | `tests/fuzz.rs`, including forged-checksum cases |
 | Concurrency | Two writers on one directory | exclusive OS lock | `tests/lock.rs` (cross-process) |
 | FFI handles | Use after close | shared, reference-counted handles; close waits for in-flight calls | `sdk/c/tests/abi.rs` |
+| Crashes and I/O errors | Lost or resurrected writes at any step of a commit, checkpoint, truncation or compaction | metadata index checkpointed last; a failed WAL write is cut back out of the log (or the log is poisoned) | `tests/crash_kill.rs` (SIGKILL), `tests/failpoints.rs` (every step); see `docs/testing.md` |
 | Store files | A damaged or missing snapshot silently dropping rows | open rebuilds from the log only when it provably holds everything, refuses otherwise; `Db::open_salvage` is the explicit opt-in | `tests/snapshot_corruption.rs` |
 | `unsafe` code | Memory errors | `// SAFETY:` on every block; AddressSanitizer over the lib, C ABI, SIMD, mmap and concurrency suites | CI `sanitizers` job |
 
@@ -21,6 +22,8 @@ attack surface is the input the embedding application hands it.
   can't be recovered without a backup: salvage keeps only what the log
   still has. Keeping the previous snapshot per store would make recovery
   lossless.
+- Power loss (unflushed writes lost) is not simulated yet; SIGKILL keeps the
+  page cache. LazyFS in CI would cover it (`docs/testing.md`).
 - A collection whose whole directory was deleted opens empty: with no files
   left, it looks like one being created for the first time.
 - A damaged active header slot in `vectors.idx` falls back to the older slot

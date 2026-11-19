@@ -205,9 +205,13 @@ memory via `Reader::tombstone_uncommitted` — a pure atomic bit-flip, *not* a W
 
 The flusher thread pokes the WAL thread on a timer; the WAL thread runs
 checkpoint *itself* (it owns the writers). Per collection, all three stores:
-the flat index does `sync_data → stage_watermark → sync_header`, the two
-metadata stores each write their serialize-and-rename snapshot. Then the commit
-thread truncates the WAL — strictly after. Ordering rule: **make the stores
+the flat index does `sync_data → stage_watermark → sync_header`, then the tuple
+store and, LAST, the metadata index each write their serialize-and-rename
+snapshot. Then the commit thread truncates the WAL — strictly after. The
+metadata index goes last because the apply-time verdicts (is a key taken, was
+a row retired) are read off it: it must never be ahead of the other stores, or
+a crash mid-checkpoint makes replay judge a record against a later state
+(`tests/failpoints.rs`). Ordering rule: **make the stores
 durable before truncating the WAL.** Truncate-first-then-crash would throw away
 records a store hadn't durably absorbed = data loss.
 
