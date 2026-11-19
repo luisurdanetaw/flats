@@ -91,7 +91,7 @@ or one of
 |---|---|
 | `FLATS_ERR_INVALID_ARGUMENT` | NULL handle or string, invalid UTF-8, a value the schema refuses (wrong vector length, wrong type, NaN, unknown column) |
 | `FLATS_ERR_QUERY` | Bad or unsupported V-SQL, unknown collection or column |
-| `FLATS_ERR_ENGINE` | Duplicate primary key, collection full, backup target not empty, I/O |
+| `FLATS_ERR_ENGINE` | Duplicate primary key, collection full, backup target not empty, a damaged database file, I/O |
 | `FLATS_ERR_INTERRUPTED` | The statement was stopped by `flats_interrupt` or by its timeout |
 | `FLATS_ERR_INTERNAL` | A bug in Flats |
 
@@ -226,6 +226,16 @@ flats_interrupt(db);                       /* stop everything running now */
 A stopped statement returns `FLATS_ERR_INTERRUPTED`, and nothing it would
 have written is written. `flats_interrupt` is safe from any thread, for
 example a watchdog thread, and only reaches statements already running.
+
+## Damaged files
+
+If a collection's files are damaged (disk corruption, a bad copy) and the log
+can't repair them, `flats_open` fails with `FLATS_ERR_ENGINE` and a message
+naming the file, and nothing on disk changes. Restore a backup. With no
+backup, `flats_open_salvage(path, &db)` opens it anyway: the damaged
+collection comes back with only the rows written since its last checkpoint,
+and the damaged file is kept as `<name>.damaged`. On a healthy database it is
+the same as `flats_open`.
 
 ## Backups
 

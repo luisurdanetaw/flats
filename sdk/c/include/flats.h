@@ -89,6 +89,14 @@ const char *flats_last_error(void);
  * recovery before returning. */
 int flats_open(const char *path, flats_db **out);
 
+/* flats_open for a database that refuses to open because a collection's
+ * store file is damaged or missing (FLATS_ERR_ENGINE, "corrupt snapshot:
+ * ... salvage"). Each damaged collection opens with only the rows written
+ * since its last checkpoint; the damaged file is kept as <name>.damaged.
+ * Restore a backup instead if you have one. On a healthy database it is the
+ * same as flats_open. */
+int flats_open_salvage(const char *path, flats_db **out);
+
 /* Checkpoint and close. Returns the checkpoint's status; the handle is
  * released either way. NULL is a no-op returning FLATS_OK. */
 int flats_close(flats_db *db);

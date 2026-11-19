@@ -32,8 +32,13 @@ export class RowIterator implements IterableIterator<Cell[]> {
   [Symbol.iterator](): RowIterator;
 }
 
+export interface OpenOptions {
+  /** Get past a damaged collection store file, keeping only the rows written since its last checkpoint. */
+  salvage?: boolean;
+}
+
 export class Database {
-  constructor(path: string);
+  constructor(path: string, options?: OpenOptions);
   readonly closed: boolean;
   close(): void;
   execute(sql: string, params?: Param[]): Result;
@@ -72,7 +77,7 @@ export class AsyncDatabase {
 }
 
 /** Open (creating if missing) a database; resolves to an AsyncDatabase. */
-export function open(path: string): Promise<AsyncDatabase>;
+export function open(path: string, options?: OpenOptions): Promise<AsyncDatabase>;
 
 export class FlatsError extends Error {
   readonly code: number;

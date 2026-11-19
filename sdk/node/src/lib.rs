@@ -650,12 +650,28 @@ unsafe extern "C" fn js_version(env: napi_env, _info: napi_callback_info) -> nap
 /// `open(path) -> handle`
 unsafe extern "C" fn js_open(env: napi_env, info: napi_callback_info) -> napi_value {
     // SAFETY: see the section note.
+    unsafe { open_with(env, info, flats_open) }
+}
+
+/// `openSalvage(path) -> handle` — see `flats_open_salvage`.
+unsafe extern "C" fn js_open_salvage(env: napi_env, info: napi_callback_info) -> napi_value {
+    // SAFETY: see the section note.
+    unsafe { open_with(env, info, flats_open_salvage) }
+}
+
+/// A C ABI opener: `flats_open` or `flats_open_salvage`.
+type Opener = unsafe extern "C" fn(*const c_char, *mut *mut flats_db) -> i32;
+
+/// # Safety
+/// See the section note.
+unsafe fn open_with(env: napi_env, info: napi_callback_info, open: Opener) -> napi_value {
+    // SAFETY: see the section note.
     unsafe {
         run(env, || {
             let [path] = args::<1>(env, info)?;
             let path = get_cstring(env, path, "path")?;
             let mut db = ptr::null_mut();
-            check(flats_open(path.as_ptr(), &mut db))?;
+            check(open(path.as_ptr(), &mut db))?;
             let handle = Box::into_raw(Box::new(DbHandle { db })) as *mut c_void;
             external(env, handle, finalize_db)
         })
@@ -1319,6 +1335,19 @@ unsafe fn spawn(env: napi_env, keep: &[napi_value], run: Run) -> Js<napi_value> 
 /// `openAsync(path) -> Promise<handle>`
 unsafe extern "C" fn js_open_async(env: napi_env, info: napi_callback_info) -> napi_value {
     // SAFETY: see the section note.
+    unsafe { open_async_with(env, info, flats_open) }
+}
+
+/// `openSalvageAsync(path) -> Promise<handle>`
+unsafe extern "C" fn js_open_salvage_async(env: napi_env, info: napi_callback_info) -> napi_value {
+    // SAFETY: see the section note.
+    unsafe { open_async_with(env, info, flats_open_salvage) }
+}
+
+/// # Safety
+/// See the section note.
+unsafe fn open_async_with(env: napi_env, info: napi_callback_info, open: Opener) -> napi_value {
+    // SAFETY: see the section note.
     unsafe {
         run(env, || {
             let [path] = args::<1>(env, info)?;
@@ -1328,7 +1357,7 @@ unsafe extern "C" fn js_open_async(env: napi_env, info: napi_callback_info) -> n
                 &[],
                 Box::new(move || {
                     let mut db = ptr::null_mut();
-                    check(flats_open(path.as_ptr(), &mut db))?;
+                    check(open(path.as_ptr(), &mut db))?;
                     Ok(Done::Db(SendPtr(db)))
                 }),
             )
@@ -1504,10 +1533,11 @@ unsafe extern "C" fn js_backup_async(env: napi_env, info: napi_callback_info) ->
 /// Called by Node with a live `env` and the module's `exports` object.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn napi_register_module_v1(env: napi_env, exports: napi_value) -> napi_value {
-    let functions: [(&str, napi_callback); 23] = [
+    let functions: [(&str, napi_callback); 25] = [
         ("interrupt", js_interrupt),
         ("setStatementTimeout", js_set_statement_timeout),
         ("openAsync", js_open_async),
+        ("openSalvageAsync", js_open_salvage_async),
         ("closeAsync", js_close_async),
         ("executeAsync", js_execute_async),
         ("queryAsync", js_query_async),
@@ -1519,6 +1549,7 @@ pub unsafe extern "C" fn napi_register_module_v1(env: napi_env, exports: napi_va
         ("cursorFree", js_cursor_free),
         ("version", js_version),
         ("open", js_open),
+        ("openSalvage", js_open_salvage),
         ("close", js_close),
         ("execute", js_execute),
         ("backup", js_backup),

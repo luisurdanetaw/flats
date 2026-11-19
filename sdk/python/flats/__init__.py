@@ -158,6 +158,7 @@ def _declare(lib):
         "flats_version": (c_char_p, []),
         "flats_last_error": (c_char_p, []),
         "flats_open": (c_int, [c_char_p, ctypes.POINTER(db_p)]),
+        "flats_open_salvage": (c_int, [c_char_p, ctypes.POINTER(db_p)]),
         "flats_close": (c_int, [db_p]),
         "flats_execute": (c_int, [db_p, c_char_p, ctypes.POINTER(res_p)]),
         "flats_execute_params": (
@@ -437,14 +438,23 @@ class Database:
     #: ``insert`` is atomic per batch, not as a whole.
     BATCH_ROWS = 10_000
 
-    def __init__(self, path):
+    def __init__(self, path, *, salvage=False):
+        """Open (creating if missing) the database in ``path``.
+
+        If a collection's store file is damaged in a way the log can't
+        repair, this raises ``EngineError`` naming the file, and changes
+        nothing. Restore a backup, or open once with ``salvage=True``: each
+        damaged collection then comes back with only the rows written since
+        its last checkpoint, and the database is healthy from then on.
+        """
         # Calls in flight, so close() can wait for them instead of freeing the
         # handle under a call running on another thread.
         self._lock = threading.Condition()
         self._active = 0
         self._db = None
         handle = ctypes.POINTER(_Db)()
-        _check(_lib.flats_open(_utf8(os.fspath(path), "path"), ctypes.byref(handle)))
+        opener = _lib.flats_open_salvage if salvage else _lib.flats_open
+        _check(opener(_utf8(os.fspath(path), "path"), ctypes.byref(handle)))
         self._db = handle
 
     # -- lifecycle --------------------------------------------------------

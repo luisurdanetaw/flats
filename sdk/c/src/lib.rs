@@ -12,7 +12,7 @@
 //!
 //! # Shape of every entry point
 //!
-//! Each fallible function runs its body inside [`guard`], which turns a
+//! Each fallible function runs its body inside `guard`, which turns a
 //! `Fail` into a status code plus the thread's last-error message, and a
 //! panic into `FLATS_ERR_INTERNAL` — a Rust panic must never unwind into C.
 
@@ -236,13 +236,35 @@ fn with_db<T>(shared: &SharedDb, f: impl FnOnce(&Db) -> Result<T, Fail>) -> Resu
 /// `path` is NULL or a NUL-terminated string; `out` is NULL or writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn flats_open(path: *const c_char, out: *mut *mut flats_db) -> i32 {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { open_with(path, out, |p, c, o| Db::open(p, c, o)) }
+}
+
+/// `int flats_open_salvage(const char *path, flats_db **out)`
+///
+/// `flats_open`, but get past a collection store file the log can't repair,
+/// giving up the rows only that file held. See `Db::open_salvage`.
+///
+/// # Safety
+/// As `flats_open`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flats_open_salvage(path: *const c_char, out: *mut *mut flats_db) -> i32 {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { open_with(path, out, |p, c, o| Db::open_salvage(p, c, o)) }
+}
+
+type EngineOpen = fn(&Path, &[flats::CollectionConfig], DbOptions) -> flats::Result<Db>;
+
+/// # Safety
+/// `path` is NULL or a NUL-terminated string; `out` is NULL or writable.
+unsafe fn open_with(path: *const c_char, out: *mut *mut flats_db, open: EngineOpen) -> i32 {
     guard(|| {
         if out.is_null() {
             return Err(Fail::invalid("out is NULL"));
         }
         // SAFETY: forwarded from this function's own contract.
         let path = unsafe { arg_str(path, "path") }?;
-        let db = Db::open(Path::new(path), &[], DbOptions::default()).map_err(Fail::engine)?;
+        let db = open(Path::new(path), &[], DbOptions::default()).map_err(Fail::engine)?;
         let handle = Box::into_raw(Box::new(flats_db {
             db: Arc::new(RwLock::new(Some(db))),
         }));

@@ -29,9 +29,10 @@ async def _in_thread(fn, *args, **kwargs):
     return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
 
 
-async def open(path):  # noqa: A001 — mirrors flats.Database(path)
-    """Open (creating if missing) the database in ``path``."""
-    return AsyncDatabase(await _in_thread(Database, path))
+async def open(path, *, salvage=False):  # noqa: A001 — mirrors flats.Database(path)
+    """Open (creating if missing) the database in ``path``. ``salvage`` is as
+    for ``flats.Database``."""
+    return AsyncDatabase(await _in_thread(Database, path, salvage=salvage))
 
 
 class AsyncCursor:

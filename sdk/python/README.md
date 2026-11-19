@@ -70,6 +70,14 @@ write-ahead log and is recovered on the next open. Closing only makes that
 next open faster. `db.closed` tells you whether it has been closed; any call
 on a closed database raises `FlatsError`.
 
+If a collection's files are damaged (disk corruption, a bad copy) and the log
+can't repair them, opening raises `EngineError` naming the file, and nothing
+on disk changes. Restore a backup. With no backup, open it once with
+`flats.Database(path, salvage=True)` (or `await flats.aio.open(path,
+salvage=True)`): the damaged collection comes back with only the rows written
+since its last checkpoint. See the
+[guide](../../docs/guide.md#operations).
+
 ## Creating collections
 
 Collections are created with V-SQL:

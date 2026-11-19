@@ -447,9 +447,9 @@ fn lost_store(
         format!(
             "{head}, and the write-ahead log may no longer hold everything it did \
              (a checkpoint has run since), so opening could lose rows. Nothing was \
-             changed. Restore a backup, or open \
-             once with Db::open_salvage to keep only the rows written since the \
-             last checkpoint"
+             changed. Restore a backup, or open it \
+             once in salvage mode to keep only the rows written since the last \
+             checkpoint"
         )
     })
 }

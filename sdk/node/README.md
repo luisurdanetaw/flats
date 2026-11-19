@@ -71,6 +71,14 @@ collector releases the handle eventually. Close explicitly anyway, on
 shutdown, so the next open is fast. `db.closed` tells you whether it has
 been closed; any call on a closed database throws `FlatsError`.
 
+If a collection's files are damaged (disk corruption, a bad copy) and the log
+can't repair them, opening throws `EngineError` naming the file, and nothing
+on disk changes. Restore a backup. With no backup, open it once with
+`new flats.Database(path, { salvage: true })` (or `await flats.open(path,
+{ salvage: true })`): the damaged collection comes back with only the rows
+written since its last checkpoint. See the
+[guide](../../docs/guide.md#operations).
+
 ## Creating collections
 
 ```js

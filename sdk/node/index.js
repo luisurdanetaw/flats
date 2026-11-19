@@ -199,11 +199,30 @@ function addRow(batch, row) {
 /** Rows sent per insert statement; each batch is atomic. */
 const BATCH_ROWS = 10000;
 
+/** `options.salvage`, checked: undefined/omitted means false. */
+function salvageOption(options) {
+  if (options === undefined) return false;
+  if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+    throw new TypeError('options must be an object');
+  }
+  const { salvage = false } = options;
+  if (typeof salvage !== 'boolean') throw new TypeError('options.salvage must be a boolean');
+  return salvage;
+}
+
 class Database {
-  /** Open (creating if missing) the database in directory `path`. */
-  constructor(dbPath) {
+  /**
+   * Open (creating if missing) the database in directory `path`.
+   *
+   * If a collection's store file is damaged in a way the log can't repair,
+   * this throws EngineError naming the file, and changes nothing. Restore a
+   * backup, or open once with `{ salvage: true }`: each damaged collection
+   * then comes back with only the rows written since its last checkpoint.
+   */
+  constructor(dbPath, options) {
     if (typeof dbPath !== 'string') throw new TypeError('path must be a string');
-    this._db = call(native.open, dbPath);
+    const salvage = salvageOption(options);
+    this._db = call(salvage ? native.openSalvage : native.open, dbPath);
   }
 
   get closed() {
@@ -500,9 +519,10 @@ class AsyncDatabase {
 }
 
 /** Open (creating if missing) the database in `path`; resolves to an AsyncDatabase. */
-async function open(dbPath) {
+async function open(dbPath, options) {
   if (typeof dbPath !== 'string') throw new TypeError('path must be a string');
-  return new AsyncDatabase(await callAsync(native.openAsync, dbPath));
+  const salvage = salvageOption(options);
+  return new AsyncDatabase(await callAsync(salvage ? native.openSalvageAsync : native.openAsync, dbPath));
 }
 
 /** The library version, e.g. "0.1.0". */
