@@ -253,10 +253,14 @@ pub enum Error {
         value: String,
     },
 
-    /// Snapshot file exists but failed magic/version/CRC checks.
-    /// Phase 4a/4b policy: `open()` swallows this internally ("start empty at
-    /// lsn 0, WAL replay rebuilds") — the variant exists for the cases that
-    /// must NOT be swallowed, e.g. a schema that contradicts the caller's.
+    /// A file the database can't open without losing data: `catalog.snap`
+    /// failed its checks, or a collection's store file is damaged or missing
+    /// and the write-ahead log no longer holds what it did. The message names
+    /// the file (and the collection). Nothing on disk was changed: restore a
+    /// backup, or see [`Db::open_salvage`](crate::Db::open_salvage).
+    ///
+    /// A store file the log CAN rebuild (nothing was checkpointed since its
+    /// collection was created) is not an error: open rebuilds it.
     #[error("corrupt snapshot: {0}")]
     CorruptSnapshot(String),
 

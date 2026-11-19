@@ -28,6 +28,32 @@ pub use common::{
 pub use index::MetadataIndex;
 pub use tuples::TupleStore;
 
+/// What a store's `open_reporting` found on disk. Whether a store that came up
+/// empty may stay that way is the ENGINE's call, not the store's: only the
+/// engine can tell whether the write-ahead log still holds everything the
+/// missing file did (see `engine::open_collection_in`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Loaded {
+    /// A valid snapshot, checkpointed through this LSN.
+    Snapshot(Lsn),
+    /// No snapshot file. The store opened empty.
+    Missing,
+    /// The file failed its magic / version / CRC / decode checks. The store
+    /// opened empty; the string says why the file was refused.
+    Corrupt(String),
+}
+
+impl Loaded {
+    /// The LSN the store is durable through: its snapshot's, or 0 when it
+    /// opened empty.
+    pub fn lsn(&self) -> Lsn {
+        match self {
+            Loaded::Snapshot(lsn) => *lsn,
+            Loaded::Missing | Loaded::Corrupt(_) => Lsn(0),
+        }
+    }
+}
+
 /// Shared CRC-32 over a byte slice — the integrity check trailing every
 /// snapshot file (metadata.snap, tuples.snap, catalog.snap).
 pub(crate) fn crc32(bytes: &[u8]) -> u32 {

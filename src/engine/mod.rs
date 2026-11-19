@@ -267,36 +267,140 @@ fn collection_dir(dir: &Path, id: u32) -> PathBuf {
 fn open_collection(
     dir: &Path,
     cfg: &CollectionConfig,
+    salvage: bool,
 ) -> Result<(CollectionWriters, Collection, u64)> {
     // An interrupted compaction can leave the directory mid-swap; resolve that
     // first. A no-op otherwise.
     compact::settle(dir, cfg.id)?;
-    open_collection_in(&collection_dir(dir, cfg.id), cfg)
+    open_collection_with(&collection_dir(dir, cfg.id), cfg, salvage)
 }
 
 /// `open_collection` against an explicit directory — the canonical one, or a
-/// compaction's staging copy.
+/// compaction's staging copy. Never salvages: both of its other callers open
+/// directories they just created.
 fn open_collection_in(
     cdir: &Path,
     cfg: &CollectionConfig,
 ) -> Result<(CollectionWriters, Collection, u64)> {
+    open_collection_with(cdir, cfg, false)
+}
+
+/// The store file names, for `open_collection_with`'s refusals.
+const VECTORS_FILE: &str = "vectors.idx";
+const METADATA_FILE: &str = "metadata.snap";
+const TUPLES_FILE: &str = "tuples.snap";
+
+/// LOST-STORE POLICY. Opening never trades rows away silently — the posture
+/// of SQLite (`SQLITE_CORRUPT`), Postgres (checksum failure), RocksDB
+/// (`paranoid_checks`) and InnoDB alike.
+///
+/// A store whose file is missing or fails its checks comes up empty. That is
+/// only correct when the WAL still holds every record the store ever applied,
+/// and the proof is the collection's OTHER stores: WAL truncation never goes
+/// past the lowest watermark of any store (`IndexApplier::checkpoint`), so if
+/// every surviving store is still at watermark 0 — this generation was never
+/// checkpointed — nothing it needs can have been truncated, and replay refills
+/// the empty store exactly. That is the crash-before-first-checkpoint case the
+/// old "start empty, replay rebuilds" fallback was built for.
+///
+/// Any surviving watermark above 0 means a checkpoint happened and the log may
+/// have been cut past rows only the lost file held. A compaction flip counts:
+/// it stamps the new generation with the flip's LSN, and records from before
+/// it name ordinals that no longer exist. Then:
+///
+/// * by default, refuse with `CorruptSnapshot` naming the collection and the
+///   file. Nothing on disk is touched, so restoring a backup stays possible.
+/// * through `Db::open_salvage`, reset BOTH metadata stores (they hold liveness
+///   and values together — keeping one would leave live rows with no values),
+///   keep a damaged file as `<name>.damaged`, and set the collection's floor
+///   to the vector index's watermark: what replays is exactly what the log
+///   proves, never a pre-flip record onto renumbered rows, and the LSN counter
+///   resumes above every checkpoint, so later writes can't be mistaken for
+///   checkpointed ones. A lost vector index is not salvageable: without the
+///   vectors there's nothing to salvage onto.
+///
+/// All three files missing is a collection being materialized for the first
+/// time (open()-registration persists the catalog before the stores exist),
+/// and opens empty as it always has.
+fn open_collection_with(
+    cdir: &Path,
+    cfg: &CollectionConfig,
+    salvage: bool,
+) -> Result<(CollectionWriters, Collection, u64)> {
+    use crate::metadata::Loaded;
+
     let cdir = cdir.to_path_buf();
     std::fs::create_dir_all(&cdir)?;
 
-    let idx_path = cdir.join("vectors.idx");
-    let (flat_w, flat_r) = if idx_path.exists() {
+    let idx_path = cdir.join(VECTORS_FILE);
+    let idx_existed = idx_path.exists();
+    let (meta_w, meta_r, meta_loaded) = MetadataIndex::open_reporting(&cdir, cfg.schema.clone())?;
+    let (tuple_w, tuple_r, tuple_loaded) = TupleStore::open_reporting(&cdir, cfg.schema.clone())?;
+
+    let fresh = !idx_existed && meta_loaded == Loaded::Missing && tuple_loaded == Loaded::Missing;
+    let lost = |l: &Loaded| !matches!(l, Loaded::Snapshot(_));
+    // The highest watermark among the stores that survived: the evidence of
+    // whether a checkpoint (and so a truncation) ever happened.
+    let mut evidence = 0u64;
+    if !lost(&meta_loaded) {
+        evidence = evidence.max(meta_loaded.lsn().0);
+    }
+    if !lost(&tuple_loaded) {
+        evidence = evidence.max(tuple_loaded.lsn().0);
+    }
+
+    let (flat_w, flat_r) = if idx_existed {
         FlatIndex::open(&idx_path)?
     } else {
+        if !fresh && evidence > 0 {
+            return Err(lost_store(cfg, VECTORS_FILE, &Loaded::Missing, false));
+        }
         FlatIndex::create(&idx_path, cfg.schema.vector().dim, cfg.capacity)?
     };
-    // The metadata stores' open() treats a corrupt snapshot as "empty at
-    // Lsn(0)" — the WAL replays them back to life. A corrupt store's 0 drags
-    // the min watermark down, forcing the full-tail replay that heals it
-    // while the healthy stores absorb the replay idempotently.
-    let (meta_w, meta_r, meta_lsn) = MetadataIndex::open_or_create(&cdir, cfg.schema.clone())?;
-    let (tuple_w, tuple_r, tuple_lsn) = TupleStore::open_or_create(&cdir, cfg.schema.clone())?;
+    let flat_lsn = flat_w.checkpoint_lsn();
+    evidence = evidence.max(flat_lsn);
 
-    let watermark = flat_w.checkpoint_lsn().min(meta_lsn.0).min(tuple_lsn.0);
+    let any_lost = lost(&meta_loaded) || lost(&tuple_loaded);
+    let (meta_w, meta_r, tuple_w, tuple_r, watermark) = if !any_lost {
+        let watermark = flat_lsn.min(meta_loaded.lsn().0).min(tuple_loaded.lsn().0);
+        (meta_w, meta_r, tuple_w, tuple_r, watermark)
+    } else if fresh || evidence == 0 {
+        // Rebuildable: the log holds everything. Write the empty snapshot now
+        // (as `create` always has) so the next open finds a file, and let the
+        // 0 drag the floor down: the full-tail replay refills this store while
+        // the healthy ones absorb it idempotently.
+        let (meta_w, meta_r) = if lost(&meta_loaded) {
+            MetadataIndex::create(&cdir, cfg.schema.clone())?
+        } else {
+            (meta_w, meta_r)
+        };
+        let (tuple_w, tuple_r) = if lost(&tuple_loaded) {
+            TupleStore::create(&cdir, cfg.schema.clone())?
+        } else {
+            (tuple_w, tuple_r)
+        };
+        (meta_w, meta_r, tuple_w, tuple_r, 0)
+    } else if salvage {
+        for (file, loaded) in [(METADATA_FILE, &meta_loaded), (TUPLES_FILE, &tuple_loaded)] {
+            if let Loaded::Corrupt(_) = loaded {
+                std::fs::rename(cdir.join(file), cdir.join(format!("{file}.damaged")))?;
+            }
+            if lost(loaded) {
+                eprintln!("flats: salvage: {}", lost_store(cfg, file, loaded, true));
+            }
+        }
+        let (meta_w, meta_r) = MetadataIndex::create(&cdir, cfg.schema.clone())?;
+        let (tuple_w, tuple_r) = TupleStore::create(&cdir, cfg.schema.clone())?;
+        (meta_w, meta_r, tuple_w, tuple_r, flat_lsn)
+    } else {
+        let (file, loaded) = if lost(&meta_loaded) {
+            (METADATA_FILE, &meta_loaded)
+        } else {
+            (TUPLES_FILE, &tuple_loaded)
+        };
+        return Err(lost_store(cfg, file, loaded, false));
+    };
+
     // ONE handle, shared by both sides. The applier could reach the read-side
     // Collection through the catalog instead, but that is an RwLock read plus a
     // HashMap lookup per record, on the write path, forever.
@@ -318,6 +422,35 @@ fn open_collection_in(
         },
         watermark,
     ))
+}
+
+/// The refusal for a store the log can't rebuild — or, when `salvaged`, the
+/// notice that salvage gave up its rows.
+fn lost_store(
+    cfg: &CollectionConfig,
+    file: &str,
+    loaded: &crate::metadata::Loaded,
+    salvaged: bool,
+) -> Error {
+    use crate::metadata::Loaded;
+    let what = match loaded {
+        Loaded::Corrupt(why) => format!("is damaged ({why})"),
+        Loaded::Missing | Loaded::Snapshot(_) => "is missing".to_string(),
+    };
+    let head = format!("collection '{}' (id {}): {file} {what}", cfg.name, cfg.id);
+    Error::CorruptSnapshot(if salvaged {
+        format!(
+            "{head}; opened with only the rows written since its last checkpoint, \
+             the rest are gone"
+        )
+    } else {
+        format!(
+            "{head}, and its rows were checkpointed out of the write-ahead log, so \
+             opening would lose them. Nothing was changed. Restore a backup, or open \
+             once with Db::open_salvage to keep only the rows written since the \
+             last checkpoint"
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -903,7 +1036,7 @@ impl IndexApplier {
         }
 
         let materialized = (|| -> Result<(CollectionWriters, Collection)> {
-            let (writers, collection, watermark) = open_collection(&self.dir, config)?;
+            let (writers, collection, watermark) = open_collection(&self.dir, config, false)?;
             self.floors.insert(config.id, watermark);
             // The new collection-{id}/ entry itself must survive a crash: the
             // stores fsync'd their own files, but the parent dir entry is
@@ -1295,7 +1428,39 @@ impl Db {
         collections: &[CollectionConfig],
         opts: DbOptions,
     ) -> Result<Db> {
-        let dir = dir.as_ref();
+        Self::open_inner(dir.as_ref(), collections, opts, false)
+    }
+
+    /// [`open`](Db::open), but get past a collection whose store file is
+    /// damaged or missing in a way the write-ahead log can't repair, giving up
+    /// the rows only that file held.
+    ///
+    /// Without this, such a database refuses to open with
+    /// [`Error::CorruptSnapshot`] (naming the collection and the file) and
+    /// nothing on disk is touched, so restoring a backup is still possible.
+    /// Prefer that. Salvage is for when there is no backup.
+    ///
+    /// Each damaged collection opens holding only the rows written since its
+    /// last checkpoint (the ones the log still has) and is fully usable; the
+    /// damaged file is kept beside it as `<name>.damaged`, and each salvage is
+    /// reported on stderr. Healthy collections open as usual. It does not get
+    /// past a damaged `catalog.snap` (the list of collections, which no log
+    /// can rebuild) or a damaged vector index. Use it for one open, then go
+    /// back to [`open`](Db::open): once salvaged, the database is healthy.
+    pub fn open_salvage(
+        dir: impl AsRef<Path>,
+        collections: &[CollectionConfig],
+        opts: DbOptions,
+    ) -> Result<Db> {
+        Self::open_inner(dir.as_ref(), collections, opts, true)
+    }
+
+    fn open_inner(
+        dir: &Path,
+        collections: &[CollectionConfig],
+        opts: DbOptions,
+        salvage: bool,
+    ) -> Result<Db> {
         std::fs::create_dir_all(dir)?;
         // FIRST, before reading or writing anything: one handle per directory.
         let lock = lock_directory(dir)?;
@@ -1374,7 +1539,8 @@ impl Db {
         let mut min_watermark = u64::MAX;
         let mut floors: HashMap<u32, u64> = HashMap::with_capacity(registry.len());
         for cfg in &registry {
-            let (collection_writers, collection, watermark) = open_collection(dir, cfg)?;
+            let (collection_writers, collection, watermark) =
+                open_collection(dir, cfg, salvage)?;
             min_watermark = min_watermark.min(watermark);
             floors.insert(cfg.id, watermark);
             map.insert(cfg.id, Arc::new(collection));

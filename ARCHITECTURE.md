@@ -280,12 +280,23 @@ Two properties make the min-watermark scheme sound:
 
 - **Idempotent applies** — re-delivering a record a store already has is a
   no-op (bitmap set-insert, slot overwrite-with-same).
-- **Corrupt/missing snapshot ⇒ empty at LSN 0** — the store's 0 drags the
-  global min down, forcing a full-tail replay that heals it while the healthy
-  stores absorb the replay harmlessly. (Only crash-produced tears are covered:
-  atomic rename means a torn checkpoint leaves the *old complete* snapshot,
-  whose watermark bounds truncation. Bit-rot after the WAL truncated past the
-  data is unrecoverable — accepted.)
+- **A lost store is rebuilt only when that provably loses nothing.** A
+  snapshot that is missing or fails its checks comes up empty, and that is
+  only correct if the WAL still holds every record the store ever applied.
+  The proof is the collection's surviving stores: truncation never passes the
+  lowest watermark of any store, so if every survivor is still at watermark 0
+  (this generation was never checkpointed, i.e. the crash-before-first-
+  checkpoint case) the store's 0 drags the min down and the full-tail replay
+  refills it while the healthy stores absorb it idempotently. Any surviving
+  watermark above 0 (a checkpoint, or a compaction flip, which renumbers
+  rows) means the log may be cut past rows only the lost file held, so `open`
+  **refuses** with `CorruptSnapshot`, naming the collection and file and
+  touching nothing, the same posture as SQLite, Postgres, RocksDB and
+  InnoDB. `Db::open_salvage` is the explicit way past it: both metadata
+  stores reset, the damaged file is kept as `<name>.damaged`, and the
+  collection's floor is set to the vector index's watermark, so exactly the
+  records the log proves replay, none land on renumbered rows, and the LSN
+  counter resumes above every checkpoint. See `open_collection_with`.
 
 Same SWMR posture as the flat index: each store is a `!Clone` `Writer` (lives
 in the applier) + cloneable `Reader`s, though internally it's a plain Mutex for
@@ -474,8 +485,9 @@ under the same `// SAFETY:` rule as the engine's quarantines.
 - Per-collection truncation precision — the WAL still truncates at the
   conservative global min. Replay, though, now skips each collection's records
   at or below that collection's own watermark (§6).
-- Snapshot bit-rot *after* the WAL truncated past its data (outside the crash
-  model; see §4).
+- Recovering rows from a damaged snapshot once the WAL is truncated past
+  them. Open refuses, and salvage keeps only what the log proves (§4). A
+  previous-snapshot copy per store would make that lossless; not built.
 - Catalog rebuild from the WAL — registration isn't logged yet; corrupt
   `catalog.snap` is a refusal, not a recovery (see §5).
 - Anything in `CLAUDE.md` §2 non-goals (ANN and the rest).

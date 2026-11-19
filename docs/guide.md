@@ -230,6 +230,18 @@ database stays open. Reads continue during the copy; writes wait for it. The
 copy holds whole statements only. To restore, open the copy. `dest` must not
 exist or must be empty.
 
+**If a database refuses to open.** Each collection keeps its vectors, its
+filter index and its values in separate files. If one of the last two is
+damaged or missing (disk corruption, a bad copy), Flats rebuilds it from the
+log when the log provably still holds all of it. Otherwise opening fails
+with an error naming the collection and the file ("corrupt snapshot:
+collection 'docs' (id 0): tuples.snap is damaged ...") and changes nothing on
+disk. Restore your latest backup. If there is none, open it once with
+`Db::open_salvage` from Rust: each damaged collection comes back with only the
+rows written since its last checkpoint, the damaged file is kept beside it as
+`<name>.damaged`, and the database is healthy again from then on. Copy the
+directory first if what's left matters.
+
 **Concurrency.** One database handle can be shared by many threads. Reads run
 in parallel and never block; writes are serialized. Each statement sees one
 consistent snapshot. There are no multi-statement transactions. Async apps

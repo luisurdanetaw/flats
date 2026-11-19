@@ -174,30 +174,45 @@ impl TupleStore {
     /// corrupt snapshot falls back to empty at Lsn(0) (surfaced, not silent;
     /// WAL replay rebuilds), while a schema mismatch is a real error.
     pub fn open(dir: &Path, schema: Schema) -> Result<(Writer, Reader, Lsn)> {
+        let (writer, reader, loaded) = Self::open_reporting(dir, schema)?;
+        if let crate::metadata::Loaded::Corrupt(why) = &loaded {
+            // No logger yet — but losing this signal silently makes
+            // "my checkpoint never sticks" undebuggable.
+            eprintln!(
+                "flats: {} corrupt ({why}); starting empty, WAL replay rebuilds",
+                dir.join(SNAP_FILE).display()
+            );
+        }
+        Ok((writer, reader, loaded.lsn()))
+    }
+
+    /// `open`, but saying what it found instead of folding a missing or
+    /// corrupt file into "empty at Lsn(0)". The engine opens through this: a
+    /// store that came up empty is only safe when the WAL can refill it, and
+    /// only the engine can tell.
+    pub fn open_reporting(
+        dir: &Path,
+        schema: Schema,
+    ) -> Result<(Writer, Reader, crate::metadata::Loaded)> {
+        use crate::metadata::Loaded;
         let snap = dir.join(SNAP_FILE);
-        let decoded = match std::fs::read(&snap) {
+        let (decoded, loaded) = match std::fs::read(&snap) {
             Ok(bytes) => match decode_snapshot(&bytes) {
-                Ok(v) => Some(v),
-                Err(Error::CorruptSnapshot(why)) => {
-                    eprintln!(
-                        "flats: {} corrupt ({why}); starting empty, WAL replay rebuilds",
-                        snap.display()
-                    );
-                    None
-                }
+                Ok((inner, lsn)) => (Some(inner), Loaded::Snapshot(lsn)),
+                Err(Error::CorruptSnapshot(why)) => (None, Loaded::Corrupt(why)),
                 Err(e) => return Err(e),
             },
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (None, Loaded::Missing),
             Err(e) => return Err(e.into()),
         };
-        let (inner, last_lsn) = match decoded {
-            Some((inner, lsn)) => {
+        let inner = match decoded {
+            Some(inner) => {
                 if inner.schema != schema {
                     return Err(Error::SchemaMismatch);
                 }
-                (inner, lsn)
+                inner
             }
-            None => (TupleInner::empty(schema), Lsn(0)),
+            None => TupleInner::empty(schema),
         };
         let inner = Arc::new(Mutex::new(inner));
         Ok((
@@ -206,7 +221,7 @@ impl TupleStore {
                 dir: dir.to_path_buf(),
             },
             Reader { inner },
-            last_lsn,
+            loaded,
         ))
     }
 
