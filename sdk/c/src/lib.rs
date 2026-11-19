@@ -873,6 +873,12 @@ impl flats_batch {
             .columns
             .get(column)
             .ok_or_else(|| Fail::invalid(format!("no column {column:?} in this collection")))?;
+        // An integer into a FLOAT column coerces, exactly as V-SQL's
+        // `INSERT ... VALUES (1)` and a `?` parameter do. Nothing else does.
+        let value = match value {
+            Value::Int(i) if ty == ColumnType::Float => Value::Float(i as f64),
+            other => other,
+        };
         if value.column_type() != ty {
             return Err(Fail::invalid(format!(
                 "column {column:?} is {ty:?}, not {:?}",

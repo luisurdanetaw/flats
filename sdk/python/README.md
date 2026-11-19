@@ -112,6 +112,7 @@ n = db.insert("docs", (
 
 - Every column must be present in every row, including the primary key.
 - Python types map directly: `int` → INT, `float` → FLOAT, `str` → TEXT.
+  An `int` also goes into a FLOAT column (stored as a float, as in V-SQL).
   `bool` and `None` are refused.
 - The vector is the row's one sequence value: a `list`, `tuple`,
   `array.array`, NumPy array or anything else that is a sequence of numbers.

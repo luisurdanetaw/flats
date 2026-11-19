@@ -207,7 +207,8 @@ every finished row as a single statement:
    good rhythm), and finally `flats_batch_free(b)`.
 
 Every value is checked against the schema as you add it, so a wrong type or
-length fails on the call that supplied it. `flats_batch_end_row` fails if a
+length fails on the call that supplied it. `flats_batch_int` into a FLOAT
+column stores the value as a float, as V-SQL does; nothing else converts. `flats_batch_end_row` fails if a
 column is missing, and drops that half-built row. `flats_batch_commit` is
 all-or-nothing: a duplicate key anywhere refuses every row in the batch. The
 batch is emptied either way and can be reused.
