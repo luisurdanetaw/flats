@@ -1,0 +1,73 @@
+# Coverage-guided fuzzing with libFuzzer (`fuzz/run.sh`).
+#
+# A standalone crate with its OWN workspace: nothing here is a dependency of
+# `flats` or of the SDKs, and `cargo build`/`cargo test` at the root never see
+# it. `libfuzzer-sys` (which bundles libFuzzer) is the only crate it adds,
+# approved for fuzzing only. Delete this directory and nothing else changes.
+[package]
+name = "flats-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+flats = { path = "..", features = ["internals"] }
+
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "sql_parse"
+path = "fuzz_targets/sql_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sql_execute"
+path = "fuzz_targets/sql_execute.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_record"
+path = "fuzz_targets/wal_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metadata_snapshot"
+path = "fuzz_targets/metadata_snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tuple_snapshot"
+path = "fuzz_targets/tuple_snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "catalog"
+path = "fuzz_targets/catalog.rs"
+test = false
+doc = false
+bench = false
+
+# Not a fuzz target: writes a seed corpus of real, valid inputs.
+[[bin]]
+name = "make_seeds"
+path = "make_seeds.rs"
+test = false
+doc = false
+bench = false

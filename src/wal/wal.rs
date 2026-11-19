@@ -211,6 +211,14 @@ impl Record {
     }
 }
 
+/// Fuzzing hook: decode `data` as a WAL frame payload that passed its CRC.
+/// Must return for any input, never panic.
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub fn fuzz_decode_record(data: &[u8]) -> bool {
+    Record::decode(data).is_ok()
+}
+
 /// What the applier DID with a record that was already made durable.
 ///
 /// Distinct from `Err`, and the distinction matters since Phase 7: an `Err`

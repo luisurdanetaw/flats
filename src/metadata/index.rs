@@ -2071,3 +2071,11 @@ mod tests {
         assert_eq!(handle.materializations(), 1, "a read builds one snapshot");
     }
 }
+
+/// Fuzzing hook: decode `data` as a snapshot body that passed every framing
+/// check. Must return (`Ok` or `Err`) for any input, never panic.
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub fn fuzz_decode_snapshot(data: &[u8]) -> bool {
+    decode_snapshot(&crate::metadata::frame_for_fuzz(MAGIC, VERSION, data)).is_ok()
+}

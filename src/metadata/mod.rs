@@ -54,6 +54,24 @@ impl Loaded {
     }
 }
 
+/// For the coverage-guided fuzzer (`fuzz/`): `body` framed as a snapshot
+/// file that passes the magic, version, length and CRC checks, so the fuzzer
+/// spends its time in the decoding behind them rather than on a checksum it
+/// can never forge. The first 8 bytes of `data`, when present, are the LSN.
+#[cfg(feature = "internals")]
+pub(crate) fn frame_for_fuzz(magic: &[u8; 4], version: u32, data: &[u8]) -> Vec<u8> {
+    let (lsn, body) = if data.len() >= 8 { data.split_at(8) } else { (&[0u8; 8][..], data) };
+    let mut out = Vec::with_capacity(body.len() + 24);
+    out.extend_from_slice(magic);
+    out.extend_from_slice(&version.to_le_bytes());
+    out.extend_from_slice(lsn);
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(body);
+    let crc = crc32(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out
+}
+
 /// Shared CRC-32 over a byte slice — the integrity check trailing every
 /// snapshot file (metadata.snap, tuples.snap, catalog.snap).
 pub(crate) fn crc32(bytes: &[u8]) -> u32 {

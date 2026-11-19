@@ -12,6 +12,7 @@ failure names its seed, and the seed replays it exactly.
 | `tests/crash_kill.rs` | SIGKILLs a child process running a workload at random moments | Torn files, non-atomic steps, recovery bugs |
 | `tests/failpoints.rs` | Fails, then crashes or carries on, at every step of every durability path | Crash-safety and error-handling bugs at exact points |
 | `tests/fuzz.rs` | Hostile statement text, damaged and forged files | Panics, poisoning, silent misreads |
+| `fuzz/run.sh` | Coverage-guided libFuzzer with AddressSanitizer: parser, full query pipeline, every decoder | Panics, memory errors, unbounded allocation or time |
 
 ## The reference model (`tests/sim`)
 
@@ -79,6 +80,41 @@ Bugs these found, each now a regression test:
   acknowledged write. After a failed write, the log is now cut back to where
   the batch started.
 
+## Coverage-guided fuzzing (`fuzz/`)
+
+A standalone crate with its own workspace, so nothing in it is a dependency
+of Flats. It adds `libfuzzer-sys`, which bundles libFuzzer. `fuzz/run.sh`
+builds with the flags `cargo fuzz` would use (sanitizer coverage, comparison
+tracing, ASan), seeds each corpus with real inputs (`fuzz/make_seeds.rs`),
+and runs:
+
+| Target | Input |
+|---|---|
+| `sql_parse` | any text into the lexer and parser |
+| `sql_execute` | any SELECT/SEARCH through bind, plan, compile and the VM, on a live database |
+| `wal_record` | a WAL frame payload, past its CRC |
+| `metadata_snapshot`, `tuple_snapshot`, `catalog` | a snapshot body, past magic, version, length and CRC |
+
+The decoders sit behind CRCs a fuzzer can never forge, so the hooks
+(`fuzz_decode_*`, under the `internals` feature) re-frame the fuzzer's
+bytes as a valid file. That lets it spend its time in the decoding itself.
+
+```sh
+fuzz/run.sh                    # every target, 60 s each (nightly toolchain)
+fuzz/run.sh sql_execute 3600   # one target, an hour
+fuzz/run.sh catalog 0 fuzz/artifacts/catalog/crash-…   # replay a crash
+```
+
+Nightly CI runs each target for 40 minutes on 2 cores, and caches the
+corpus so it keeps growing across nights.
+
+## Coverage
+
+`scripts/coverage.sh [--html]` measures line, region and branch coverage of
+`src/` under the whole suite, randomized harnesses included. It uses rustc's
+`-C instrument-coverage` and the `llvm-tools` component, with no cargo plugin.
+`COVERAGE_MIN=<pct>` makes it fail below a floor.
+
 ## Replaying and scaling
 
 ```sh
@@ -99,9 +135,6 @@ nightly job uses it to cover new ground each night.
   keeps the page cache, so it can't test fsync discipline. The tool for that
   is LazyFS, a FUSE filesystem that drops unsynced data on command. It needs
   `libfuse3-dev` on the runner and hasn't been wired in.
-- **Coverage-guided fuzzing** (cargo-fuzz / ClusterFuzzLite) of the lexer,
-  parser and file decoders. It needs `libfuzzer-sys` and `arbitrary`, which
-  are dev-only crates, and the code owner's approval for new dependencies.
 - **Concurrency**: the harnesses drive the database from one thread. The
   concurrency suites (`swmr`, `concurrent_stores`, `thread_safety`) cover
   races separately.

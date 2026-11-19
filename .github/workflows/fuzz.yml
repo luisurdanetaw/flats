@@ -13,6 +13,8 @@ name: Fuzz
 #   tests/crash_kill.rs    SIGKILL at random moments; acknowledged writes survive
 #   tests/failpoints.rs    fail and crash at every step of every durability path
 #   tests/fuzz.rs          hostile statement text and damaged files: never panic
+#   fuzz/run.sh            coverage-guided libFuzzer (+ASan) on the parser, the
+#                          query pipeline and every decoder
 #
 # A failure uploads target/sim-failures (each report has the seed, a minimal
 # reproduction and the replay command) and, nightly, opens an issue.
@@ -74,6 +76,71 @@ jobs:
           path: target/sim-failures
           if-no-files-found: ignore
 
+  libfuzzer-quick:
+    name: libFuzzer (quick)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly
+        run: rustup toolchain install nightly --profile minimal --no-self-update
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: fuzz every target for 30 s
+        run: fuzz/run.sh all 30
+      - name: upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-failures-libfuzzer-quick
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
+  libfuzzer-nightly:
+    name: libFuzzer (nightly, ${{ matrix.target }})
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [sql_parse, sql_execute, wal_record, metadata_snapshot, tuple_snapshot, catalog]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly
+        run: rustup toolchain install nightly --profile minimal --no-self-update
+      # The corpus is the fuzzer's memory: keep it growing across nights.
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: fuzz for 40 minutes on 2 cores
+        run: FUZZ_JOBS=2 fuzz/run.sh ${{ matrix.target }} $(( 2400 * ${{ github.event.inputs.scale || 1 }} ))
+      - name: describe the crashing inputs
+        if: failure()
+        run: |
+          mkdir -p target/sim-failures
+          for f in fuzz/artifacts/${{ matrix.target }}/*; do
+            [ -f "$f" ] || continue
+            { echo "libFuzzer target ${{ matrix.target }}: $(basename "$f")"; echo
+              echo "replay: fuzz/run.sh ${{ matrix.target }} 0 <this input>"; echo
+              echo "input (hex):"; xxd "$f" | head -64; } > "target/sim-failures/libfuzzer-${{ matrix.target }}-$(basename "$f").txt"
+          done
+      - name: upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-failures-libfuzzer-${{ matrix.target }}
+          path: |
+            target/sim-failures
+            fuzz/artifacts
+          if-no-files-found: ignore
+
   nightly:
     name: fuzz (nightly, shard ${{ matrix.shard }})
     if: github.event_name != 'pull_request'
@@ -128,7 +195,7 @@ jobs:
 
   report:
     name: open an issue for nightly failures
-    needs: nightly
+    needs: [nightly, libfuzzer-nightly]
     if: failure() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     permissions:
@@ -144,8 +211,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          shopt -s nullglob
-          files=(failures/*/*.txt)
+          mapfile -t files < <(find failures -name '*.txt' 2>/dev/null | sort)
           if [ ${#files[@]} -eq 0 ]; then
             title="Nightly fuzz failed (no report file; see the run log)"
             gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[].number' | grep -q . \
