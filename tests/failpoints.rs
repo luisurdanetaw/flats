@@ -182,7 +182,8 @@ fn model_without(before: &Model) -> Model {
 fn sweep_one(seed: u64, mode: Mode) -> u64 {
     let ops: Vec<Op> = gen_workload(seed, 220);
     let mut rng = Rng::new(seed ^ 0xFA17);
-    let mut sim = Sim::new(seed);
+    // Quiet background: a fault must fire inside the op it's attributed to.
+    let mut sim = Sim::new_with(seed, opts());
     let arm = |rng: &mut Rng| {
         let site = *rng.pick(failpoint::SITES);
         failpoint::arm(site, rng.below(6));

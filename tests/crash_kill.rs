@@ -18,7 +18,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use sim::{Model, Op, Rng, Sim, env_u64, gen_workload, opts, verify_db};
+use sim::{Model, Op, Rng, Sim, env_u64, gen_workload, verify_db};
 
 const OPS: usize = 400;
 
@@ -125,7 +125,7 @@ fn crash_once(seed: u64) {
     }
     let acked = last_ack.map_or(0, |i| i + 1);
 
-    let db = flats::Db::open(root.path().join("db"), &[], opts())
+    let db = flats::Db::open(root.path().join("db"), &[], sim::opts_for(seed))
         .unwrap_or_else(|e| panic!("seed {seed}: recovery after a kill at op {acked} failed: {e}"));
     let exact = verify_db(&db, &model_after(&ops, acked));
     let with_inflight = verify_db(&db, &model_after(&ops, acked + 1));
@@ -142,7 +142,7 @@ fn crash_once(seed: u64) {
     drop(db);
 
     // And it still works: finish the workload on the recovered database.
-    let mut sim = Sim::at(root.path(), seed ^ 1);
+    let mut sim = Sim::at(root.path(), seed);
     sim.model = model_after(&ops, survivors);
     if let Err((i, e)) = sim.run(&ops[survivors.min(ops.len())..], 25) {
         panic!(

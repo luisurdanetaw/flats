@@ -1468,6 +1468,28 @@ pub fn opts() -> DbOptions {
     }
 }
 
+/// The background threads at their busiest: a checkpoint every few
+/// milliseconds and a compaction as soon as any row is dead. Results don't
+/// depend on timing, so the model applies unchanged — but every statement
+/// now races a background flip or checkpoint, and a kill can land inside one.
+pub fn busy_opts() -> DbOptions {
+    DbOptions {
+        checkpoint_interval: Duration::from_millis(5),
+        compaction: CompactionOptions {
+            enabled: true,
+            waste_ratio: 0.0,
+            waste_min_dead: 1,
+            headroom_ratio: 0.0,
+            headroom_min_dead_ratio: 0.0,
+        },
+    }
+}
+
+/// Which options a seed runs with: odd seeds keep the background busy.
+pub fn opts_for(seed: u64) -> DbOptions {
+    if seed % 2 == 1 { busy_opts() } else { opts() }
+}
+
 fn to_lit(v: &RegValue) -> Lit {
     match v {
         RegValue::Int(i) => Lit::Int(*i),
@@ -1611,6 +1633,7 @@ pub struct Sim {
     pub model: Model,
     rng: Rng,
     backups: u32,
+    opts: DbOptions,
     /// Percent of literals sent as `?` parameters.
     pub param_pct: u64,
     /// What the workload actually exercised; see [`Stats`].
@@ -1636,15 +1659,24 @@ pub struct Stats {
 
 impl Sim {
     pub fn new(seed: u64) -> Sim {
+        Sim::new_with(seed, opts_for(seed))
+    }
+
+    /// `new`, with these options instead of the seed's.
+    pub fn new_with(seed: u64, opts: DbOptions) -> Sim {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mut sim = Sim::at(tmp.path(), seed);
+        let mut sim = Sim::at_with(tmp.path(), seed, opts);
         sim._tmp = Some(tmp);
         sim
     }
 
     /// A simulator over `root/db`, which may already hold a database.
     pub fn at(root: &Path, seed: u64) -> Sim {
-        let db = Db::open(root.join("db"), &[], opts()).expect("open");
+        Sim::at_with(root, seed, opts_for(seed))
+    }
+
+    fn at_with(root: &Path, seed: u64, opts: DbOptions) -> Sim {
+        let db = Db::open(root.join("db"), &[], opts).expect("open");
         Sim {
             _tmp: None,
             root: root.to_path_buf(),
@@ -1652,6 +1684,7 @@ impl Sim {
             model: Model::default(),
             rng: Rng::new(seed ^ 0xA5A5),
             backups: 0,
+            opts,
             param_pct: 40,
             stats: Stats::default(),
         }
@@ -1672,7 +1705,7 @@ impl Sim {
         } else {
             drop(db);
         }
-        self.db = Some(Db::open(self.path(), &[], opts()).map_err(|e| format!("reopen: {e}"))?);
+        self.db = Some(Db::open(self.path(), &[], self.opts).map_err(|e| format!("reopen: {e}"))?);
         self.verify_all()
     }
 
@@ -1681,7 +1714,7 @@ impl Sim {
     /// the caller decides what the recovered state may be.
     pub fn crash_and_reopen(&mut self) -> Result<(), String> {
         drop(self.db.take());
-        self.db = Some(Db::open(self.path(), &[], opts()).map_err(|e| format!("reopen: {e}"))?);
+        self.db = Some(Db::open(self.path(), &[], self.opts).map_err(|e| format!("reopen: {e}"))?);
         Ok(())
     }
 
@@ -1749,7 +1782,8 @@ impl Sim {
                 self.db()
                     .backup(&dest)
                     .map_err(|e| format!("backup: {e}"))?;
-                let copy = Db::open(&dest, &[], opts()).map_err(|e| format!("open backup: {e}"))?;
+                let copy =
+                    Db::open(&dest, &[], self.opts).map_err(|e| format!("open backup: {e}"))?;
                 let verdict = verify_db(&copy, &self.model).map_err(|e| format!("backup: {e}"));
                 copy.close().map_err(|e| format!("close backup: {e}"))?;
                 let _ = std::fs::remove_dir_all(&dest);
