@@ -249,9 +249,10 @@ fn a_damaged_store_in_one_collection_names_that_collection() {
 }
 
 #[test]
-fn a_damaged_store_in_a_collection_that_was_never_written_is_rebuilt() {
-    // An empty collection's stores stay at watermark 0, which proves the log
-    // was never cut past anything it held: rebuilding it loses nothing.
+fn a_damaged_store_in_an_idle_collection_refuses_once_checkpointed_and_salvages() {
+    // A checkpoint moves every store's watermark, written or not (that is
+    // what lets the log shed records), so after one the log is no proof of
+    // an idle collection's contents either.
     let dir = tempfile::tempdir().unwrap();
     {
         let db = open(dir.path());
@@ -264,9 +265,19 @@ fn a_damaged_store_in_a_collection_that_was_never_written_is_rebuilt() {
         db.close().unwrap();
     }
     damage(&dir.path().join("collection-1").join("metadata.snap"));
-    let db = open(dir.path());
-    assert_eq!(ids(&db), vec![1]);
+    let why = refusal(dir.path());
+    assert!(why.contains("'other'"), "{why}");
+
+    let db = salvage(dir.path()).unwrap();
+    assert_eq!(ids(&db), vec![1], "the healthy collection is untouched");
     assert_eq!(db.execute("SELECT id FROM other;").unwrap().count(), 0);
+    db.close().unwrap();
+    assert!(
+        dir.path()
+            .join("collection-1/metadata.snap.damaged")
+            .exists()
+    );
+    let db = open(dir.path());
     db.close().unwrap();
 }
 

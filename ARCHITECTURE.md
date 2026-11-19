@@ -216,6 +216,13 @@ every collection, not the max. A frame at LSN L is redundant only once *every*
 store that might own it is durable past L. If any one store's checkpoint fails,
 the whole round errs and truncation is skipped — retried next tick.
 
+Before syncing, every store is advanced to the commit thread's `last_applied`.
+Every record at or below it has been fully processed for every collection, so
+a store whose collection wasn't written since is exactly as caught up as the
+busiest one. Without that, an idle collection's watermark stayed at its last
+write (or 0) forever and the min pinned the whole log: unbounded WAL growth,
+full replay on every open (`tests/wal_truncation.rs`).
+
 ### Recovery (`Db::open`)
 
 Each store's persisted watermark says which prefix is already folded into it.

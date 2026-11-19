@@ -445,8 +445,9 @@ fn lost_store(
         )
     } else {
         format!(
-            "{head}, and its rows were checkpointed out of the write-ahead log, so \
-             opening would lose them. Nothing was changed. Restore a backup, or open \
+            "{head}, and the write-ahead log may no longer hold everything it did \
+             (a checkpoint has run since), so opening could lose rows. Nothing was \
+             changed. Restore a backup, or open \
              once with Db::open_salvage to keep only the rows written since the \
              last checkpoint"
         )
@@ -794,8 +795,24 @@ impl Apply for IndexApplier {
         if let Some(cause) = &self.halted {
             return Err(io::Error::other(cause.clone()));
         }
+        // Every record at or below `last_applied` has been fully processed,
+        // for every collection: applied, or refused/conflicted (which also
+        // leaves the stores fully reflecting it). A store whose collection
+        // saw none of the records since its own last write is therefore just
+        // as caught up as the busiest one, so it is durable through
+        // `last_applied` too. Without this, a store's watermark only moves
+        // when its own collection is written: an idle collection sat at 0
+        // forever, and since truncation stops at the lowest watermark, it
+        // held the whole log back — the file grew without bound and every
+        // open replayed all of it. (Compaction stamps its new generation with
+        // `last_applied` on the same argument.) A failed apply halts the log
+        // before this can run, so there is never a hole below it.
+        let through = self.last_applied;
         let mut min_durable = u64::MAX;
         for w in self.writers.values_mut() {
+            w.flat.advance_applied_lsn(through);
+            w.meta.advance_applied_lsn(Lsn(through));
+            w.tuple.advance_applied_lsn(Lsn(through));
             min_durable = min_durable.min(w.checkpoint()?);
         }
 
