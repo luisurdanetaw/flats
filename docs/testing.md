@@ -116,6 +116,12 @@ corpus so it keeps growing across nights.
 `-C instrument-coverage` and the `llvm-tools` component, with no cargo plugin.
 `COVERAGE_MIN=<pct>` makes it fail below a floor.
 
+Baseline (2026-11-19): **94.8% of lines, 93.0% of regions, 82.9% of
+branches** of `src/`. The nightly job fails below 93% lines and publishes the
+HTML report. The weakest spots when measured were the scalar kernel's
+dispatch path on AVX2 machines (the aarch64 CI job covers NEON natively),
+`vm/exec.rs` regions (80%) and `query.rs` branches (63%).
+
 ## Replaying and scaling
 
 ```sh

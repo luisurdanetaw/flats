@@ -20,7 +20,7 @@ categories = ["database-implementations", "data-structures"]
 # NOT SET YET: `license` (or `license-file`). crates.io refuses a publish
 # without one, and choosing it is the code owner's call.
 # The language bindings are workspace members with their own packaging.
-exclude = ["sdk/", ".github/", ".idea/"]
+exclude = ["sdk/", ".github/", ".idea/", "fuzz/", "scripts/"]
 
 [dependencies]
 thiserror = "2"

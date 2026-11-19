@@ -201,9 +201,41 @@ jobs:
           path: target/sim-failures
           if-no-files-found: ignore
 
+  coverage:
+    name: coverage (nightly)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly with llvm-tools
+        run: |
+          rustup toolchain install nightly --profile minimal --component llvm-tools --no-self-update
+          rustup default nightly
+      - name: measure (fails below the floor)
+        run: COVERAGE_MIN=93 scripts/coverage.sh --html | tee coverage.txt
+      - name: explain a drop
+        if: failure()
+        run: |
+          mkdir -p target/sim-failures
+          { echo "Line coverage fell below the 93% floor."; echo; cat coverage.txt; } \
+            > target/sim-failures/coverage-below-floor.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-html
+          path: target/coverage/html
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: sim-failures-coverage
+          path: target/sim-failures
+          if-no-files-found: ignore
+
   report:
     name: open an issue for nightly failures
-    needs: [nightly, libfuzzer-nightly]
+    needs: [nightly, libfuzzer-nightly, coverage]
     if: failure() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     permissions:
