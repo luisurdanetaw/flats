@@ -12,6 +12,7 @@ name: Fuzz
 #   fuzz/sqlite_diff.py    the same WHERE text through Flats and SQLite (Python SDK)
 #   tests/crash_kill.rs    SIGKILL at random moments; acknowledged writes survive
 #   tests/failpoints.rs    fail and crash at every step of every durability path
+#   tests/concurrent_differential.rs  writers + readers + busy background threads
 #   tests/fuzz.rs          hostile statement text and damaged files: never panic
 #   fuzz/run.sh            coverage-guided libFuzzer (+ASan) on the parser, the
 #                          query pipeline and every decoder
@@ -61,6 +62,9 @@ jobs:
       - name: crash (fault points)
         run: cargo test --release --locked --features failpoints --test failpoints
         env: { FLATS_FP_SEEDS: "20" }
+      - name: concurrency
+        run: cargo test --release --locked --test concurrent_differential
+        env: { FLATS_CONC_ROUNDS: "2" }
       - name: differential (SQLite, via the Python SDK)
         run: |
           cargo build --release --locked -p flats-c
@@ -174,6 +178,10 @@ jobs:
         run: |
           FLATS_FP_SEEDS=$(( 150 * SCALE )) \
             cargo test --release --locked --features failpoints --test failpoints
+      - name: concurrency
+        run: |
+          FLATS_CONC_ROUNDS=$(( 30 * SCALE )) \
+            cargo test --release --locked --test concurrent_differential
       - name: differential (SQLite, via the Python SDK)
         run: |
           cargo build --release --locked -p flats-c

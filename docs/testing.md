@@ -11,6 +11,7 @@ failure names its seed, and the seed replays it exactly.
 | `fuzz/sqlite_diff.py` | The same `WHERE` text and parameters through Flats and SQLite, via the Python SDK | Predicate semantics, SDK parameter and batch paths |
 | `tests/crash_kill.rs` | SIGKILLs a child process running a workload at random moments | Torn files, non-atomic steps, recovery bugs |
 | `tests/failpoints.rs` | Fails, then crashes or carries on, at every step of every durability path | Crash-safety and error-handling bugs at exact points |
+| `tests/concurrent_differential.rs` | Writer and reader threads, with the checkpointer and compactor busy | Torn or mixed-version reads, lost writes under races |
 | `tests/fuzz.rs` | Hostile statement text, damaged and forged files | Panics, poisoning, silent misreads |
 | `fuzz/run.sh` | Coverage-guided libFuzzer with AddressSanitizer: parser, full query pipeline, every decoder | Panics, memory errors, unbounded allocation or time |
 
@@ -135,6 +136,7 @@ nightly job uses it to cover new ground each night.
   keeps the page cache, so it can't test fsync discipline. The tool for that
   is LazyFS, a FUSE filesystem that drops unsynced data on command. It needs
   `libfuse3-dev` on the runner and hasn't been wired in.
-- **Concurrency**: the harnesses drive the database from one thread. The
-  concurrency suites (`swmr`, `concurrent_stores`, `thread_safety`) cover
-  races separately.
+- **Deterministic concurrency**: `concurrent_differential` runs real threads,
+  so a race it finds may not replay from its seed. A seeded scheduler
+  driving all I/O and threads, as Turso does, would make every race replay
+  exactly. It needs the storage layer's I/O behind one interface.
