@@ -88,3 +88,75 @@ pub fn hit(site: &'static str) -> io::Result<()> {
         _ => Ok(()),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Pause points: hold a thread at a named step until the test releases it, so
+// a race that real timing almost never produces can be produced on demand.
+// ---------------------------------------------------------------------------
+
+/// Every pause point in the engine.
+pub const PAUSE_SITES: &[&str] = &["vm.open_cursors.between_ops"];
+
+struct Pause {
+    armed: Option<(&'static str, u64)>,
+    parked: bool,
+    released: bool,
+}
+
+static PAUSE: Mutex<Pause> = Mutex::new(Pause {
+    armed: None,
+    parked: false,
+    released: false,
+});
+static PAUSE_CV: std::sync::Condvar = std::sync::Condvar::new();
+
+fn pause_state() -> std::sync::MutexGuard<'static, Pause> {
+    PAUSE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Park the next thread to reach `site` (after letting `skip` through)
+/// until [`release`]. One thread, once.
+pub fn arm_pause(site: &'static str, skip: u64) {
+    let mut p = pause_state();
+    p.armed = Some((site, skip));
+    p.parked = false;
+    p.released = false;
+}
+
+/// Wait up to `timeout` for a thread to park at the armed point.
+pub fn wait_parked(timeout: std::time::Duration) -> bool {
+    let p = pause_state();
+    let (p, _) = PAUSE_CV
+        .wait_timeout_while(p, timeout, |p| !p.parked)
+        .unwrap_or_else(|e| e.into_inner());
+    p.parked
+}
+
+/// Let the parked thread go (and disarm).
+pub fn release() {
+    let mut p = pause_state();
+    p.armed = None;
+    p.released = true;
+    PAUSE_CV.notify_all();
+}
+
+/// Called at each pause point (through `pause_point!`).
+pub fn pause(site: &'static str) {
+    *state().hits.entry(site).or_insert(0) += 1;
+    let mut p = pause_state();
+    match &mut p.armed {
+        Some((armed, skip)) if *armed == site => {
+            if *skip > 0 {
+                *skip -= 1;
+                return;
+            }
+            p.armed = None;
+            p.parked = true;
+            PAUSE_CV.notify_all();
+            while !p.released {
+                p = PAUSE_CV.wait(p).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        _ => {}
+    }
+}

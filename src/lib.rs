@@ -98,6 +98,16 @@ macro_rules! fail_point {
     };
 }
 
+/// A pause point: with the `failpoints` feature, a test can hold the thread
+/// that reaches `$site` until it lets go (see `failpoint::arm_pause`).
+/// Without the feature it expands to nothing at all.
+macro_rules! pause_point {
+    ($site:literal) => {
+        #[cfg(feature = "failpoints")]
+        $crate::failpoint::pause($site);
+    };
+}
+
 #[cfg(feature = "failpoints")]
 #[doc(hidden)]
 pub mod failpoint;

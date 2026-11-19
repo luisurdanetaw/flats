@@ -346,3 +346,84 @@ fn a_crash_mid_checkpoint_after_an_update_loses_nothing() {
         db.close().unwrap();
     }
 }
+
+/// Found untested by `scripts/coverage.sh`: a read that opens while a
+/// compaction flips generations. Opening resolves several handles (the live
+/// set, the metadata reader, the vectors) one at a time; a flip between two of
+/// them would pair one generation's ordinals with the other's rows, and the
+/// read must notice (the epoch check) and start again. Real timing almost
+/// never hits that window, so pause a reader inside it, flip, and let go.
+#[test]
+fn a_read_that_opens_across_a_compaction_flip_starts_again() {
+    let _g = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = std::sync::Arc::new(fresh(dir.path()));
+    for id in 0..30 {
+        insert(&db, id).unwrap();
+    }
+    // Dead rows, so the flip renumbers every live one.
+    db.execute("DELETE FROM t WHERE id < 20;").unwrap();
+    let coll = db.collections()[0].id;
+
+    for query in [
+        "SELECT id, s, vector FROM t WHERE id >= 0;",
+        "SELECT id, s, vector FROM t;",
+        "SEARCH TOP 5 NEAREST TO [1, 0] FROM t WHERE id >= 22 RETURNING id, s, vector;",
+    ] {
+        // Refill the dead space so the next round's flip renumbers again.
+        for id in 100..110 {
+            insert(&db, id).unwrap();
+        }
+        db.execute("DELETE FROM t WHERE id >= 100;").unwrap();
+
+        let hits_before = failpoint::hits("vm.open_cursors.between_ops");
+        failpoint::arm_pause("vm.open_cursors.between_ops", 0);
+        let reader = {
+            let db = db.clone();
+            std::thread::spawn(move || -> Vec<(i64, String, Vec<f32>)> {
+                db.execute(query)
+                    .unwrap()
+                    .map(|r| match r.unwrap().0.as_slice() {
+                        [RegValue::Int(i), RegValue::Str(s), RegValue::Vector(v)] => {
+                            (*i, s.clone(), v.to_vec())
+                        }
+                        other => panic!("{other:?}"),
+                    })
+                    .collect()
+            })
+        };
+        let parked = failpoint::wait_parked(std::time::Duration::from_secs(10));
+        if parked {
+            assert!(db.compact_now(coll).unwrap(), "{query}: the flip happened");
+        }
+        failpoint::release();
+        let rows = reader.join().expect("the reader");
+        for (id, s, v) in &rows {
+            assert_eq!(
+                s,
+                &format!("r{id}"),
+                "{query}: row {id} got another row's value"
+            );
+            assert_eq!(
+                v.as_slice(),
+                [*id as f32, 1.0],
+                "{query}: row {id} got another row's vector"
+            );
+        }
+        let mut ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
+        ids.sort_unstable();
+        let want: Vec<i64> = if query.starts_with("SEARCH") {
+            (25..30).collect()
+        } else {
+            (20..30).collect()
+        };
+        assert_eq!(ids, want, "{query}");
+        if parked {
+            // The read went round again after the flip.
+            assert!(
+                failpoint::hits("vm.open_cursors.between_ops") > hits_before + 1,
+                "{query}: the read did not start again"
+            );
+        }
+    }
+}

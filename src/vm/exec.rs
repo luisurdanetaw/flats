@@ -380,7 +380,11 @@ impl Vm {
         // and strand the scan.
         while self.program.ops[self.pc..].iter().any(needs_db) {
             match self.exec_one(Some(db))? {
-                Flow::Next => {}
+                Flow::Next => {
+                    // Between two storage-facing ops: where a generation flip
+                    // would split one read across two generations.
+                    pause_point!("vm.open_cursors.between_ops");
+                }
                 // Producing a row, or finishing, before the last storage-facing
                 // op means the program interleaves reads with row production —
                 // it cannot be detached, and finding that out HERE is the point:
