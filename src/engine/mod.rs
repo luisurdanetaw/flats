@@ -1338,6 +1338,29 @@ fn load_catalog(dir: &Path) -> Result<LoadedCatalog> {
 
 /// Persist the registry with the shared tmp → fsync → rename → dir-fsync
 /// dance (a leftover garbage .tmp from a crash is overwritten, never read).
+/// `create_dir_all`, then fsync the parent of every directory it created,
+/// deepest first. A new directory entry is durable only once its parent is
+/// synced: without this, a power cut after the first acknowledged write could
+/// take the whole database directory with it (`tests/sync_order.rs`).
+fn create_dir_durably(dir: &Path) -> io::Result<()> {
+    let mut missing = Vec::new();
+    let mut at = Some(dir);
+    while let Some(d) = at {
+        if d.as_os_str().is_empty() || d.exists() {
+            break;
+        }
+        missing.push(d.to_path_buf());
+        at = d.parent();
+    }
+    std::fs::create_dir_all(dir)?;
+    for d in &missing {
+        if let Some(parent) = d.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
 fn persist_catalog(
     dir: &Path,
     registry: &[CollectionConfig],
@@ -1520,7 +1543,7 @@ impl Db {
         opts: DbOptions,
         salvage: bool,
     ) -> Result<Db> {
-        std::fs::create_dir_all(dir)?;
+        create_dir_durably(dir)?;
         // FIRST, before reading or writing anything: one handle per directory.
         let lock = lock_directory(dir)?;
 

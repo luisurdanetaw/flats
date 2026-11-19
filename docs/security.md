@@ -22,8 +22,9 @@ attack surface is the input the embedding application hands it.
   can't be recovered without a backup: salvage keeps only what the log
   still has. Keeping the previous snapshot per store would make recovery
   lossless.
-- Power loss (unflushed writes lost) is not simulated yet; SIGKILL keeps the
-  page cache. LazyFS in CI would cover it (`docs/testing.md`).
+- Power loss: the order of every fsync and rename is checked from a syscall
+  trace (`tests/sync_order.rs`), but recovery from a simulated power cut is
+  not tested yet (`docs/deterministic-simulation.md`).
 - A collection whose whole directory was deleted opens empty: with no files
   left, it looks like one being created for the first time.
 - A damaged active header slot in `vectors.idx` falls back to the older slot

@@ -12,6 +12,7 @@ failure names its seed, and the seed replays it exactly.
 | `tests/crash_kill.rs` | SIGKILLs a child process running a workload at random moments | Torn files, non-atomic steps, recovery bugs |
 | `tests/failpoints.rs` | Fails, then crashes or carries on, at every step of every durability path | Crash-safety and error-handling bugs at exact points |
 | `tests/concurrent_differential.rs` | Writer and reader threads, with the checkpointer and compactor busy | Torn or mixed-version reads, lost writes under races |
+| `tests/sync_order.rs` | Runs a workload under `strace` and checks the fsync/rename order against what a power cut needs | Missing or misplaced syncs |
 | `tests/fuzz.rs` | Hostile statement text, damaged and forged files | Panics, poisoning, silent misreads |
 | `fuzz/run.sh` | Coverage-guided libFuzzer with AddressSanitizer: parser, full query pipeline, every decoder | Panics, memory errors, unbounded allocation or time |
 
@@ -126,6 +127,34 @@ HTML report. The weakest spots when measured were the scalar kernel's
 dispatch path on AVX2 machines (the aarch64 CI job covers NEON natively),
 `vm/exec.rs` regions (80%) and `query.rs` branches (63%).
 
+## Power loss, from the syscall trace
+
+A SIGKILL keeps the page cache, so a missing fsync never shows up in
+`crash_kill`. `tests/sync_order.rs` runs a workload under `strace -f -y`.
+It then checks the order of the durability syscalls, following ALICE
+(OSDI '14):
+
+- an acknowledgment never leaves un-fsynced bytes in the WAL;
+- a file is fsynced before it is renamed into place;
+- a rename, a new file and a new directory are each followed by an fsync of
+  their directory before the next acknowledgment.
+
+Its first runs found three real power-loss gaps, all fixed:
+- the database directory was created without syncing its parent;
+- the WAL truncation's rename wasn't followed by a directory fsync, so a
+  power cut could bring back the old log and lose every write acknowledged
+  since;
+- a new `wal.log` wasn't followed by a directory fsync.
+
+Planted bugs were caught: a missing WAL `fdatasync` (rule 1) and an
+un-synced snapshot rename (rule 2).
+
+It checks ORDER, not recovery: whether replay works on what a power cut
+leaves is the job of deterministic simulation
+(`docs/deterministic-simulation.md`). The vector index's writes go through
+`mmap`, which strace doesn't see; its durability rests on the `msync`
+before each header update (`index.rs`).
+
 ## Replaying and scaling
 
 ```sh
@@ -142,10 +171,8 @@ nightly job uses it to cover new ground each night.
 
 ## Not covered yet
 
-- **Power loss**, meaning writes the OS never flushed are lost. A SIGKILL
-  keeps the page cache, so it can't test fsync discipline. The tool for that
-  is LazyFS, a FUSE filesystem that drops unsynced data on command. It needs
-  `libfuse3-dev` on the runner and hasn't been wired in.
+- **Recovery after a power cut.** `sync_order` checks the sync order but
+  never replays a power-cut state. Deterministic simulation would.
 - **Deterministic concurrency**: `concurrent_differential` runs real threads,
   so a race it finds may not replay from its seed. A seeded scheduler
   driving all I/O and threads, as Turso does, would make every race replay

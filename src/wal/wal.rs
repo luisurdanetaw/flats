@@ -620,11 +620,17 @@ impl Wal {
 
         // 2. Open the log for appending. We keep the File for fsync; the batched
         //    frames are buffered in memory and written in one shot per batch.
+        let existed = path.exists();
         let mut file = OpenOptions::new()
             .read(true)
-            .create(true)
+            .create(!existed)
             .append(true) // appends only (implies write); truncation is in-thread
             .open(&path)?;
+        // A NEW log's directory entry must be durable before the first write
+        // is acknowledged into it, or a power cut can take the file away.
+        if !existed && let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            File::open(dir)?.sync_all()?;
+        }
 
         // Fresh (or crash-emptied) file: stamp the header before any frame.
         // Recovery already validated it on non-empty files.
@@ -1052,13 +1058,18 @@ fn truncate_wal(file: &mut File, path: &Path, up_to: u64) -> io::Result<()> {
     }
     fail_point!("wal.truncate.before_rename");
     std::fs::rename(&tmp, path)?;
+    // The rename must be durable before anything is appended to the new file:
+    // if a power cut lost it, the directory would still name the OLD log, and
+    // every write acknowledged into the new one would be gone
+    // (`tests/sync_order.rs`).
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        File::open(dir)?.sync_all()?;
+    }
 
     // The old fd points at the now-unlinked inode; reopen on the new file.
-    *file = OpenOptions::new()
-        .read(true)
-        .create(true)
-        .append(true)
-        .open(path)?;
+    // It exists (the rename just put it there): no `create`, so a missing log
+    // is an error rather than a silently empty one.
+    *file = OpenOptions::new().read(true).append(true).open(path)?;
     Ok(())
 }
 

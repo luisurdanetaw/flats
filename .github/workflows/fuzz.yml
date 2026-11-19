@@ -13,6 +13,8 @@ name: Fuzz
 #   tests/crash_kill.rs    SIGKILL at random moments; acknowledged writes survive
 #   tests/failpoints.rs    fail and crash at every step of every durability path
 #   tests/concurrent_differential.rs  writers + readers + busy background threads
+#   tests/sync_order.rs    the fsync/rename order, from an strace, against
+#                          the rules a power cut enforces
 #   tests/fuzz.rs          hostile statement text and damaged files: never panic
 #   fuzz/run.sh            coverage-guided libFuzzer (+ASan) on the parser, the
 #                          query pipeline and every decoder
@@ -65,6 +67,11 @@ jobs:
       - name: concurrency
         run: cargo test --release --locked --test concurrent_differential
         env: { FLATS_CONC_ROUNDS: "2" }
+      - name: power-loss ordering (strace)
+        run: |
+          sudo apt-get install -y strace >/dev/null
+          cargo test --release --locked --test sync_order
+        env: { FLATS_SYNC_SEEDS: "5" }
       - name: differential (SQLite, via the Python SDK)
         run: |
           cargo build --release --locked -p flats-c
@@ -182,6 +189,10 @@ jobs:
         run: |
           FLATS_CONC_ROUNDS=$(( 30 * SCALE )) \
             cargo test --release --locked --test concurrent_differential
+      - name: power-loss ordering (strace)
+        run: |
+          sudo apt-get install -y strace >/dev/null
+          FLATS_SYNC_SEEDS=$(( 60 * SCALE )) cargo test --release --locked --test sync_order
       - name: differential (SQLite, via the Python SDK)
         run: |
           cargo build --release --locked -p flats-c
