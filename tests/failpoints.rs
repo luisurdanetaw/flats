@@ -427,3 +427,30 @@ fn a_read_that_opens_across_a_compaction_flip_starts_again() {
         }
     }
 }
+
+/// Found by `tests/crash_kill.rs` (seed 500052): a kill during CREATE
+/// COLLECTION, after the vector index file was sized but before its header
+/// was written, left a zero-filled `vectors.idx`. Replaying the CREATE found
+/// the file, tried to open it, and the database refused to open at all ("bad
+/// magic number: 0"). A half-made collection must be absorbed by replay.
+#[test]
+fn a_crash_while_creating_a_collection_leaves_the_database_openable() {
+    let _g = serial();
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = Db::open(dir.path(), &[], opts()).unwrap();
+        failpoint::arm("index.create.before_header", 0);
+        let r = db.execute(
+            "CREATE COLLECTION t (id INT PRIMARY KEY, vector VECTOR(2), s TEXT) WITH (capacity = 1000);",
+        );
+        assert!(r.is_err(), "the failpoint fired");
+        drop(db); // crash
+    }
+    failpoint::disarm();
+    let db = Db::open(dir.path(), &[], opts()).expect("the database opens");
+    // The CREATE was committed before it failed to materialize, so replay
+    // finishes it: the collection exists, empty, and works.
+    insert(&db, 1).expect("the collection works");
+    assert_eq!(ids(&db, "t"), vec![1]);
+    db.close().unwrap();
+}

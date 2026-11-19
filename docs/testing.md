@@ -80,6 +80,10 @@ Bugs these found, each now a regression test:
 - **A torn write** in the middle of the log made recovery drop every later
   acknowledged write. After a failed write, the log is now cut back to where
   the batch started.
+- **A kill during CREATE COLLECTION** could leave a sized but zero-filled
+  vector index, and then the database refused to open at all ("bad magic
+  number: 0"). The index file is now built under a temporary name and
+  renamed into place once its header is durable.
 
 ## Coverage-guided fuzzing (`fuzz/`)
 

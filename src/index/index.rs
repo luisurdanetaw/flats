@@ -225,16 +225,25 @@ pub struct FlatIndex;
 impl FlatIndex {
     /// Creates a fresh index file pre-mapped for up to `capacity` vectors,
     /// overwriting any existing file. Returns the writer + a reader.
+    ///
+    /// ATOMIC: the file is built under a temporary name and renamed into
+    /// place only once its header is durable, then the directory is synced.
+    /// A crash leaves either no index (replay creates it) or a complete one;
+    /// never a sized, zero-filled file that `open` must refuse — which made a
+    /// CREATE COLLECTION killed at the wrong moment leave a database that
+    /// would not open at all.
     pub fn create(path: &Path, dim: NonZeroUsize, capacity: usize) -> Result<(Writer, Reader)> {
+        let tmp = path.with_extension("idx.tmp");
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
-            .open(path)?;
+            .open(&tmp)?;
 
         let len = bytes_for(dim.get(), capacity)?;
         file.set_len(len as u64)?; // sparse: only touched pages occupy disk
+        fail_point!("index.create.before_header");
 
         // SAFETY: the file is sized to `len`; the mapping covers exactly it.
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
@@ -250,6 +259,12 @@ impl FlatIndex {
         write_slot(&mut mmap[SLOT0_OFFSET..SLOT0_OFFSET + SLOT_BYTES], &slot);
         write_slot(&mut mmap[SLOT1_OFFSET..SLOT1_OFFSET + SLOT_BYTES], &slot);
         mmap.flush()?; // make the freshly created file valid on disk
+        file.sync_all()?; // ...and its size and metadata
+        // The mapping follows the inode, so it stays valid across the rename.
+        std::fs::rename(&tmp, path)?;
+        if let Some(dir) = path.parent() {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
 
         Ok(build(mmap, dim, capacity, 0, 0, 0, 0, 0))
     }

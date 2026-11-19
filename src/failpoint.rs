@@ -32,6 +32,7 @@ pub const SITES: &[&str] = &[
     "catalog.before_write",
     "compact.before_flip",
     "compact.between_renames",
+    "index.create.before_header",
 ];
 
 struct State {
