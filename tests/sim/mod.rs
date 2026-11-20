@@ -858,10 +858,7 @@ impl Model {
                 // RETURNING: columns (the embedding included) and `score`.
                 let labels: Vec<String> = match returning {
                     Some(cols) => {
-                        let distinct: BTreeSet<&str> = cols.iter().map(|s| s.as_str()).collect();
-                        if distinct.len() != cols.len() {
-                            return Expect::Error;
-                        }
+                        // Repeats are allowed, as in SQL (`SELECT a, a`).
                         for n in cols {
                             if n != "score" && schema.idx(n).is_none() {
                                 return Expect::Error;
@@ -876,7 +873,12 @@ impl Model {
                     .iter()
                     .position(|l| l == pk_name)
                     .expect("generator always returns the key");
-                let score_at = labels.iter().position(|l| l == "score");
+                // Only a RETURNING list has a similarity item; a bare SEARCH's
+                // `score` label (if any) is a real column.
+                let ranked_score = returning.is_some();
+                let score_at = ranked_score
+                    .then(|| labels.iter().position(|l| l == "score"))
+                    .flatten();
                 let vec_i = schema.vector();
                 let candidates = c
                     .rows
@@ -890,8 +892,10 @@ impl Model {
                         let projected = labels
                             .iter()
                             .map(|l| match schema.idx(l) {
-                                Some(i) => row[i].clone(),
-                                None => Lit::Float(s), // the score slot, checked separately
+                                // In RETURNING, `score` is the similarity even
+                                // when a column has that name.
+                                Some(i) if !(ranked_score && l == "score") => row[i].clone(),
+                                _ => Lit::Float(s), // the score slot, checked separately
                             })
                             .collect();
                         (projected, s, tol)
@@ -962,8 +966,11 @@ impl Model {
 // ---------------------------------------------------------------------------
 
 const COLL_NAMES: [&str; 4] = ["c0", "c1", "c2", "c3"];
-const COL_NAMES: [&str; 12] = [
-    "id", "a", "b", "n", "m", "x", "y", "title", "year", "pk", "w", "u",
+// `score` included: a real column of that name must work alongside the
+// pseudo-column (filterable as the column; `RETURNING score` in a SEARCH is
+// still the similarity).
+const COL_NAMES: [&str; 13] = [
+    "id", "a", "b", "n", "m", "x", "y", "title", "year", "pk", "w", "u", "score",
 ];
 const VEC_NAMES: [&str; 3] = ["vector", "emb", "v"];
 const TEXTS: [&str; 16] = [
@@ -1091,7 +1098,15 @@ fn gen_schema(rng: &mut Rng, name: &str) -> SchemaDef {
             pk: false,
         })
         .collect();
-    let pk = rng.below(n_scalars as u64) as usize;
+    let mut pk = rng.below(n_scalars as u64) as usize;
+    // Not `score`: `RETURNING score` in a SEARCH is the similarity, so such
+    // a key could never be returned, and the checker identifies rows by key.
+    if cols[pk].name == "score" {
+        pk = (pk + 1) % n_scalars;
+        if cols[pk].name == "score" || n_scalars == 1 {
+            cols[pk].name = "key_".to_string() + &cols[pk].name;
+        }
+    }
     cols[pk].pk = true;
     cols[pk].ty = if rng.chance(50) { Ty::Int } else { Ty::Text };
     let at = rng.below(cols.len() as u64 + 1) as usize;
@@ -1639,7 +1654,8 @@ fn check_search(expect: &ReadExpect, labels: &[String], got: &[Vec<Lit>]) -> Res
         }
         let (want, s, tol) = &candidates[at];
         for (i, (g, w)) in row.iter().zip(want).enumerate() {
-            if Some(i) == *score_at {
+            // Every `score` item is the similarity (it may be listed twice).
+            if labels[i] == "score" && score_at.is_some() {
                 let Lit::Float(g) = g else {
                     return Err(format!("score is {g:?}"));
                 };

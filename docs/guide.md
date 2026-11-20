@@ -140,7 +140,9 @@ SEARCH TOP 5 NEAREST TO [...] FROM docs WHERE title != 'draft' RETURNING id, sco
 ```
 
 Results come nearest first. `score` exists only in `RETURNING`. The query
-vector must have the collection's dimension.
+vector must have the collection's dimension. A collection may have its own
+column named `score` (a rating, say): `WHERE score > 0.5` and `SELECT score`
+use that column, but `RETURNING score` in a SEARCH is always the similarity.
 
 **Select** — read rows without ranking them. Row order is unspecified.
 

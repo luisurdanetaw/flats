@@ -1264,7 +1264,14 @@ fn bind_comparison(
     // Pseudo-columns are checked FIRST, exactly as in a projection, so `id`
     // means the same thing everywhere regardless of what a collection calls its
     // own columns.
-    if let Some(pseudo) = Pseudo::from_name(&name) {
+    //
+    // Except when the collection has a REAL column of that name: no
+    // pseudo-column can be filtered on (they are computed by the ranking), so
+    // in a predicate the name can only mean the column — a `score` rating,
+    // say. (In a SEARCH's RETURNING, `score` still means the similarity.)
+    if let Some(pseudo) = Pseudo::from_name(&name)
+        && schema.column(&name).is_none()
+    {
         return bind_pseudo_comparison(pseudo, op, literal);
     }
 

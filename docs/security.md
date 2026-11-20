@@ -33,8 +33,9 @@ attack surface is the input the embedding application hands it.
   the "the log still has everything" test.
 - A CREATE whose files fail to materialize for reasons other than the caps
   (for example, a full disk) still poisons the log.
-- A column named `score` cannot be filtered on: it collides with the
-  `score` pseudo-column.
+- A column named `score` can be filtered on and SELECTed, but a SEARCH's
+  `RETURNING score` always means the similarity, so a SEARCH can't return
+  that column (SELECT it instead).
 - `backup(dest)` writes wherever it is told. Don't pass it user-controlled
   paths.
 - The Miri CI job is untested; it was added at the end of the session.
