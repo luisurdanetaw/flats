@@ -1,0 +1,33 @@
+name: Perf
+
+# Catch performance regressions on pull requests by comparing the PR with its
+# base branch ON THE SAME RUNNER, interleaved, by median (shared runners are
+# too noisy for absolute numbers). Fails if any probe measurement is more
+# than 30% slower. See scripts/perf_compare.sh and tests/perf_probe.rs.
+
+on:
+  pull_request:
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: compare with the base branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install stable toolchain
+        run: rustup update stable --no-self-update && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: workflow files are valid YAML
+        run: python3 -c 'import glob, yaml; [yaml.safe_load(open(f)) for f in glob.glob(".github/workflows/*.yml")]'
+      - name: compare (9 interleaved rounds, medians)
+        run: scripts/perf_compare.sh "origin/${{ github.base_ref }}" 9

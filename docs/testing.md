@@ -156,6 +156,19 @@ leaves is the job of deterministic simulation
 `mmap`, which strace doesn't see; its durability rests on the `msync`
 before each header update (`index.rs`).
 
+## Performance regressions
+
+`tests/perf_probe.rs` times a few hot paths: a bulk insert, unfiltered and
+filtered SEARCH, a filtered SELECT scan, and a checkpoint.
+`scripts/perf_compare.sh <base-ref>` builds the probe for this checkout and
+for the base. It runs them interleaved on the same machine and compares
+medians, failing past 30% slower (`PERF_THRESHOLD`).
+
+Shared CI runners are too noisy for absolute numbers, so only the ratio
+counts. The PR workflow (`perf.yml`) runs it against the base branch. It
+was checked by forcing the scalar kernel, which it flagged as +372% on
+SEARCH.
+
 ## Replaying and scaling
 
 ```sh
