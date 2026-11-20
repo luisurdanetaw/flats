@@ -14,6 +14,7 @@ cd "$(dirname "$0")"
 TARGETS=(sql_parse sql_execute wal_record metadata_snapshot tuple_snapshot catalog)
 which=${1:-all}
 secs=${2:-60}
+replay=${3:-}   # read now: `set --` below replaces the positional arguments
 host=$(rustc +nightly -vV | sed -n 's/^host: //p')
 
 export RUSTFLAGS="-Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=4 \
@@ -28,8 +29,8 @@ if [ "$which" = all ]; then set -- "${TARGETS[@]}"; else set -- "$which"; fi
 status=0
 for t in "$@"; do
   mkdir -p "corpus/$t" "artifacts/$t"
-  if [ -n "${3:-}" ]; then
-    "$bins/$t" "$3"; exit
+  if [ -n "$replay" ]; then
+    "$bins/$t" "$replay"; exit
   fi
   echo "== $t ($secs s)"
   # -rss_limit: an allocation the input can steer without bound is a bug too.
