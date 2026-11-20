@@ -1,0 +1,18 @@
+[package]
+name = "flats-c"
+version = "0.1.0"
+edition = "2024"
+description = "C ABI for the Flats embeddable vector database"
+publish = false
+
+[lib]
+name = "flats_c"
+# cdylib/staticlib for C (and ctypes); rlib so the Node addon can call the same
+# functions from Rust rather than re-wrapping the engine.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+flats = { path = "../.." }
+
+[dev-dependencies]
+tempfile = "3"

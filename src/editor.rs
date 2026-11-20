@@ -153,21 +153,21 @@ impl<R: Read> Keys<R> {
             return Ok(None);
         };
         let key = match b {
-            0x01 => Key::Home,        // Ctrl-A
-            0x02 => Key::Left,        // Ctrl-B
-            0x03 => Key::Interrupt,   // Ctrl-C
-            0x04 => Key::Eof,         // Ctrl-D
-            0x05 => Key::End,         // Ctrl-E
-            0x06 => Key::Right,       // Ctrl-F
-            0x08 => Key::Backspace,   // Ctrl-H
-            0x09 => Key::Ignored,     // Tab: no completion to offer yet
+            0x01 => Key::Home,         // Ctrl-A
+            0x02 => Key::Left,         // Ctrl-B
+            0x03 => Key::Interrupt,    // Ctrl-C
+            0x04 => Key::Eof,          // Ctrl-D
+            0x05 => Key::End,          // Ctrl-E
+            0x06 => Key::Right,        // Ctrl-F
+            0x08 => Key::Backspace,    // Ctrl-H
+            0x09 => Key::Ignored,      // Tab: no completion to offer yet
             0x0a | 0x0d => Key::Enter, // NL / CR — ICRNL is off, so Enter is CR
-            0x0b => Key::KillToEnd,   // Ctrl-K
-            0x0c => Key::ClearScreen, // Ctrl-L
-            0x0e => Key::Down,        // Ctrl-N
-            0x10 => Key::Up,          // Ctrl-P
-            0x15 => Key::KillToStart, // Ctrl-U
-            0x17 => Key::DeleteWord,  // Ctrl-W
+            0x0b => Key::KillToEnd,    // Ctrl-K
+            0x0c => Key::ClearScreen,  // Ctrl-L
+            0x0e => Key::Down,         // Ctrl-N
+            0x10 => Key::Up,           // Ctrl-P
+            0x15 => Key::KillToStart,  // Ctrl-U
+            0x17 => Key::DeleteWord,   // Ctrl-W
             0x1b => self.escape()?,
             0x7f => Key::Backspace, // what most terminals actually send
             // Remaining C0 controls are unmapped; passing them through would
@@ -656,7 +656,10 @@ mod tests {
 
     #[test]
     fn ctrl_arrows_decode_as_word_movement() {
-        assert_eq!(keys_of(b"\x1b[1;5C\x1b[1;5D"), [Key::WordRight, Key::WordLeft]);
+        assert_eq!(
+            keys_of(b"\x1b[1;5C\x1b[1;5D"),
+            [Key::WordRight, Key::WordLeft]
+        );
     }
 
     #[test]
@@ -691,12 +694,14 @@ mod tests {
     #[test]
     fn multi_byte_characters_decode_as_one_key() {
         assert_eq!(keys_of("é".as_bytes()), [Key::Char('é')]);
-        assert_eq!(keys_of("日本".as_bytes()), [Key::Char('日'), Key::Char('本')]);
-        assert_eq!(keys_of("aé漢".as_bytes()), [
-            Key::Char('a'),
-            Key::Char('é'),
-            Key::Char('漢')
-        ]);
+        assert_eq!(
+            keys_of("日本".as_bytes()),
+            [Key::Char('日'), Key::Char('本')]
+        );
+        assert_eq!(
+            keys_of("aé漢".as_bytes()),
+            [Key::Char('a'), Key::Char('é'), Key::Char('漢')]
+        );
     }
 
     #[test]

@@ -36,6 +36,11 @@ pub enum LogicalPlan {
     Project(Project),
     /// A single, resolved row insert.
     Insert(Insert),
+    /// Many resolved rows, inserted as one statement.
+    InsertMany(InsertMany),
+    /// Resolved rows, each inserted or replacing the live row holding its key,
+    /// as one statement.
+    Upsert(InsertMany),
     /// Provision a new collection.
     CreateCollection(CreateCollection),
     /// Rank a collection's rows by similarity to a query vector (leaf of a
@@ -45,6 +50,15 @@ pub enum LogicalPlan {
     Delete(Delete),
     /// Rewrite every row a predicate admits, as one statement.
     Update(Update),
+    /// Retire a whole collection.
+    DropCollection(DropCollection),
+}
+
+/// Retire a whole collection — a leaf, one fat op, like `CreateCollection`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropCollection {
+    /// The collection to drop.
+    pub name: String,
 }
 
 // NOTE: there is deliberately no `Filter` node. A `WHERE` predicate in V-SQL is
@@ -129,6 +143,18 @@ pub struct Insert {
     /// One [`TypedValue`] per schema column, in schema order (the binder
     /// already reordered and type-checked it; the planner does not touch it).
     pub row: Vec<TypedValue>,
+}
+
+/// Many resolved rows inserted as ONE statement — a leaf, like [`Insert`], that
+/// lowers to one durable record rather than one per row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertMany {
+    /// Target collection.
+    pub collection: String,
+    /// Its resolved schema.
+    pub schema: Schema,
+    /// One schema-ordered row per source row, in source order.
+    pub rows: Vec<Vec<TypedValue>>,
 }
 
 /// Retire every row `predicate` admits — one statement, one durable record.

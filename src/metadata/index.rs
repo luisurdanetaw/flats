@@ -86,9 +86,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use roaring::RoaringBitmap;
 
 use crate::error::{Error, Result};
-use crate::metadata::common::{
-    ColumnId, ColumnType, Lsn, Ordinal, RangeOp, Row, Schema, Value,
-};
+use crate::metadata::common::{ColumnId, ColumnType, Lsn, Ordinal, RangeOp, Row, Schema, Value};
 
 const MAGIC: &[u8; 4] = b"MET0";
 /// 2 = the embedded `Schema` carries a PRIMARY KEY. The snapshot serializes
@@ -240,9 +238,7 @@ impl ColumnStore {
     /// Phase 4a's problem.)
     fn lookup_eq(&self, column: ColumnId, value: &Value) -> Result<RoaringBitmap> {
         match (self, value) {
-            (ColumnStore::Int(map), Value::Int(k)) => {
-                Ok(map.get(k).cloned().unwrap_or_default())
-            }
+            (ColumnStore::Int(map), Value::Int(k)) => Ok(map.get(k).cloned().unwrap_or_default()),
             (ColumnStore::Float(map), Value::Float(f)) => {
                 // A NaN probe compares equal to nothing; an error beats a
                 // silently-empty result for what is always a caller bug.
@@ -326,7 +322,11 @@ struct MetadataInner {
 
 impl MetadataInner {
     fn empty(schema: Schema) -> MetadataInner {
-        let columns = schema.columns.iter().map(|c| ColumnStore::empty(c.ty)).collect();
+        let columns = schema
+            .columns
+            .iter()
+            .map(|c| ColumnStore::empty(c.ty))
+            .collect();
         MetadataInner {
             schema,
             columns,
@@ -390,32 +390,43 @@ impl MetadataIndex {
     /// the caller opened the wrong dir or the catalog is lying; rebuilding
     /// from WAL won't fix that.
     pub fn open(dir: &Path, schema: Schema) -> Result<(Writer, Reader, Lsn)> {
+        let (writer, reader, loaded) = Self::open_reporting(dir, schema)?;
+        if let crate::metadata::Loaded::Corrupt(why) = &loaded {
+            crate::diagnostics::warn(&format!(
+                "{} corrupt ({why}); starting empty, WAL replay rebuilds",
+                dir.join(SNAP_FILE).display()
+            ));
+        }
+        Ok((writer, reader, loaded.lsn()))
+    }
+
+    /// `open`, but saying what it found instead of folding a missing or
+    /// corrupt file into "empty at Lsn(0)". The engine opens through this: a
+    /// store that came up empty is only safe when the WAL can refill it, and
+    /// only the engine can tell.
+    pub fn open_reporting(
+        dir: &Path,
+        schema: Schema,
+    ) -> Result<(Writer, Reader, crate::metadata::Loaded)> {
+        use crate::metadata::Loaded;
         let snap = dir.join(SNAP_FILE);
-        let decoded = match std::fs::read(&snap) {
+        let (decoded, loaded) = match std::fs::read(&snap) {
             Ok(bytes) => match decode_snapshot(&bytes) {
-                Ok(v) => Some(v),
-                Err(Error::CorruptSnapshot(why)) => {
-                    // No logger yet — but losing this signal silently makes
-                    // "my checkpoint never sticks" undebuggable.
-                    eprintln!(
-                        "flats: {} corrupt ({why}); starting empty, WAL replay rebuilds",
-                        snap.display()
-                    );
-                    None
-                }
+                Ok((inner, lsn)) => (Some(inner), Loaded::Snapshot(lsn)),
+                Err(Error::CorruptSnapshot(why)) => (None, Loaded::Corrupt(why)),
                 Err(e) => return Err(e),
             },
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (None, Loaded::Missing),
             Err(e) => return Err(e.into()),
         };
-        let (inner, last_lsn) = match decoded {
-            Some((inner, lsn)) => {
+        let inner = match decoded {
+            Some(inner) => {
                 if inner.schema != schema {
                     return Err(Error::SchemaMismatch);
                 }
-                (inner, lsn)
+                inner
             }
-            None => (MetadataInner::empty(schema), Lsn(0)),
+            None => MetadataInner::empty(schema),
         };
         let inner = Arc::new(Mutex::new(inner));
         Ok((
@@ -424,7 +435,7 @@ impl MetadataIndex {
                 dir: dir.to_path_buf(),
             },
             Reader { inner },
-            last_lsn,
+            loaded,
         ))
     }
 
@@ -522,6 +533,58 @@ impl Writer {
             .ok_or(Error::UnknownColumn { column: col })?;
         let holders = store.lookup_eq(col, value)?;
         Ok(!(holders & inner.live.clone()).is_empty())
+    }
+
+    /// Every LIVE row holding any of `values` in `col` — what an UPSERT
+    /// replaces. One lock hold, so the answer is about one state of `live`.
+    pub fn live_holders(&self, col: ColumnId, values: &[&Value]) -> Result<RoaringBitmap> {
+        let inner = self.lock();
+        let store = inner
+            .columns
+            .get(col as usize)
+            .ok_or(Error::UnknownColumn { column: col })?;
+        let mut out = RoaringBitmap::new();
+        for value in values {
+            out |= store.lookup_eq(col, value)? & &inner.live;
+        }
+        Ok(out)
+    }
+
+    /// Whether ANY of `values` is held in `col` by a live row that `retire`
+    /// does not free — the uniqueness check for a whole `Record::Mutate`.
+    ///
+    /// The multi-row sibling of [`is_key_taken`](Self::is_key_taken), and
+    /// different from a loop of it in two ways that matter:
+    ///
+    /// * **One lock hold** for the whole record, so the verdict is about one
+    ///   state of `live`, and no per-key copy of the live bitmap: a holder set
+    ///   for a key is one row, so the test is a disjointness check against
+    ///   `live` in place. A bulk insert of n rows stays O(n), not O(n·live).
+    /// * **`retire` frees keys.** An UPDATE retires a row and installs its
+    ///   copy under the same key; that key is held only by a row the record
+    ///   itself removes, so it is not a conflict.
+    ///
+    /// Repeats WITHIN `values` are the caller's to detect — this answers only
+    /// "is a key taken by a row that will still be live".
+    pub fn any_key_held_outside(
+        &self,
+        col: ColumnId,
+        values: &[&Value],
+        retire: &RoaringBitmap,
+    ) -> Result<bool> {
+        let inner = self.lock();
+        let store = inner
+            .columns
+            .get(col as usize)
+            .ok_or(Error::UnknownColumn { column: col })?;
+        for value in values {
+            let mut holders = store.lookup_eq(col, value)?;
+            holders -= retire;
+            if !holders.is_disjoint(&inner.live) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Apply ONE `Record::Mutate` — every retirement and every installation —
@@ -628,23 +691,23 @@ impl Writer {
     pub fn checkpoint(&mut self, last_lsn: Lsn) -> Result<()> {
         let bytes = {
             let inner = self.lock();
-            Self::encode_snapshot(&inner, last_lsn)
+            Self::encode_snapshot(&inner, last_lsn)?
         };
         crate::metadata::write_snapshot_atomic(&self.dir, TMP_FILE, SNAP_FILE, &bytes)
     }
 
     /// See the layout doc at the top of the module. Explicit to_le_bytes on
     /// every integer — never host order.
-    fn encode_snapshot(inner: &MetadataInner, last_lsn: Lsn) -> Vec<u8> {
+    fn encode_snapshot(inner: &MetadataInner, last_lsn: Lsn) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
         buf.extend_from_slice(&VERSION.to_le_bytes());
         buf.extend_from_slice(&last_lsn.0.to_le_bytes());
 
-        // Serializing plain data into memory has no fallible step (no IO, no
-        // size cap) — same reasoning as Record::encode in wal.rs.
-        let schema_bytes =
-            bincode::serialize(&inner.schema).expect("Schema serialization into memory cannot fail");
+        // Serializing plain data into memory has no fallible step today (no IO,
+        // no size cap), but it is surfaced rather than unwrapped — same
+        // reasoning as Record::encode in wal.rs.
+        let schema_bytes = bincode::serialize(&inner.schema).map_err(io::Error::other)?;
         buf.extend_from_slice(&(schema_bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(&schema_bytes);
 
@@ -654,16 +717,14 @@ impl Writer {
                     buf.extend_from_slice(&(map.len() as u64).to_le_bytes());
                     for (k, bm) in map {
                         buf.extend_from_slice(&k.to_le_bytes());
-                        bm.serialize_into(&mut buf)
-                            .expect("bitmap serialization into memory cannot fail");
+                        bm.serialize_into(&mut buf)?;
                     }
                 }
                 ColumnStore::Float(map) => {
                     buf.extend_from_slice(&(map.len() as u64).to_le_bytes());
                     for (k, bm) in map {
                         buf.extend_from_slice(&k.0.to_le_bytes());
-                        bm.serialize_into(&mut buf)
-                            .expect("bitmap serialization into memory cannot fail");
+                        bm.serialize_into(&mut buf)?;
                     }
                 }
                 ColumnStore::Text { dict, postings } => {
@@ -677,21 +738,17 @@ impl Writer {
                     for (name, bm) in names.iter().zip(postings) {
                         buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
                         buf.extend_from_slice(name.as_bytes());
-                        bm.serialize_into(&mut buf)
-                            .expect("bitmap serialization into memory cannot fail");
+                        bm.serialize_into(&mut buf)?;
                     }
                 }
             }
         }
 
-        inner
-            .live
-            .serialize_into(&mut buf)
-            .expect("bitmap serialization into memory cannot fail");
+        inner.live.serialize_into(&mut buf)?;
 
         let crc = crc32(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
-        buf
+        Ok(buf)
     }
 
     fn lock(&self) -> MutexGuard<'_, MetadataInner> {
@@ -719,12 +776,7 @@ impl Reader {
     /// then produce a row set matching no single moment in time. A caller must
     /// say which snapshot its answer is relative to, and use that same one for
     /// the whole query.
-    pub fn lookup_eq(
-        &self,
-        col: ColumnId,
-        value: &Value,
-        live: &LiveSet,
-    ) -> Result<RoaringBitmap> {
+    pub fn lookup_eq(&self, col: ColumnId, value: &Value, live: &LiveSet) -> Result<RoaringBitmap> {
         let inner = self.lock();
         let store = inner
             .columns
@@ -847,7 +899,9 @@ impl LiveSet {
     /// Is `ordinal` alive in this snapshot?
     pub fn contains(&self, ordinal: u32) -> bool {
         let word = ordinal as usize / 64;
-        self.bits.get(word).is_some_and(|w| w >> (ordinal % 64) & 1 == 1)
+        self.bits
+            .get(word)
+            .is_some_and(|w| w >> (ordinal % 64) & 1 == 1)
     }
 
     /// The flat bitset form, ordinal-indexed, LSB-first within each word.
@@ -975,18 +1029,18 @@ impl LiveHandle {
         // Fast path: the common case is an unchanged version, and it must not
         // touch the metadata lock the applier is contending for.
         let want = self.version();
-        if let Some(cached) = self.cached() {
-            if cached.version() == want {
-                return cached;
-            }
+        if let Some(cached) = self.cached()
+            && cached.version() == want
+        {
+            return cached;
         }
 
         let mut cache = self.lock_cache();
         // Re-check: a reader that beat us to the lock may have just filled it.
-        if let Some(cached) = cache.as_ref() {
-            if cached.version() == self.version() {
-                return Arc::clone(cached);
-            }
+        if let Some(cached) = cache.as_ref()
+            && cached.version() == self.version()
+        {
+            return Arc::clone(cached);
         }
 
         let set = {
@@ -1082,7 +1136,9 @@ fn decode_snapshot(bytes: &[u8]) -> Result<(MetadataInner, Lsn)> {
                 let mut map = BTreeMap::new();
                 for _ in 0..n {
                     let k = i64::from_le_bytes(
-                        take(&mut cur, 8)?.try_into().map_err(|_| corrupt("truncated"))?,
+                        take(&mut cur, 8)?
+                            .try_into()
+                            .map_err(|_| corrupt("truncated"))?,
                     );
                     map.insert(k, read_bitmap(&mut cur)?);
                 }
@@ -1093,7 +1149,9 @@ fn decode_snapshot(bytes: &[u8]) -> Result<(MetadataInner, Lsn)> {
                 let mut map = BTreeMap::new();
                 for _ in 0..n {
                     let f = f64::from_le_bytes(
-                        take(&mut cur, 8)?.try_into().map_err(|_| corrupt("truncated"))?,
+                        take(&mut cur, 8)?
+                            .try_into()
+                            .map_err(|_| corrupt("truncated"))?,
                     );
                     // Written keys are never NaN; a NaN here is corruption
                     // the CRC happened not to catch. Refuse rather than
@@ -1141,12 +1199,20 @@ fn decode_snapshot(bytes: &[u8]) -> Result<(MetadataInner, Lsn)> {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Fuzzing hook: decode `data` as a snapshot body that passed every framing
+/// check. Must return (`Ok` or `Err`) for any input, never panic.
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub fn fuzz_decode_snapshot(data: &[u8]) -> bool {
+    decode_snapshot(&crate::metadata::frame_for_fuzz(MAGIC, VERSION, data)).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
     use crate::metadata::common::{ColumnSpec, ColumnType};
     use std::num::NonZeroUsize;
+    use std::sync::atomic::AtomicBool;
 
     /// Schema used across tests: (a INT, b FLOAT, c TEXT) alongside the vector.
     fn test_schema() -> Schema {
@@ -1205,14 +1271,34 @@ mod tests {
         w.insert_row(Ordinal(1), &row(2, 2.5, "y")).unwrap();
         w.insert_row(Ordinal(2), &row(3, 3.5, "x")).unwrap(); // "x" repeats
 
-        assert_eq!(r.lookup_eq(0, &Value::Int(2), &live_now(&r)).unwrap(), bm(&[1]));
-        assert_eq!(r.lookup_eq(1, &Value::Float(3.5), &live_now(&r)).unwrap(), bm(&[2]));
-        assert_eq!(r.lookup_eq(2, &Value::Text("x".into()), &live_now(&r)).unwrap(), bm(&[0, 2]));
+        assert_eq!(
+            r.lookup_eq(0, &Value::Int(2), &live_now(&r)).unwrap(),
+            bm(&[1])
+        );
+        assert_eq!(
+            r.lookup_eq(1, &Value::Float(3.5), &live_now(&r)).unwrap(),
+            bm(&[2])
+        );
+        assert_eq!(
+            r.lookup_eq(2, &Value::Text("x".into()), &live_now(&r))
+                .unwrap(),
+            bm(&[0, 2])
+        );
 
         // Never-inserted values → empty bitmap, not Err.
-        assert_eq!(r.lookup_eq(0, &Value::Int(99), &live_now(&r)).unwrap(), bm(&[]));
-        assert_eq!(r.lookup_eq(1, &Value::Float(9.9), &live_now(&r)).unwrap(), bm(&[]));
-        assert_eq!(r.lookup_eq(2, &Value::Text("zzz".into()), &live_now(&r)).unwrap(), bm(&[]));
+        assert_eq!(
+            r.lookup_eq(0, &Value::Int(99), &live_now(&r)).unwrap(),
+            bm(&[])
+        );
+        assert_eq!(
+            r.lookup_eq(1, &Value::Float(9.9), &live_now(&r)).unwrap(),
+            bm(&[])
+        );
+        assert_eq!(
+            r.lookup_eq(2, &Value::Text("zzz".into()), &live_now(&r))
+                .unwrap(),
+            bm(&[])
+        );
     }
 
     #[test]
@@ -1226,37 +1312,97 @@ mod tests {
 
         // INT against 2.
         let v = Value::Int(2);
-        assert_eq!(r.lookup_range(0, RangeOp::Lt, &v, &live_now(&r)).unwrap(), bm(&[0]));
-        assert_eq!(r.lookup_range(0, RangeOp::Le, &v, &live_now(&r)).unwrap(), bm(&[0, 1]));
-        assert_eq!(r.lookup_range(0, RangeOp::Gt, &v, &live_now(&r)).unwrap(), bm(&[2]));
-        assert_eq!(r.lookup_range(0, RangeOp::Ge, &v, &live_now(&r)).unwrap(), bm(&[1, 2]));
+        assert_eq!(
+            r.lookup_range(0, RangeOp::Lt, &v, &live_now(&r)).unwrap(),
+            bm(&[0])
+        );
+        assert_eq!(
+            r.lookup_range(0, RangeOp::Le, &v, &live_now(&r)).unwrap(),
+            bm(&[0, 1])
+        );
+        assert_eq!(
+            r.lookup_range(0, RangeOp::Gt, &v, &live_now(&r)).unwrap(),
+            bm(&[2])
+        );
+        assert_eq!(
+            r.lookup_range(0, RangeOp::Ge, &v, &live_now(&r)).unwrap(),
+            bm(&[1, 2])
+        );
 
         // FLOAT against 2.0.
         let v = Value::Float(2.0);
-        assert_eq!(r.lookup_range(1, RangeOp::Lt, &v, &live_now(&r)).unwrap(), bm(&[0]));
-        assert_eq!(r.lookup_range(1, RangeOp::Le, &v, &live_now(&r)).unwrap(), bm(&[0, 1]));
-        assert_eq!(r.lookup_range(1, RangeOp::Gt, &v, &live_now(&r)).unwrap(), bm(&[2]));
-        assert_eq!(r.lookup_range(1, RangeOp::Ge, &v, &live_now(&r)).unwrap(), bm(&[1, 2]));
+        assert_eq!(
+            r.lookup_range(1, RangeOp::Lt, &v, &live_now(&r)).unwrap(),
+            bm(&[0])
+        );
+        assert_eq!(
+            r.lookup_range(1, RangeOp::Le, &v, &live_now(&r)).unwrap(),
+            bm(&[0, 1])
+        );
+        assert_eq!(
+            r.lookup_range(1, RangeOp::Gt, &v, &live_now(&r)).unwrap(),
+            bm(&[2])
+        );
+        assert_eq!(
+            r.lookup_range(1, RangeOp::Ge, &v, &live_now(&r)).unwrap(),
+            bm(&[1, 2])
+        );
 
         // Bound BETWEEN keys.
         let v = Value::Float(2.5);
-        assert_eq!(r.lookup_range(1, RangeOp::Lt, &v, &live_now(&r)).unwrap(), bm(&[0, 1]));
-        assert_eq!(r.lookup_range(1, RangeOp::Gt, &v, &live_now(&r)).unwrap(), bm(&[2]));
+        assert_eq!(
+            r.lookup_range(1, RangeOp::Lt, &v, &live_now(&r)).unwrap(),
+            bm(&[0, 1])
+        );
+        assert_eq!(
+            r.lookup_range(1, RangeOp::Gt, &v, &live_now(&r)).unwrap(),
+            bm(&[2])
+        );
 
         // Bounds OUTSIDE the key range.
-        assert_eq!(r.lookup_range(0, RangeOp::Lt, &Value::Int(0), &live_now(&r)).unwrap(), bm(&[]));
-        assert_eq!(r.lookup_range(0, RangeOp::Ge, &Value::Int(0), &live_now(&r)).unwrap(), bm(&[0, 1, 2]));
-        assert_eq!(r.lookup_range(0, RangeOp::Gt, &Value::Int(100), &live_now(&r)).unwrap(), bm(&[]));
-        assert_eq!(r.lookup_range(0, RangeOp::Le, &Value::Int(100), &live_now(&r)).unwrap(), bm(&[0, 1, 2]));
+        assert_eq!(
+            r.lookup_range(0, RangeOp::Lt, &Value::Int(0), &live_now(&r))
+                .unwrap(),
+            bm(&[])
+        );
+        assert_eq!(
+            r.lookup_range(0, RangeOp::Ge, &Value::Int(0), &live_now(&r))
+                .unwrap(),
+            bm(&[0, 1, 2])
+        );
+        assert_eq!(
+            r.lookup_range(0, RangeOp::Gt, &Value::Int(100), &live_now(&r))
+                .unwrap(),
+            bm(&[])
+        );
+        assert_eq!(
+            r.lookup_range(0, RangeOp::Le, &Value::Int(100), &live_now(&r))
+                .unwrap(),
+            bm(&[0, 1, 2])
+        );
 
         // -0.0 and +0.0 land on the same normalized key.
         let mut w2 = w;
         w2.insert_row(Ordinal(3), &row(0, -0.0, "z")).unwrap();
-        assert_eq!(r.lookup_eq(1, &Value::Float(0.0), &live_now(&r)).unwrap(), bm(&[3]));
-        assert_eq!(r.lookup_eq(1, &Value::Float(-0.0), &live_now(&r)).unwrap(), bm(&[3]));
+        assert_eq!(
+            r.lookup_eq(1, &Value::Float(0.0), &live_now(&r)).unwrap(),
+            bm(&[3])
+        );
+        assert_eq!(
+            r.lookup_eq(1, &Value::Float(-0.0), &live_now(&r)).unwrap(),
+            bm(&[3])
+        );
         // And range bounds treat them identically: nothing is < -0.0 here.
-        assert_eq!(r.lookup_range(1, RangeOp::Lt, &Value::Float(-0.0), &live_now(&r)).unwrap(), bm(&[]));
-        assert_eq!(r.lookup_range(1, RangeOp::Le, &Value::Float(-0.0), &live_now(&r)).unwrap(), bm(&[3]));
+        assert_eq!(
+            r.lookup_range(1, RangeOp::Lt, &Value::Float(-0.0), &live_now(&r))
+                .unwrap(),
+            bm(&[])
+        );
+        assert_eq!(
+            r.lookup_range(1, RangeOp::Le, &Value::Float(-0.0), &live_now(&r))
+                .unwrap(),
+            bm(&[3])
+        );
     }
 
     #[test]
@@ -1270,10 +1416,18 @@ mod tests {
         }
         w.remove_row(Ordinal(1)).unwrap();
 
-        assert_eq!(r.lookup_eq(2, &Value::Text("same".into()), &live_now(&r)).unwrap(), bm(&[0, 2]));
-        assert_eq!(r.lookup_eq(0, &Value::Int(1), &live_now(&r)).unwrap(), bm(&[]));
         assert_eq!(
-            r.lookup_range(0, RangeOp::Ge, &Value::Int(0), &live_now(&r)).unwrap(),
+            r.lookup_eq(2, &Value::Text("same".into()), &live_now(&r))
+                .unwrap(),
+            bm(&[0, 2])
+        );
+        assert_eq!(
+            r.lookup_eq(0, &Value::Int(1), &live_now(&r)).unwrap(),
+            bm(&[])
+        );
+        assert_eq!(
+            r.lookup_range(0, RangeOp::Ge, &Value::Int(0), &live_now(&r))
+                .unwrap(),
             bm(&[0, 2])
         );
         assert_eq!(r.live(), bm(&[0, 2]));
@@ -1289,14 +1443,20 @@ mod tests {
         w.insert_row(Ordinal(0), &the_row).unwrap();
         // Insert twice with the identical row: set semantics, same state.
         w.insert_row(Ordinal(0), &the_row).unwrap();
-        assert_eq!(r.lookup_eq(0, &Value::Int(7), &live_now(&r)).unwrap(), bm(&[0]));
+        assert_eq!(
+            r.lookup_eq(0, &Value::Int(7), &live_now(&r)).unwrap(),
+            bm(&[0])
+        );
         assert_eq!(r.live_count(), 1);
 
         // Remove twice → same state, no Err.
         w.remove_row(Ordinal(0)).unwrap();
         w.remove_row(Ordinal(0)).unwrap();
         assert_eq!(r.live_count(), 0);
-        assert_eq!(r.lookup_eq(0, &Value::Int(7), &live_now(&r)).unwrap(), bm(&[]));
+        assert_eq!(
+            r.lookup_eq(0, &Value::Int(7), &live_now(&r)).unwrap(),
+            bm(&[])
+        );
 
         // Remove a never-inserted ordinal → no Err.
         w.remove_row(Ordinal(999)).unwrap();
@@ -1315,8 +1475,15 @@ mod tests {
         ));
         // Validate-before-mutate: nothing was half-inserted.
         assert_eq!(r.live_count(), 0);
-        assert_eq!(r.lookup_eq(0, &Value::Int(1), &live_now(&r)).unwrap(), bm(&[]));
-        assert_eq!(r.lookup_eq(2, &Value::Text("x".into()), &live_now(&r)).unwrap(), bm(&[]));
+        assert_eq!(
+            r.lookup_eq(0, &Value::Int(1), &live_now(&r)).unwrap(),
+            bm(&[])
+        );
+        assert_eq!(
+            r.lookup_eq(2, &Value::Text("x".into()), &live_now(&r))
+                .unwrap(),
+            bm(&[])
+        );
     }
 
     #[test]
@@ -1366,7 +1533,9 @@ mod tests {
         w.insert_row(Ordinal(0), &row(1, 1.0, "x")).unwrap();
 
         for op in [RangeOp::Lt, RangeOp::Le, RangeOp::Gt, RangeOp::Ge] {
-            let got = r.lookup_range(2, op, &Value::Text("x".into()), &live_now(&r)).unwrap();
+            let got = r
+                .lookup_range(2, op, &Value::Text("x".into()), &live_now(&r))
+                .unwrap();
             assert_eq!(got, bm(&[]), "range on TEXT must be empty, op {op:?}");
         }
     }
@@ -1386,10 +1555,18 @@ mod tests {
         let (_w, r, lsn) = MetadataIndex::open(dir.path(), test_schema()).unwrap();
         assert_eq!(lsn, Lsn(7));
         assert_eq!(r.live(), bm(&[0, 2]));
-        assert_eq!(r.lookup_eq(2, &Value::Text("x".into()), &live_now(&r)).unwrap(), bm(&[0, 2]));
-        assert_eq!(r.lookup_eq(0, &Value::Int(2), &live_now(&r)).unwrap(), bm(&[])); // tombstoned
         assert_eq!(
-            r.lookup_range(1, RangeOp::Ge, &Value::Float(2.0), &live_now(&r)).unwrap(),
+            r.lookup_eq(2, &Value::Text("x".into()), &live_now(&r))
+                .unwrap(),
+            bm(&[0, 2])
+        );
+        assert_eq!(
+            r.lookup_eq(0, &Value::Int(2), &live_now(&r)).unwrap(),
+            bm(&[])
+        ); // tombstoned
+        assert_eq!(
+            r.lookup_range(1, RangeOp::Ge, &Value::Float(2.0), &live_now(&r))
+                .unwrap(),
             bm(&[2])
         );
     }
@@ -1408,7 +1585,10 @@ mod tests {
             let (_w, r, lsn) = MetadataIndex::open(dir, test_schema()).unwrap();
             assert_eq!(lsn, Lsn(0));
             assert_eq!(r.live_count(), 0);
-            assert_eq!(r.lookup_eq(0, &Value::Int(1), &live_now(&r)).unwrap(), bm(&[]));
+            assert_eq!(
+                r.lookup_eq(0, &Value::Int(1), &live_now(&r)).unwrap(),
+                bm(&[])
+            );
         };
 
         // Flip one byte in the middle.
@@ -1443,7 +1623,10 @@ mod tests {
 
         let (mut w, r, lsn) = MetadataIndex::open(dir.path(), test_schema()).unwrap();
         assert_eq!(lsn, Lsn(5), "good snap must load; tmp must be ignored");
-        assert_eq!(r.lookup_eq(0, &Value::Int(1), &live_now(&r)).unwrap(), bm(&[0]));
+        assert_eq!(
+            r.lookup_eq(0, &Value::Int(1), &live_now(&r)).unwrap(),
+            bm(&[0])
+        );
 
         // A fresh checkpoint overwrites the stale tmp and succeeds.
         w.insert_row(Ordinal(1), &row(2, 2.0, "y")).unwrap();
@@ -1538,9 +1721,12 @@ mod tests {
         let live = Arc::new(r.live_handle());
 
         // Seed set A live.
-        let set_a: Vec<(Ordinal, Row)> = (0..N).map(|o| (Ordinal(o), row(o as i64, 0.0, "a"))).collect();
-        let set_b: Vec<(Ordinal, Row)> =
-            (N..2 * N).map(|o| (Ordinal(o), row(o as i64, 0.0, "b"))).collect();
+        let set_a: Vec<(Ordinal, Row)> = (0..N)
+            .map(|o| (Ordinal(o), row(o as i64, 0.0, "a")))
+            .collect();
+        let set_b: Vec<(Ordinal, Row)> = (N..2 * N)
+            .map(|o| (Ordinal(o), row(o as i64, 0.0, "b")))
+            .collect();
         for (ord, r) in &set_a {
             w.insert_row(*ord, r).unwrap();
         }
@@ -1563,9 +1749,8 @@ mod tests {
             })
         };
 
-        let bitmap_of = |rows: &[(Ordinal, Row)]| -> RoaringBitmap {
-            rows.iter().map(|(o, _)| o.0).collect()
-        };
+        let bitmap_of =
+            |rows: &[(Ordinal, Row)]| -> RoaringBitmap { rows.iter().map(|(o, _)| o.0).collect() };
         for i in 0..ROUNDS {
             let (retire, install) = if i % 2 == 0 {
                 (bitmap_of(&set_a), &set_b)
@@ -1626,7 +1811,8 @@ mod tests {
         let (mut w, r) = MetadataIndex::create(dir.path(), test_schema()).unwrap();
 
         for o in 0..4u32 {
-            w.insert_row(Ordinal(o), &row(o as i64, 0.0, "old")).unwrap();
+            w.insert_row(Ordinal(o), &row(o as i64, 0.0, "old"))
+                .unwrap();
         }
 
         let new_row = row(99, 9.0, "new");

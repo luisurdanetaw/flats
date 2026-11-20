@@ -58,7 +58,7 @@ use crate::compiler::bytecode::ValidateError;
 use crate::compiler::compile;
 use crate::engine::Db;
 use crate::sql::bind::{BoundStatement, Projected};
-use crate::sql::{BindError, ParseError, Statement, analyze, parse, plan};
+use crate::sql::{BindError, Param, ParseError, Statement, analyze, parse_with_limit, plan};
 use crate::vm::exec::{ExecError, OutputRow, Vm};
 
 /// How many times a conflicted write is run again before giving up.
@@ -71,7 +71,7 @@ const MAX_WRITE_ATTEMPTS: usize = 10;
 
 /// A lazy stream of result rows.
 ///
-/// Owns the suspended [`Vm`] that produces them, and borrows nothing — see the
+/// Owns the suspended `Vm` that produces them, and borrows nothing — see the
 /// module header. Iterating pulls one row at a time; the stream is FUSED, so
 /// once it ends (drained or errored) it keeps returning `None`.
 pub struct RowStream {
@@ -81,6 +81,28 @@ pub struct RowStream {
     vm: Vm,
     /// Set on `Halt` or on an error, so iteration cannot restart or re-error.
     done: bool,
+    /// The statement's `LIMIT`/`OFFSET`, applied as rows are pulled — so a
+    /// `LIMIT 10` stops the scan after ten rows instead of reading them all.
+    window: Window,
+    /// The statement's interrupt generation and deadline, checked before each
+    /// row is pulled. `None` for a stream that is already finished.
+    watch: Option<crate::cancel::Watch>,
+}
+
+/// What is left of a `LIMIT n OFFSET m` as a stream is consumed.
+#[derive(Debug, Clone, Copy)]
+struct Window {
+    /// Rows still to skip before the first one returned.
+    skip: u64,
+    /// Rows still allowed out; `None` for no cap.
+    remaining: Option<u64>,
+}
+
+impl Window {
+    const ALL: Window = Window {
+        skip: 0,
+        remaining: None,
+    };
 }
 
 impl RowStream {
@@ -90,6 +112,8 @@ impl RowStream {
             labels,
             vm,
             done: false,
+            window: Window::ALL,
+            watch: None,
         }
     }
 
@@ -100,6 +124,8 @@ impl RowStream {
             labels: Vec::new(),
             vm: Vm::halted(),
             done: true,
+            window: Window::ALL,
+            watch: None,
         }
     }
 
@@ -120,11 +146,49 @@ impl Iterator for RowStream {
     /// Pull one row. `None` ends the stream; `Some(Err(_))` is a RUNTIME
     /// failure that happened after `execute` already succeeded.
     ///
-    /// [`Vm::resume`] rather than `step`, because a read stream is detached: its
+    /// `Vm::resume` rather than `step`, because a read stream is detached: its
     /// cursor is already open and the rest of the scan needs no database.
     fn next(&mut self) -> Option<Self::Item> {
+        match self.watch.clone() {
+            Some(watch) => crate::cancel::under(&watch, || self.pull()),
+            None => self.pull(),
+        }
+    }
+}
+
+impl RowStream {
+    /// One row, under whatever watch `next` installed.
+    fn pull(&mut self) -> Option<Result<OutputRow, Error>> {
         if self.done {
             return None;
+        }
+        // Stopped by Db::interrupt or its deadline? Checked before each row,
+        // so a stream nobody is reading costs nothing.
+        if let Err(e) = crate::cancel::check() {
+            self.done = true;
+            return Some(Err(Error::Engine(e)));
+        }
+        // The cap is checked BEFORE pulling, so a satisfied LIMIT never reads
+        // the row after its last.
+        if self.window.remaining == Some(0) {
+            self.done = true;
+            return None;
+        }
+        while self.window.skip > 0 {
+            match self.vm.resume() {
+                Ok(Some(_)) => self.window.skip -= 1,
+                Ok(None) => {
+                    self.done = true;
+                    return None;
+                }
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e.into()));
+                }
+            }
+        }
+        if let Some(n) = &mut self.window.remaining {
+            *n -= 1;
         }
         match self.vm.resume() {
             Ok(Some(row)) => Some(Ok(row)),
@@ -240,8 +304,74 @@ impl Db {
     /// serialize every statement through one caller and make parallel `SELECT`s
     /// impossible — the opposite of what the read path was built for.
     pub fn execute(&self, sql: &str) -> Result<RowStream, Error> {
-        // 1. PARSE (lexing included — the parser wraps lex errors).
-        let statement = parse(sql).map_err(Error::Parse)?;
+        self.execute_with(sql, &[])
+    }
+
+    /// Run one V-SQL statement with its `?` placeholders filled from
+    /// `params`, in order.
+    ///
+    /// **Use this whenever a value comes from outside the program.** A
+    /// parameter is substituted after lexing, as a value: nothing in it — a
+    /// quote, a `;`, a keyword — is ever read as syntax, and it can only stand
+    /// where a literal can, never for a collection or column name. A vector
+    /// parameter is also exact and cheaper than formatting floats into text.
+    ///
+    /// The number of `?` must equal `params.len()`; a mismatch, a non-finite
+    /// float, or an empty vector is a [`Error::Parse`] and runs nothing.
+    /// Otherwise a parameter behaves exactly as the literal it stands for —
+    /// the same type checks, the same coercions, the same errors.
+    ///
+    /// ```
+    /// # use flats::{Db, DbOptions, Param};
+    /// # let tmp = tempfile::tempdir().unwrap();
+    /// # let db = Db::open(tmp.path(), &[], DbOptions::default()).unwrap();
+    /// # db.execute("CREATE COLLECTION docs (id TEXT PRIMARY KEY, vector VECTOR(2), lang TEXT) WITH (capacity = 10);").unwrap();
+    /// db.execute_with(
+    ///     "INSERT INTO docs (id, vector, lang) VALUES (?, ?, ?);",
+    ///     &["d1".into(), vec![0.6f32, 0.8].into(), "en".into()],
+    /// )?;
+    /// let hits = db.execute_with(
+    ///     "SEARCH TOP 5 NEAREST TO ? FROM docs WHERE lang = ? RETURNING id, score;",
+    ///     &[vec![1.0f32, 0.0].into(), "en".into()],
+    /// )?;
+    /// assert_eq!(hits.count(), 1);
+    /// # Ok::<(), flats::QueryError>(())
+    /// ```
+    pub fn execute_with(&self, sql: &str, params: &[Param]) -> Result<RowStream, Error> {
+        // The statement's clock and interrupt generation start NOW, and it
+        // runs under them — its cursors' opening (where a SEARCH ranks), its
+        // write, and every row a stream later pulls.
+        let watch = self.statement_watch();
+        crate::cancel::under(&watch, || self.execute_watched(sql, params, &watch))
+    }
+
+    fn execute_watched(
+        &self,
+        sql: &str,
+        params: &[Param],
+        watch: &crate::cancel::Watch,
+    ) -> Result<RowStream, Error> {
+        // 1. PARSE (lexing included — the parser wraps lex errors), with the
+        //    parameters substituted between the two.
+        let statement = parse_with_limit(sql, params, self.limits().max_statement_bytes)
+            .map_err(Error::Parse)?;
+        // A row window belongs to the result stream, not to the statement the
+        // rest of the pipeline sees: unwrap it here and apply it as rows are
+        // pulled.
+        let (statement, window) = match statement {
+            Statement::Limited {
+                statement,
+                limit,
+                offset,
+            } => (
+                *statement,
+                Window {
+                    skip: offset,
+                    remaining: limit,
+                },
+            ),
+            statement => (statement, Window::ALL),
+        };
         // The compiler needs the TARGET collection's storage schema, and only
         // the statement says which collection that is — read it before `analyze`
         // consumes the statement.
@@ -261,9 +391,12 @@ impl Db {
         let mutates = matches!(
             bound,
             BoundStatement::Insert(_)
+                | BoundStatement::InsertMany(_)
+                | BoundStatement::Upsert(_)
                 | BoundStatement::CreateCollection(_)
                 | BoundStatement::Delete(_)
                 | BoundStatement::Update(_)
+                | BoundStatement::DropCollection(_)
         );
 
         // 3. PLAN — infallible: binding already validated everything, so this
@@ -355,7 +488,10 @@ impl Db {
                 let opened = vm.open_cursors(self);
                 if self.epoch().unchanged(seen) {
                     opened?;
-                    return Ok(RowStream::over(labels, vm));
+                    let mut stream = RowStream::over(labels, vm);
+                    stream.window = window;
+                    stream.watch = Some(watch.clone());
+                    return Ok(stream);
                 }
                 vm = Vm::new(program.clone())?;
             }
@@ -388,6 +524,7 @@ impl Target {
         match statement {
             Statement::Select(s) => Target::Existing(s.from.clone()),
             Statement::Insert(i) => Target::Existing(i.collection.clone()),
+            Statement::InsertMany(m) | Statement::Upsert(m) => Target::Existing(m.collection.clone()),
             Statement::CreateCollection(_) => Target::New,
             // A SEARCH reads an existing collection, like a SELECT. (The binder
             // rejects it for now — see `BindError::Unbound` — but this is the
@@ -395,8 +532,13 @@ impl Target {
             Statement::Search(s) => Target::Existing(s.collection.clone()),
             // A DELETE's predicate is resolved against the collection it names.
             Statement::Delete(d) => Target::Existing(d.from.clone()),
+            // A window changes which rows come back, not where they come from.
+            Statement::Limited { statement, .. } => Target::of(statement),
             // An UPDATE reads and rewrites rows of the collection it names.
             Statement::Update(u) => Target::Existing(u.collection.clone()),
+            // A DROP names an existing collection; its schema is not read, but
+            // the statement is about that collection like any other.
+            Statement::DropCollection(d) => Target::Existing(d.name.clone()),
         }
     }
 }
@@ -427,9 +569,12 @@ fn labels_of(bound: &BoundStatement) -> Vec<String> {
             })
             .collect(),
         BoundStatement::Insert(_)
+        | BoundStatement::InsertMany(_)
+        | BoundStatement::Upsert(_)
         | BoundStatement::CreateCollection(_)
         | BoundStatement::Delete(_)
-        | BoundStatement::Update(_) => Vec::new(),
+        | BoundStatement::Update(_)
+        | BoundStatement::DropCollection(_) => Vec::new(),
     }
 }
 
@@ -1953,7 +2098,10 @@ mod tests {
     #[test]
     fn a_where_clause_naming_an_unknown_column_is_a_bind_error() {
         let (_dir, db) = docs_db();
-        if db.execute("SELECT author FROM docs WHERE nope = 1;").is_ok() {
+        if db
+            .execute("SELECT author FROM docs WHERE nope = 1;")
+            .is_ok()
+        {
             panic!("an unknown column in WHERE must be refused");
         }
         db.close().unwrap();

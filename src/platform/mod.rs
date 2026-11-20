@@ -1,7 +1,7 @@
 //! Hand-rolled platform bindings.
 //!
 //! This is one of the two `unsafe` quarantines (CLAUDE.md §5); the other is
-//! [`crate::simd`]. Nothing here has any database logic in it — it exists so
+//! `flats::simd`. Nothing here has any database logic in it — it exists so
 //! that the rest of the crate can talk to the operating system without a
 //! `libc` dependency (CLAUDE.md §2), and so that every `extern "C"` block in
 //! the project sits in one auditable place.

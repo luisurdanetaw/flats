@@ -1,0 +1,16 @@
+{
+  "name": "flats",
+  "version": "0.1.0",
+  "description": "Flats — a tiny embeddable vector database. Node.js bindings (N-API, no dependencies).",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts", "flats.node", "prebuilds/", "README.md"],
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build": "cargo build --release -p flats-node",
+    "prebuild": "scripts/prebuild.sh",
+    "test": "node --test test/"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}

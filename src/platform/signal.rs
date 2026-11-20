@@ -3,7 +3,7 @@
 //! By default `SIGINT` kills the process where it stands. For a database shell
 //! that is the wrong behavior twice over:
 //!
-//! 1. It skips [`Db::close`](crate::engine::Db::close), so the final
+//! 1. It skips [`Db::close`](flats::Db::close), so the final
 //!    checkpoint never runs. Nothing is *lost* — every write was fsync'd
 //!    through the WAL before it was acked — but the next open has to replay a
 //!    WAL that should have been truncated.

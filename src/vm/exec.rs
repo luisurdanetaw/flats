@@ -76,7 +76,7 @@ use crate::wal::wal::{Outcome, RejectReason};
 
 /// A value in a register.
 ///
-/// NAMING: this is the *contents* of a register; [`Reg`] is the *index* of one.
+/// NAMING: this is the *contents* of a register; `Reg` is the *index* of one.
 /// They are deliberately not both called `Reg` — this codebase keeps
 /// structurally-different types with related meanings type- and name-distinct
 /// (see the `DeclarationOrdinal` / `ColumnId` split), and a `Reg` that is
@@ -90,16 +90,16 @@ pub enum RegValue {
     /// Never written. NOT a SQL `NULL` — V-SQL has no nulls (see
     /// [`ColumnType`](crate::metadata::common::ColumnType)); this is the
     /// "the emitter never loaded this register" state, and reading it is an
-    /// [`ExecError::UnsetRegister`].
+    /// `ExecError::UnsetRegister`.
     Unset,
-    /// An `i64`, from [`Op::Integer`] or an `INT` column.
+    /// An `i64`, from `Op::Integer` or an `INT` column.
     Int(i64),
-    /// An `f64`, from [`Op::Real`] or a `FLOAT` column.
+    /// An `f64`, from `Op::Real` or a `FLOAT` column.
     Real(f64),
-    /// A string, from [`Op::String`] or a `TEXT` column.
+    /// A string, from `Op::String` or a `TEXT` column.
     Str(String),
-    /// An embedding — **seam (b)**. Produced today only by [`Op::VectorConst`];
-    /// [`Op::VectorFetch`] joins it in 5b, and a `SEARCH … NEAREST TO [...]`
+    /// An embedding — **seam (b)**. Produced today only by `Op::VectorConst`;
+    /// `Op::VectorFetch` joins it in 5b, and a `SEARCH … NEAREST TO [...]`
     /// query vector interns as a `Const` and lands here too.
     ///
     /// `Arc<[f32]>` rather than a pool handle because the two producers have
@@ -108,8 +108,8 @@ pub enum RegValue {
     /// in a `'static` register file. An `Arc` is the one representation both
     /// can produce and neither has to copy again.
     Vector(Arc<[f32]>),
-    /// A packed row, built by [`Op::MakeRecord`] and consumed by
-    /// [`Op::Insert`]. The ISA's `MakeRecord dst` is a register, so a register
+    /// A packed row, built by `Op::MakeRecord` and consumed by
+    /// `Op::Insert`. The ISA's `MakeRecord dst` is a register, so a register
     /// has to be able to hold one.
     Record(Record),
     /// A set of ordinals — the value a `WHERE` clause computes.
@@ -164,7 +164,7 @@ enum Slot {
     },
 }
 
-/// One row yielded by [`Op::ResultRow`].
+/// One row yielded by `Op::ResultRow`.
 ///
 /// Built from a RUN OF REGISTERS — **seam (c)** — never read straight off a
 /// cursor. That is what will let `RETURNING id, score` mix a stored column
@@ -206,8 +206,11 @@ fn needs_db(op: &Op) -> bool {
             | Op::OpenWrite { .. }
             | Op::KnnScan { .. }
             | Op::Insert { .. }
+            | Op::InsertMany { .. }
+            | Op::Upsert { .. }
             | Op::Mutate { .. }
             | Op::CreateCollection { .. }
+            | Op::DropCollection { .. }
             // Every bitmap op reads the collection's metadata index.
             | Op::BitmapEq { .. }
             | Op::BitmapRange { .. }
@@ -231,10 +234,13 @@ fn mnemonic(op: &Op) -> &'static str {
         Op::ResultRow { .. } => "ResultRow",
         Op::MakeRecord { .. } => "MakeRecord",
         Op::Insert { .. } => "Insert",
+        Op::InsertMany { .. } => "InsertMany",
+        Op::Upsert { .. } => "Upsert",
         Op::KnnScan { .. } => "KnnScan",
         Op::RowId { .. } => "RowId",
         Op::Score { .. } => "Score",
         Op::CreateCollection { .. } => "CreateCollection",
+        Op::DropCollection { .. } => "DropCollection",
         Op::BitmapEq { .. } => "BitmapEq",
         Op::BitmapRange { .. } => "BitmapRange",
         Op::BitmapAnd { .. } => "BitmapAnd",
@@ -376,7 +382,11 @@ impl Vm {
         // and strand the scan.
         while self.program.ops[self.pc..].iter().any(needs_db) {
             match self.exec_one(Some(db))? {
-                Flow::Next => {}
+                Flow::Next => {
+                    // Between two storage-facing ops: where a generation flip
+                    // would split one read across two generations.
+                    pause_point!("vm.open_cursors.between_ops");
+                }
                 // Producing a row, or finishing, before the last storage-facing
                 // op means the program interleaves reads with row production —
                 // it cannot be detached, and finding that out HERE is the point:
@@ -816,6 +826,30 @@ impl Vm {
                     db.insert(collection, &vector, row)
                         .map_err(ExecError::Engine)?;
                 }
+                Op::InsertMany { cur, start, count } | Op::Upsert { cur, start, count } => {
+                    let upsert = matches!(op, Op::Upsert { .. });
+                    let (cur, start, count) = (*cur, *start, *count);
+                    let db = db.ok_or(ExecError::Detached { op: "InsertMany" })?;
+                    let (collection, schema) = match self.slot(cur)? {
+                        Slot::Write { collection, schema } => (*collection, schema.clone()),
+                        _ => return Err(ExecError::NotAWriteCursor { cur: cur.0 }),
+                    };
+                    // The same split `Insert` does, once per record; the
+                    // batch then goes down whole, as one durable record.
+                    let mut rows = Vec::with_capacity(count as usize);
+                    for reg in start.0..start.0 + count {
+                        let record = match self.reg(Reg(reg)) {
+                            Some(RegValue::Record(record)) => record,
+                            _ => return Err(ExecError::NotARecord { reg }),
+                        };
+                        rows.push(split_record(record, &schema).map_err(ExecError::Split)?);
+                    }
+                    if upsert {
+                        db.upsert_many(collection, rows).map_err(ExecError::Engine)?;
+                    } else {
+                        db.insert_many(collection, rows).map_err(ExecError::Engine)?;
+                    }
+                }
 
                 // -- DELETE: one statement, one record --------------------------
                 Op::Mutate {
@@ -895,6 +929,13 @@ impl Vm {
                     // return the collection is durable and immediately usable.
                     db.create_collection(name, capacity, schema)
                         .map_err(ExecError::Engine)?;
+                }
+                Op::DropCollection { name } => {
+                    let db = db.ok_or(ExecError::Detached {
+                        op: "DropCollection",
+                    })?;
+                    // Blocks until durable AND applied.
+                    db.drop_collection(name).map_err(ExecError::Engine)?;
                 }
             }
         }
@@ -985,11 +1026,11 @@ impl Vm {
             return Ok(Arc::clone(set));
         }
         let id = db.collection_id(collection).map_err(ExecError::Engine)?;
-        let set = db.live_snapshot(id).ok_or(ExecError::Engine(
-            crate::Error::UnknownCollectionName {
-                name: collection.to_string(),
-            },
-        ))?;
+        let set =
+            db.live_snapshot(id)
+                .ok_or(ExecError::Engine(crate::Error::UnknownCollectionName {
+                    name: collection.to_string(),
+                }))?;
         self.live
             .borrow_mut()
             .insert(collection.to_string(), Arc::clone(&set));
@@ -998,11 +1039,10 @@ impl Vm {
 
     fn metadata(&self, db: &Db, collection: &str) -> Result<meta::Reader, ExecError> {
         let id = db.collection_id(collection).map_err(ExecError::Engine)?;
-        db.metadata_reader(id).ok_or(ExecError::Engine(
-            crate::Error::UnknownCollectionName {
+        db.metadata_reader(id)
+            .ok_or(ExecError::Engine(crate::Error::UnknownCollectionName {
                 name: collection.to_string(),
-            },
-        ))
+            }))
     }
 
     /// Read a register as a metadata [`Value`] — a predicate's comparand.
@@ -1287,6 +1327,9 @@ impl fmt::Display for ExecError {
             }
             ExecError::Rejected(RejectReason::DuplicateKey) => {
                 write!(f, "a live row already holds this primary key")
+            }
+            ExecError::Rejected(RejectReason::CollectionDropped) => {
+                write!(f, "the collection was dropped while this statement ran")
             }
             ExecError::NotABitmap { reg } => {
                 write!(f, "register r{reg} does not hold a bitmap")

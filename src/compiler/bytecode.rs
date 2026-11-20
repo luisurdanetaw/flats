@@ -63,6 +63,8 @@
 //   Insert       cur, rec             write the record in `rec` through the
 //                                     cursor: WAL + tuple store + bitmap index
 //                                     + flat index
+//   InsertMany   cur, start, count    write the records in start..start+count
+//                                     through the cursor as ONE durable record
 //   KnnScan      cur, collection, query, k
 //                                     SIMD top-k over the flat index. Opens
 //                                     `cur` over the winning ordinals IN SCORE
@@ -381,6 +383,27 @@ pub enum Op {
         /// Register holding the record to write.
         rec: Reg,
     },
+    /// Write the records in registers `start..start + count` through cursor
+    /// `cur` as ONE statement: one durable record, every row or none.
+    InsertMany {
+        /// Write cursor.
+        cur: Cursor,
+        /// First register of the run of records.
+        start: Reg,
+        /// How many records the run holds.
+        count: u32,
+    },
+    /// Write the records in registers `start..start + count` through cursor
+    /// `cur` as ONE statement, each inserted or REPLACING the live row that
+    /// holds its primary key.
+    Upsert {
+        /// Write cursor.
+        cur: Cursor,
+        /// First register of the run of records.
+        start: Reg,
+        /// How many records the run holds.
+        count: u32,
+    },
     /// SIMD top-`k` over the flat index: rank `collection`'s rows by similarity
     /// to the query vector in `query`, and open `cur` over the winning ordinals
     /// **in score order, nearest first**.
@@ -507,6 +530,11 @@ pub enum Op {
         /// Requested capacity.
         capacity: u64,
     },
+    /// Drop a collection. One fat op, like `CreateCollection`.
+    DropCollection {
+        /// The collection's name.
+        name: String,
+    },
     /// Stop execution.
     Halt,
 }
@@ -591,6 +619,10 @@ impl Program {
                     self.check_cursor(at, *cur)?;
                     self.check_reg(at, *rec)?;
                 }
+                Op::InsertMany { cur, start, count } | Op::Upsert { cur, start, count } => {
+                    self.check_cursor(at, *cur)?;
+                    self.check_reg_run(at, *start, *count)?;
+                }
                 Op::KnnScan {
                     cur, query, filter, ..
                 } => {
@@ -627,7 +659,7 @@ impl Program {
                 Op::CreateCollection { schema, .. } => {
                     self.check_const(at, *schema)?;
                 }
-                Op::Halt => {}
+                Op::DropCollection { .. } | Op::Halt => {}
             }
         }
         Ok(())

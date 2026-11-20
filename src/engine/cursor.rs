@@ -87,7 +87,7 @@ use crate::metadata::tuples::{self, RowGet};
 /// ties the cursor to a shorter life.
 pub struct Cursor<'a> {
     /// The ordinals to visit, in the source's order (ascending for a bitmap).
-    ordinals: Box<dyn Iterator<Item = Ordinal> + 'a>,
+    ordinals: Box<dyn Iterator<Item = Ordinal> + Send + 'a>,
     /// Read handle into the tuple store. OWNED (an `Arc` clone), not borrowed:
     /// `Db::scan` reaches the reader through a temporary `Arc<Collection>` from
     /// the catalog snapshot, so there is no `&Reader` outliving the call to
@@ -131,7 +131,7 @@ impl<'a> Cursor<'a> {
     /// This is the constructor both [`Db::scan`](crate::Db::scan) and any
     /// future filtered/KNN path use; there is exactly one cursor type.
     pub fn over(
-        ordinals: impl Iterator<Item = Ordinal> + 'a,
+        ordinals: impl Iterator<Item = Ordinal> + Send + 'a,
         tuples: tuples::Reader,
         vectors: VectorReader,
         columns: Vec<ColumnId>,
@@ -162,7 +162,7 @@ impl<'a> Cursor<'a> {
     /// `over` only when the ordinals genuinely come from somewhere else.
     pub fn over_snapshot(
         collection: u32,
-        ordinals: impl Iterator<Item = Ordinal> + 'a,
+        ordinals: impl Iterator<Item = Ordinal> + Send + 'a,
         tuples: tuples::Reader,
         vectors: VectorReader,
         columns: Vec<ColumnId>,
@@ -278,8 +278,8 @@ impl<'a> Cursor<'a> {
     /// How many rows this cursor has materialized out of the tuple store.
     ///
     /// This is a STORAGE-READ COUNT, not a bookkeeping tally: it is incremented
-    /// at the one place [`tuples::Reader::get`] returns
-    /// [`Live`](RowGet::Live), so `fetched() + skipped()` is exactly the number
+    /// at the one place the tuple store's `Reader::get` returns
+    /// `RowGet::Live`, so `fetched() + skipped()` is exactly the number
     /// of `get` calls the cursor has issued. That is what makes it usable as
     /// evidence that a scan is LAZY — a consumer that stops after `k` rows
     /// leaves this at `k`, while an eager implementation would show the whole

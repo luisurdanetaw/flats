@@ -85,6 +85,14 @@ NOTE: V1 IS LINUX ONLY
 V-SQL: SUBSET OF SQL DEDICATED TO FLATS
 
 -- Types: only VECTOR(dim), TEXT, INT, FLOAT... thats it!
+-- Parameters: `?` stands for any literal (WHERE comparand, INSERT/SET value,
+-- NEAREST TO ?, TOP ?), filled from Db::execute_with(sql, &[Param]) AFTER
+-- lexing — a value is never source text, so it cannot inject syntax, and it
+-- can never stand for a name. SDKs must document parameters, never string
+-- formatting.
+-- Float literals take an exponent (1e-5, 2.5E+10, Python's 1e-05) so a client
+-- can format with its language's own printer. Overflow (1e999, or a vector
+-- element past f32::MAX) is refused, never stored as infinity.
 
 -- Vector similarity search queries (core)
 SEARCH TOP 5 NEAREST TO [...] FROM docs;                              
@@ -109,6 +117,8 @@ CREATE COLLECTION docs (
 -- Regular metadata queries:
 SELECT x, y FROM docs; 
 SELECT * FROM docs; -- NOTE: DOES NOT RETURN EMBEDDING BY DEFAULT!
+SELECT x, y FROM docs WHERE a < 4 LIMIT 100 OFFSET 200; -- paging; LIMIT first,
+                         -- either optional. SELECT only: SEARCH has TOP k.
 SELECT vector FROM docs; -- NAME the vector column to get the embedding back.
                          -- Opt-in, never part of `*` — same as Pinecone's
                          -- include_values / Qdrant's with_vector.
@@ -123,11 +133,23 @@ SELECT x, y FROM docs WHERE a < 4 AND a = 2; -- NOTE: we support < > <= >= != =
 -- INSERT (every column, including the key — V-SQL has no NULLs and no defaults)
 INSERT INTO docs (id, vector, author, title, published_at) VALUES ('d1', [0.1, ...], 'alice', 'My doc', 1700000000);
 
+-- Multi-row INSERT: one statement, ONE durable record — every row or none. A key
+-- repeated in the batch or already live refuses the whole batch. (Rust API:
+-- Db::insert_many.)
+INSERT INTO docs (id, vector, author, title, published_at) VALUES
+    ('d2', [0.1, ...], 'bob', 'A', 1700000001),
+    ('d3', [0.2, ...], 'eve', 'B', 1700000002);
+
 -- DELETE
 DELETE FROM <collection> WHERE <predicate>;
 
 -- UPDATE (WHERE is mandatory; the PRIMARY KEY itself cannot be assigned)
 UPDATE <collection> SET <col> = <expr>, <col> = <expr>, ... WHERE <predicate>;
+
+-- DROP: the collection, its rows and its files. The name is free at once; the
+-- id is never reused. (Rust API: Db::drop_collection. Backup: Db::backup(dir),
+-- a consistent copy that Db::open restores.)
+DROP COLLECTION docs;
 
 -- UPDATE replacing the embedding: needs the key, because one statement carries
 -- one vector and so must name one row.
@@ -144,7 +166,7 @@ Concurrency: single writer, multiple readers. Please refer to ARCHITECTURE.md fo
 
 - **No `unwrap()` in library code.** Bubble errors with `Result<T, Error>`. Tests can `unwrap`.
 - **One error type per layer.** The storage engine has exactly one: `crate::Error` (in `error.rs`), with variants covering all engine/IO/durability failures. The **query pipeline** (lexer → parser → plan → compiler → VM) may define its own stage-local error types — e.g. `lexer::LexError` — because they carry frontend-only concerns (source `pos`, `line_col` diagnostics) that must not bleed into the engine's error enum, and an engine `Error` can never surface from lexing (nor vice versa). Each stage's error stays local; the top-level API wraps them at the boundary rather than flattening every stage into one enum. No `anyhow`. Hand-roll `Display` and `Error` (the `thiserror` derive on `crate::Error` is a sanctioned temporary exception — see §2 / `Cargo.toml`).
-- **`unsafe` is allowed but quarantined.** Only in `simd/*` and `platform/*`. Every `unsafe` block has a `// SAFETY:` comment naming the preconditions.
+- **`unsafe` is allowed but quarantined.** Only in `simd/*` and `platform/*`. Every `unsafe` block has a `// SAFETY:` comment naming the preconditions. The SDK crates (`sdk/c`, `sdk/node`) are FFI-export layers outside the engine and hold their own `unsafe` under the same rule; the engine crate itself stays quarantined.
 - **No `Box<dyn Error>` in public API.**
 - **`#![forbid(unsafe_op_in_unsafe_fn)]`** at crate root. Be explicit about unsafe scopes.
 - **`#![warn(missing_docs)]`** on public API.
@@ -157,3 +179,4 @@ Concurrency: single writer, multiple readers. Please refer to ARCHITECTURE.md fo
 - Adding a new SIMD path? Add it to `simd_parity.rs` first, then implement.
 - Touching `unsafe`? Write the `// SAFETY:` comment before the code.
 - Tempted to add a dependency? Read §2 again. The answer is most likely no.
+- Adding to the public API? It is ONLY what `src/lib.rs` re-exports. Every module is private on default features; the `internals` feature (on for our own tests/benches via a self dev-dependency) makes them `#[doc(hidden)] pub`. `tests/public_api.rs` builds a downstream crate to hold that line — extend its `uses_root` fixture with anything you export.

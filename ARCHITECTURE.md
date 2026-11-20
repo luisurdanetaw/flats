@@ -205,9 +205,13 @@ memory via `Reader::tombstone_uncommitted` — a pure atomic bit-flip, *not* a W
 
 The flusher thread pokes the WAL thread on a timer; the WAL thread runs
 checkpoint *itself* (it owns the writers). Per collection, all three stores:
-the flat index does `sync_data → stage_watermark → sync_header`, the two
-metadata stores each write their serialize-and-rename snapshot. Then the commit
-thread truncates the WAL — strictly after. Ordering rule: **make the stores
+the flat index does `sync_data → stage_watermark → sync_header`, then the tuple
+store and, LAST, the metadata index each write their serialize-and-rename
+snapshot. Then the commit thread truncates the WAL — strictly after. The
+metadata index goes last because the apply-time verdicts (is a key taken, was
+a row retired) are read off it: it must never be ahead of the other stores, or
+a crash mid-checkpoint makes replay judge a record against a later state
+(`tests/failpoints.rs`). Ordering rule: **make the stores
 durable before truncating the WAL.** Truncate-first-then-crash would throw away
 records a store hadn't durably absorbed = data loss.
 
@@ -215,6 +219,13 @@ The truncation point is the **minimum** durable watermark across every store of
 every collection, not the max. A frame at LSN L is redundant only once *every*
 store that might own it is durable past L. If any one store's checkpoint fails,
 the whole round errs and truncation is skipped — retried next tick.
+
+Before syncing, every store is advanced to the commit thread's `last_applied`.
+Every record at or below it has been fully processed for every collection, so
+a store whose collection wasn't written since is exactly as caught up as the
+busiest one. Without that, an idle collection's watermark stayed at its last
+write (or 0) forever and the min pinned the whole log: unbounded WAL growth,
+full replay on every open (`tests/wal_truncation.rs`).
 
 ### Recovery (`Db::open`)
 
@@ -280,12 +291,23 @@ Two properties make the min-watermark scheme sound:
 
 - **Idempotent applies** — re-delivering a record a store already has is a
   no-op (bitmap set-insert, slot overwrite-with-same).
-- **Corrupt/missing snapshot ⇒ empty at LSN 0** — the store's 0 drags the
-  global min down, forcing a full-tail replay that heals it while the healthy
-  stores absorb the replay harmlessly. (Only crash-produced tears are covered:
-  atomic rename means a torn checkpoint leaves the *old complete* snapshot,
-  whose watermark bounds truncation. Bit-rot after the WAL truncated past the
-  data is unrecoverable — accepted.)
+- **A lost store is rebuilt only when that provably loses nothing.** A
+  snapshot that is missing or fails its checks comes up empty, and that is
+  only correct if the WAL still holds every record the store ever applied.
+  The proof is the collection's surviving stores: truncation never passes the
+  lowest watermark of any store, so if every survivor is still at watermark 0
+  (this generation was never checkpointed, i.e. the crash-before-first-
+  checkpoint case) the store's 0 drags the min down and the full-tail replay
+  refills it while the healthy stores absorb it idempotently. Any surviving
+  watermark above 0 (a checkpoint, or a compaction flip, which renumbers
+  rows) means the log may be cut past rows only the lost file held, so `open`
+  **refuses** with `CorruptSnapshot`, naming the collection and file and
+  touching nothing, the same posture as SQLite, Postgres, RocksDB and
+  InnoDB. `Db::open_salvage` is the explicit way past it: both metadata
+  stores reset, the damaged file is kept as `<name>.damaged`, and the
+  collection's floor is set to the vector index's watermark, so exactly the
+  records the log proves replay, none land on renumbered rows, and the LSN
+  counter resumes above every checkpoint. See `open_collection_with`.
 
 Same SWMR posture as the flat index: each store is a `!Clone` `Writer` (lives
 in the applier) + cloneable `Reader`s, though internally it's a plain Mutex for
@@ -398,6 +420,58 @@ reopens.
 
 ---
 
+## 7. DROP COLLECTION and backup
+
+**DROP** is DDL on the log, like CREATE: `Record::DropCollection { id }` (WAL
+v6 — an append, so v5 logs still replay). Apply, on the commit thread:
+
+1. persist `catalog.snap` without the collection — **the commit point**;
+2. unpublish it from the read path (reads already holding it finish against
+   their own handles; unlinked files stay mapped until released);
+3. release its writers;
+4. delete `collection-{id}/` and any `.compact` / `.old` sibling.
+
+**Ids are never reused.** `catalog.snap` v4 carries `next_id`, one past the
+highest id ever issued, so "below `next_id` and not registered" means
+*dropped*. That is what keeps replay sound with the dropped collection's
+records still in the log: a data record for a dropped id gets the
+deterministic verdict `Rejected(CollectionDropped)` (never an apply failure,
+so never a halt), a replayed `CreateCollection` of it is skipped, and an
+open-time config cannot revive it. A crash between steps 1 and 4 leaves files
+that `Db::open` deletes before opening anything. An insert that resolved the
+collection before the drop and logged after it is refused with
+`UnknownCollection`.
+
+**Backup** (`Db::backup(dest)`) is a control job on the commit thread, like a
+compaction flip: checkpoint, then copy `catalog.snap`, every registered
+collection directory (no staging copies, no `.tmp`), and `wal.log`, fsyncing
+each. Nothing applies while it runs, so the copy is the database as of one
+point in the log — whole statements only — and restoring is `Db::open(dest)`.
+Reads continue throughout; writes wait for the copy.
+
+---
+
+## 8. The SDKs — one C ABI, thin bindings over it
+
+```text
+Python (ctypes)  ─┐
+Node.js (N-API)  ─┼─►  sdk/c  flats.h / flats-c  ─►  flats (root API only)
+C                ─┘
+```
+
+`sdk/c` is the only implementation of the foreign interface: open/close,
+`execute` (results collected into typed cells), `backup`, and a batch-insert
+path that takes vectors as binary and commits through `Db::insert_many`.
+Errors are a status code plus a per-thread message; panics are caught at the
+boundary. It is built from the engine's PUBLIC API alone, like any downstream
+crate. The Python package wraps it with ctypes; the Node addon (`sdk/node`) is
+a Rust cdylib that hand-declares the N-API functions it needs and calls the
+same `flats_c` functions, so the bindings cannot drift apart semantically.
+The two SDK crates hold their own `unsafe` (FFI exports cannot avoid it),
+under the same `// SAFETY:` rule as the engine's quarantines.
+
+---
+
 ## What is and isn't guaranteed
 
 | Guaranteed | How |
@@ -411,6 +485,7 @@ reopens.
 | **Gap-free monotonic LSNs** | assigned only by the single commit thread; reclaimed on failure |
 | **Catalog survives restarts** | `catalog.snap`, atomic-rename; conflicts refused loudly |
 | **Compaction is crash-safe and invisible to readers** | build off-thread, write gate + one-thread flip, rename commit point, `settle` on open, per-collection replay floors, epoch-checked reads (§6) |
+| **One handle per directory** | exclusive OS lock (`flock`) on `<dir>/LOCK`, taken first in `Db::open`, held by the `Db`, released by the OS on process death |
 
 **Not** guaranteed:
 
@@ -421,8 +496,9 @@ reopens.
 - Per-collection truncation precision — the WAL still truncates at the
   conservative global min. Replay, though, now skips each collection's records
   at or below that collection's own watermark (§6).
-- Snapshot bit-rot *after* the WAL truncated past its data (outside the crash
-  model; see §4).
+- Recovering rows from a damaged snapshot once the WAL is truncated past
+  them. Open refuses, and salvage keeps only what the log proves (§4). A
+  previous-snapshot copy per store would make that lossless; not built.
 - Catalog rebuild from the WAL — registration isn't logged yet; corrupt
   `catalog.snap` is a refusal, not a recovery (see §5).
 - Anything in `CLAUDE.md` §2 non-goals (ANN and the rest).

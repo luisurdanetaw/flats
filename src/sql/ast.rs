@@ -38,8 +38,18 @@
 pub enum Statement {
     /// `SELECT …`
     Select(SelectStmt),
-    /// `INSERT INTO …`
+    /// `INSERT INTO …` with ONE row of values.
     Insert(InsertStmt),
+    /// `INSERT INTO … VALUES (…), (…), …` — two or more rows, one statement.
+    ///
+    /// A separate variant rather than a `Vec` of rows on [`InsertStmt`] so the
+    /// one-row statement every existing stage and test speaks keeps its exact
+    /// shape; a multi-row statement binds each row through the same routine.
+    InsertMany(InsertManyStmt),
+    /// `UPSERT INTO … VALUES (…), …` — one row or many. Each row is inserted,
+    /// or REPLACES the live row holding its primary key (every column and the
+    /// vector), and the whole statement is one record: all rows or none.
+    Upsert(InsertManyStmt),
     /// `CREATE COLLECTION …`
     CreateCollection(CreateStmt),
     /// `SEARCH TOP … NEAREST TO … FROM …`
@@ -48,6 +58,30 @@ pub enum Statement {
     Delete(DeleteStmt),
     /// `UPDATE … SET … WHERE …`
     Update(UpdateStmt),
+    /// `DROP COLLECTION name`
+    DropCollection(DropStmt),
+    /// A statement with a row window: `… LIMIT n [OFFSET m]` or `… OFFSET m`.
+    ///
+    /// A WRAPPER rather than fields on [`SelectStmt`]: the inner statement is
+    /// exactly the one written without the window, so every stage that knows
+    /// statements keeps the shape it always had, and the window is applied to
+    /// the result stream by the query layer. Only a SELECT takes one; a
+    /// SEARCH says how many rows it wants with `TOP k`.
+    Limited {
+        /// The statement the window applies to.
+        statement: Box<Statement>,
+        /// At most this many rows; `None` for no cap (an `OFFSET` alone).
+        limit: Option<u64>,
+        /// Skip this many rows first.
+        offset: u64,
+    },
+}
+
+/// `DROP COLLECTION name`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropStmt {
+    /// The collection to drop.
+    pub name: String,
 }
 
 /// `UPDATE ident SET col = literal, … WHERE expr`.
@@ -280,6 +314,20 @@ pub struct InsertStmt {
     /// One value per source position. The parser does NOT check that
     /// `values.len() == columns.len()` — count/type validation is the planner's.
     pub values: Vec<Literal>,
+}
+
+/// `INSERT INTO collection ( columns ) VALUES ( … ), ( … ), …` — two or more
+/// rows against one column list. Lands as ONE record: every row or none.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertManyStmt {
+    /// Target collection.
+    pub collection: String,
+    /// Target columns, in source order, shared by every row.
+    pub columns: Vec<String>,
+    /// One value list per row, in source order. As for [`InsertStmt`], the
+    /// parser does not check a row's length against `columns` — the binder
+    /// does, row by row.
+    pub rows: Vec<Vec<Literal>>,
 }
 
 /// A literal value in an `INSERT ... VALUES (...)` list. Carries no type

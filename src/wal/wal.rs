@@ -33,16 +33,15 @@
 //! data types in `metadata::common` (`Record::Insert` carries the metadata
 //! row); the stores themselves are never imported here.
 
-
 use std::any::Any;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, OnceLock};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
 use roaring::RoaringBitmap;
@@ -53,7 +52,6 @@ use crate::metadata::common::{CollectionConfig, ColumnId, Value};
 // ---------------------------------------------------------------------------
 // Core types
 // ---------------------------------------------------------------------------
-
 
 /// Monotonic log sequence number. Assigned by the WAL thread, recorded in the
 /// frame, and returned to the writer on ack. Recovery resumes the counter from
@@ -154,7 +152,9 @@ pub enum Record {
     /// assigned on the logging side, like ordinals) so a dumb replay loop can
     /// materialize the collection with no catalog to consult. Apply is
     /// idempotent: if the id/name already exists, it's a no-op.
-    CreateCollection { config: CollectionConfig },
+    CreateCollection {
+        config: CollectionConfig,
+    },
     /// ONE STATEMENT, ONE RECORD (Phase 7): everything a `DELETE` or `UPDATE`
     /// changes, in a single frame with a single CRC behind a single fsync.
     ///
@@ -179,6 +179,28 @@ pub enum Record {
         retire: Bitmap,
         install: Vec<Install>,
     },
+    /// DROP COLLECTION (WAL v6): retire a whole collection — its catalog
+    /// entry, its stores, its files. Carries only the id: the name is the
+    /// catalog's to resolve on the logging side, and ids are never reused, so
+    /// the id alone names exactly one collection for the life of the log.
+    ///
+    /// APPENDED, never inserted: bincode tags variants positionally, so every
+    /// earlier variant keeps its tag and a v5 log is a strict subset of a v6
+    /// one.
+    DropCollection { id: u32 },
+    /// UPSERT (WAL v7): install every row, and retire whichever live rows
+    /// hold their primary keys — decided by the COMMIT THREAD when it applies
+    /// the record, not by the caller when it logs it. That is what makes an
+    /// upsert immune to conflicts: there is no read on the caller's side that
+    /// another writer could invalidate, so no retry and no starvation. Replay
+    /// reaches the same decision because the metadata index it reads is never
+    /// checkpointed ahead of the other stores (see the checkpoint order).
+    ///
+    /// APPENDED, like `DropCollection`: a v5 or v6 log is a strict subset.
+    Upsert {
+        collection: u32,
+        install: Vec<Install>,
+    },
 }
 
 impl Record {
@@ -186,11 +208,11 @@ impl Record {
     ///
     /// Appends to `buf` rather than returning a fresh `Vec` so the commit loop
     /// can reuse one scratch buffer across the whole batch. Serializing our
-    /// plain data into an in-memory buffer has no fallible step (no IO, no size
-    /// cap), so a failure here is a logic bug, not a runtime condition.
-    fn encode(&self, buf: &mut Vec<u8>) {
-        bincode::serialize_into(buf, self)
-            .expect("Record serialization into an in-memory buffer cannot fail");
+    /// plain data into an in-memory buffer has no fallible step today (no IO,
+    /// no size cap), but the error is surfaced rather than unwrapped: the
+    /// commit loop fails the batch exactly as it would for a bad frame.
+    fn encode(&self, buf: &mut Vec<u8>) -> io::Result<()> {
+        bincode::serialize_into(buf, self).map_err(io::Error::other)
     }
 
     /// Inverse of `encode`. A malformed/garbage payload is a recoverable
@@ -200,6 +222,14 @@ impl Record {
         bincode::deserialize(bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
+}
+
+/// Fuzzing hook: decode `data` as a WAL frame payload that passed its CRC.
+/// Must return for any input, never panic.
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub fn fuzz_decode_record(data: &[u8]) -> bool {
+    Record::decode(data).is_ok()
 }
 
 /// What the applier DID with a record that was already made durable.
@@ -238,6 +268,10 @@ pub enum Outcome {
 pub enum RejectReason {
     /// The row carries a primary key some live row already holds.
     DuplicateKey,
+    /// The record names a collection that has been dropped. A write that
+    /// resolved the collection before a DROP committed, and was logged after
+    /// it, lands here — as does every replayed record of a dropped collection.
+    CollectionDropped,
 }
 
 /// A durable record plus what became of it.
@@ -329,8 +363,8 @@ pub trait Apply {
 const WAL_MAGIC: &[u8; 4] = b"FWAL";
 /// Version written to new logs. 2 = metadata-carrying Insert (Phase 4c);
 /// 3 = + CreateCollection (Phase 6); 4 = + Mutate (Phase 7); 5 = `Schema`
-/// carries a PRIMARY KEY.
-const WAL_VERSION: u32 = 5;
+/// carries a PRIMARY KEY; 6 = + DropCollection; 7 = + Upsert.
+const WAL_VERSION: u32 = 7;
 /// Oldest version this build still reads.
 ///
 /// THE 5 BUMP IS THE FIRST THAT IS NOT AN APPEND. Every earlier one only added
@@ -341,6 +375,9 @@ const WAL_VERSION: u32 = 5;
 /// shape, so a v3 or v4 log carrying a create would decode into the wrong
 /// fields rather than fail. Nothing below 5 may be replayed, and recovery says
 /// so plainly instead of guessing.
+///
+/// Versions 6 and 7 are appends again (`DropCollection`, `Upsert`), so a v5
+/// log still replays: the floor stays at 5.
 const WAL_MIN_VERSION: u32 = 5;
 const WAL_HEADER_BYTES: usize = 8;
 
@@ -393,6 +430,21 @@ fn write_frame(out: &mut impl Write, lsn: Lsn, payload: &[u8]) -> io::Result<()>
     Ok(())
 }
 
+/// Little-endian `u32` at `offset` of a fixed-size header buffer. Callers pass
+/// constant offsets inside the header, so the range is always in bounds.
+fn le_u32(buf: &[u8], offset: usize) -> u32 {
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&buf[offset..offset + 4]);
+    u32::from_le_bytes(b)
+}
+
+/// Little-endian `u64` at `offset`; see [`le_u32`].
+fn le_u64(buf: &[u8], offset: usize) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&buf[offset..offset + 8]);
+    u64::from_le_bytes(b)
+}
+
 // ---------------------------------------------------------------------------
 // Writer-facing handle
 // ---------------------------------------------------------------------------
@@ -419,9 +471,7 @@ enum Command {
     /// Run `Apply::checkpoint` on the commit thread (making the index durable),
     /// then truncate the log up to the watermark it returns. This keeps all
     /// index mutation on the single writer thread.
-    Checkpoint {
-        ack: Sender<io::Result<()>>,
-    },
+    Checkpoint { ack: Sender<io::Result<()>> },
     /// Run `Apply::control` on the commit thread, then truncate the log up to
     /// the watermark it returns.
     Control {
@@ -460,10 +510,7 @@ impl WalHandle {
     pub fn truncate(&self, up_to: u64) -> io::Result<()> {
         let (ack_tx, ack_rx) = mpsc::channel();
         self.tx
-            .send(Command::Truncate {
-                up_to,
-                ack: ack_tx,
-            })
+            .send(Command::Truncate { up_to, ack: ack_tx })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wal thread gone"))?;
         ack_rx
             .recv()
@@ -586,11 +633,17 @@ impl Wal {
 
         // 2. Open the log for appending. We keep the File for fsync; the batched
         //    frames are buffered in memory and written in one shot per batch.
+        let existed = path.exists();
         let mut file = OpenOptions::new()
             .read(true)
-            .create(true)
+            .create(!existed)
             .append(true) // appends only (implies write); truncation is in-thread
             .open(&path)?;
+        // A NEW log's directory entry must be durable before the first write
+        // is acknowledged into it, or a power cut can take the file away.
+        if !existed && let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            File::open(dir)?.sync_all()?;
+        }
 
         // Fresh (or crash-emptied) file: stamp the header before any frame.
         // Recovery already validated it on non-empty files.
@@ -618,8 +671,7 @@ impl Wal {
                     loop_fail,
                     loop_poison,
                 )
-            })
-            .expect("spawn wal thread");
+            })?;
 
         Ok(Wal {
             handle: WalHandle { tx },
@@ -854,8 +906,10 @@ fn commit_batch<A: Apply>(
         assigned.push(lsn);
 
         payload.clear();
-        record.encode(payload);
-        if let Err(e) = write_frame(frame_buf, lsn, payload) {
+        if let Err(e) = record
+            .encode(payload)
+            .and_then(|()| write_frame(frame_buf, lsn, payload))
+        {
             frame_err = Some(e);
             break;
         }
@@ -868,18 +922,61 @@ fn commit_batch<A: Apply>(
         return;
     }
 
-    // --- one write + ONE fsyncclaude for the whole batch (group commit) ---
+    // --- one write + ONE fsync for the whole batch (group commit) ---
+    // Where this batch starts. If it doesn't become durable, the file is cut
+    // back to here (see below).
+    let start = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(e) => {
+            *next_lsn = batch_start_lsn;
+            fail_batch(batch, &e);
+            return;
+        }
+    };
     let durable: io::Result<()> = (|| {
+        fail_point!("wal.before_write");
+        #[cfg(feature = "failpoints")]
+        if let Err(e) = crate::failpoint::hit("wal.torn_write") {
+            // A short write: half the batch reaches the file, then the error.
+            file.write_all(&frame_buf[..frame_buf.len() / 2])?;
+            return Err(e);
+        }
         file.write_all(frame_buf)?;
+        fail_point!("wal.before_fsync");
         // fdatasync: we need the data + the file-size growth, not mtime.
         // NOTE: on macOS sync_data/fsync does NOT flush the drive cache; use
         // F_FULLFSYNC there if you want real power-loss durability.
         file.sync_data()?;
+        fail_point!("wal.after_fsync");
         Ok(())
     })();
     if let Err(e) = durable {
-        // Not durable -> these writes did NOT commit. Ack every waiter with the
-        // error so callers do NOT ack their clients.
+        // Not durable -> these writes did NOT commit, and the caller is about
+        // to be told so. That has to stay TRUE, which means getting the
+        // batch's bytes back out of the file: a failed write or fsync can
+        // leave all of them there (and the next restart would replay a write
+        // its caller was told failed), or half of them (and the next batch,
+        // appended after a torn frame, would be cut off by recovery, which
+        // stops at the first bad frame: every later acknowledged write
+        // silently gone). So cut the file back to where the batch started and
+        // make THAT durable. Then the batch never happened, its LSNs are
+        // reused, and the log carries on.
+        //
+        // If even that fails, nothing about the file's tail can be promised:
+        // poison the log (the Postgres answer to fsync failure) so every later
+        // write is refused until a reopen recovers from what's really on disk.
+        match file.set_len(start).and_then(|()| file.sync_data()) {
+            Ok(()) => *next_lsn = batch_start_lsn,
+            Err(rollback) => {
+                let _ = poison.set(Poison {
+                    lsn: Lsn(batch_start_lsn),
+                    cause: format!(
+                        "a write to the log failed ({e}) and so did removing it ({rollback}); \
+                         reopen the database"
+                    ),
+                });
+            }
+        }
         fail_batch(batch, &e);
         return;
     }
@@ -934,18 +1031,17 @@ fn truncate_wal(file: &mut File, path: &Path, up_to: u64) -> io::Result<()> {
         // Skip the file header (recovery validated it when this file was
         // opened); the temp file below gets a fresh copy.
         let mut file_header = [0u8; WAL_HEADER_BYTES];
-        match read_exact_or_eof(&mut reader, &mut file_header)? {
-            ReadOutcome::Full => {}
-            _ => {} // empty/short file: no frames to keep
-        }
+        // Either outcome is fine: an empty/short file has no frames to keep,
+        // and the frame loop below stops at the same EOF.
+        let _ = read_exact_or_eof(&mut reader, &mut file_header)?;
         loop {
             let mut header = [0u8; HEADER_BYTES];
             match read_exact_or_eof(&mut reader, &mut header)? {
                 ReadOutcome::Full => {}
                 _ => break, // clean EOF or torn tail: stop
             }
-            let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
-            let lsn = u64::from_le_bytes(header[8..16].try_into().unwrap());
+            let len = le_u32(&header, 0) as usize;
+            let lsn = le_u64(&header, 8);
             if len > MAX_FRAME_BYTES {
                 break; // impossible length: torn/corrupt tail, not an allocation
             }
@@ -973,14 +1069,20 @@ fn truncate_wal(file: &mut File, path: &Path, up_to: u64) -> io::Result<()> {
         tf.write_all(&kept)?;
         tf.sync_all()?;
     }
+    fail_point!("wal.truncate.before_rename");
     std::fs::rename(&tmp, path)?;
+    // The rename must be durable before anything is appended to the new file:
+    // if a power cut lost it, the directory would still name the OLD log, and
+    // every write acknowledged into the new one would be gone
+    // (`tests/sync_order.rs`).
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        File::open(dir)?.sync_all()?;
+    }
 
     // The old fd points at the now-unlinked inode; reopen on the new file.
-    *file = OpenOptions::new()
-        .read(true)
-        .create(true)
-        .append(true)
-        .open(path)?;
+    // It exists (the rename just put it there): no `create`, so a missing log
+    // is an error rather than a silently empty one.
+    *file = OpenOptions::new().read(true).append(true).open(path)?;
     Ok(())
 }
 
@@ -1047,11 +1149,7 @@ fn recover<A: Apply>(path: &Path, applier: &mut A, skip_through: u64) -> io::Res
              into the indexes), then start this build",
         ));
     }
-    let version = u32::from_le_bytes(
-        file_header[4..8]
-            .try_into()
-            .expect("slice of fixed len 4"),
-    );
+    let version = le_u32(&file_header, 4);
     if !(WAL_MIN_VERSION..=WAL_VERSION).contains(&version) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1073,9 +1171,9 @@ fn recover<A: Apply>(path: &Path, applier: &mut A, skip_through: u64) -> io::Res
             ReadOutcome::Full => {}
         }
 
-        let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
-        let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
-        let lsn = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        let len = le_u32(&header, 0) as usize;
+        let crc = le_u32(&header, 4);
+        let lsn = le_u64(&header, 8);
 
         // A length no writer could have produced is corruption, and sizing a
         // buffer from it would turn one bad byte into a 4 GiB allocation.
@@ -1115,6 +1213,46 @@ fn recover<A: Apply>(path: &Path, applier: &mut A, skip_through: u64) -> io::Res
     }
 
     Ok(next_lsn)
+}
+
+/// The highest LSN of any valid frame in the log at `path` (0 if there is
+/// none, or no log): where everything already logged ends. Stops at the first
+/// torn or corrupt frame, exactly as recovery does, and applies nothing.
+pub(crate) fn last_lsn(path: &Path) -> io::Result<u64> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut reader = BufReader::new(file);
+    let mut file_header = [0u8; WAL_HEADER_BYTES];
+    if !matches!(read_exact_or_eof(&mut reader, &mut file_header)?, ReadOutcome::Full) {
+        return Ok(0);
+    }
+    let mut last = 0;
+    loop {
+        let mut header = [0u8; HEADER_BYTES];
+        if !matches!(read_exact_or_eof(&mut reader, &mut header)?, ReadOutcome::Full) {
+            return Ok(last);
+        }
+        let len = le_u32(&header, 0) as usize;
+        let crc = le_u32(&header, 4);
+        let lsn = le_u64(&header, 8);
+        if len > MAX_FRAME_BYTES {
+            return Ok(last);
+        }
+        let mut payload = vec![0u8; len];
+        if !matches!(read_exact_or_eof(&mut reader, &mut payload)?, ReadOutcome::Full) {
+            return Ok(last);
+        }
+        let mut crc_input = Vec::with_capacity(LSN_BYTES + len);
+        crc_input.extend_from_slice(&lsn.to_le_bytes());
+        crc_input.extend_from_slice(&payload);
+        if crc32(&crc_input) != crc {
+            return Ok(last);
+        }
+        last = last.max(lsn);
+    }
 }
 
 enum ReadOutcome {
@@ -1270,7 +1408,10 @@ mod tests {
     impl Apply for CollectingApplier {
         fn apply(&mut self, lsn: Lsn, record: &Record) -> io::Result<Outcome> {
             if self.fail_at == Some(lsn.0) {
-                return Err(io::Error::other(format!("injected apply failure at {}", lsn.0)));
+                return Err(io::Error::other(format!(
+                    "injected apply failure at {}",
+                    lsn.0
+                )));
             }
             if self.conflict_at == Some(lsn.0) {
                 return Ok(Outcome::Conflicted);
@@ -1358,7 +1499,11 @@ mod tests {
         assert_eq!(next.lsn, Lsn(3));
         assert_eq!(next.outcome, Outcome::Applied);
         assert_eq!(
-            applier.snapshot().iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            applier
+                .snapshot()
+                .iter()
+                .map(|(l, _)| *l)
+                .collect::<Vec<_>>(),
             vec![1, 3],
             "the stale record was never folded in"
         );
@@ -1537,7 +1682,10 @@ mod tests {
         assert_eq!(decoded.0, dense);
 
         // Sparse and empty are the other two shapes the record carries.
-        for set in [RoaringBitmap::new(), (0..50_000u32).map(|i| i * 977).collect()] {
+        for set in [
+            RoaringBitmap::new(),
+            (0..50_000u32).map(|i| i * 977).collect(),
+        ] {
             let round: Bitmap =
                 bincode::deserialize(&bincode::serialize(&Bitmap(set.clone())).unwrap()).unwrap();
             assert_eq!(round.0, set);
@@ -1577,7 +1725,7 @@ mod tests {
         ];
         for (record, tag) in cases {
             let mut buf = Vec::new();
-            record.encode(&mut buf);
+            record.encode(&mut buf).unwrap();
             // bincode writes the variant index as a u32 LE prefix.
             assert_eq!(
                 u32::from_le_bytes(buf[0..4].try_into().unwrap()),
@@ -1606,15 +1754,16 @@ mod tests {
         // tell it to (CLAUDE.md §6). Pinned as a literal so appending a variant
         // without bumping fails here rather than in production.
         assert_eq!(
-            WAL_VERSION, 5,
-            "Schema gained a primary key; the written version must bump with it"
+            WAL_VERSION, 7,
+            "Upsert was appended; the written version must bump with it"
         );
-        // And this bump, unlike every earlier one, is NOT backward-readable:
+        // The 5 bump, unlike every earlier one, was NOT backward-readable:
         // `Schema` sits inside `Record::CreateCollection`, so adding a field to
-        // it re-shapes an existing variant's bytes.
+        // it re-shaped an existing variant's bytes. 6 is a plain append, so
+        // the floor stays at 5.
         assert_eq!(
-            WAL_MIN_VERSION, WAL_VERSION,
-            "a field added inside an existing variant breaks older logs"
+            WAL_MIN_VERSION, 5,
+            "a field added inside an existing variant broke logs older than 5"
         );
 
         // Every version this build claims to accept must actually replay.
@@ -1627,7 +1776,7 @@ mod tests {
             bytes.extend_from_slice(&version.to_le_bytes());
             for (i, rec) in records.iter().enumerate() {
                 let mut payload = Vec::new();
-                rec.encode(&mut payload);
+                rec.encode(&mut payload).unwrap();
                 write_frame(&mut bytes, Lsn(i as u64 + 1), &payload).unwrap();
             }
             std::fs::write(&path, &bytes).unwrap();
@@ -1670,7 +1819,7 @@ mod tests {
         // One good frame first, to prove recovery keeps everything before the
         // garbage rather than discarding the whole log.
         let mut payload = Vec::new();
-        insert(0, 0, &[1.0]).encode(&mut payload);
+        insert(0, 0, &[1.0]).encode(&mut payload).unwrap();
         write_frame(&mut bytes, Lsn(1), &payload).unwrap();
         // Then a header claiming a preposterous payload.
         bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // len
@@ -1681,7 +1830,11 @@ mod tests {
         let applier = CollectingApplier::new();
         let wal = Wal::start(&path, applier.clone(), 0).unwrap();
         let seen = applier.snapshot();
-        assert_eq!(seen.len(), 1, "the good frame survives the garbage that follows");
+        assert_eq!(
+            seen.len(),
+            1,
+            "the good frame survives the garbage that follows"
+        );
         assert_eq!(seen[0].0, 1);
         wal.shutdown();
     }
@@ -1722,7 +1875,7 @@ mod tests {
             },
         ] {
             let mut buf = Vec::new();
-            record.encode(&mut buf);
+            record.encode(&mut buf).unwrap();
             let decoded = Record::decode(&buf).expect("decode clean payload");
             assert_eq!(record, decoded);
         }
@@ -1772,7 +1925,7 @@ mod tests {
             },
         ] {
             let mut buf = Vec::new();
-            record.encode(&mut buf);
+            record.encode(&mut buf).unwrap();
             let decoded = Record::decode(&buf).expect("decode clean payload");
             assert_eq!(record, decoded);
         }
@@ -1891,7 +2044,10 @@ mod tests {
             Ok(_) => panic!("bad magic must refuse, not misdecode"),
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("FWAL"), "error names the header: {err}");
+        assert!(
+            err.to_string().contains("FWAL"),
+            "error names the header: {err}"
+        );
     }
 
     #[test]
@@ -1907,7 +2063,10 @@ mod tests {
             Ok(_) => panic!("future version must refuse cleanly"),
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("99"), "error names the version: {err}");
+        assert!(
+            err.to_string().contains("99"),
+            "error names the version: {err}"
+        );
     }
 
     #[test]
@@ -1946,5 +2105,3 @@ mod tests {
         wal.shutdown();
     }
 }
-
-

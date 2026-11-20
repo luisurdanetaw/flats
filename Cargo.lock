@@ -78,12 +78,28 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "crc32fast",
+ "flats",
  "memmap2",
  "roaring",
  "serde",
  "static_assertions",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "flats-c"
+version = "0.1.0"
+dependencies = [
+ "flats",
+ "tempfile",
+]
+
+[[package]]
+name = "flats-node"
+version = "0.1.0"
+dependencies = [
+ "flats-c",
 ]
 
 [[package]]

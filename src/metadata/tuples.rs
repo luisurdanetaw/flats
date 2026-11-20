@@ -174,30 +174,43 @@ impl TupleStore {
     /// corrupt snapshot falls back to empty at Lsn(0) (surfaced, not silent;
     /// WAL replay rebuilds), while a schema mismatch is a real error.
     pub fn open(dir: &Path, schema: Schema) -> Result<(Writer, Reader, Lsn)> {
+        let (writer, reader, loaded) = Self::open_reporting(dir, schema)?;
+        if let crate::metadata::Loaded::Corrupt(why) = &loaded {
+            crate::diagnostics::warn(&format!(
+                "{} corrupt ({why}); starting empty, WAL replay rebuilds",
+                dir.join(SNAP_FILE).display()
+            ));
+        }
+        Ok((writer, reader, loaded.lsn()))
+    }
+
+    /// `open`, but saying what it found instead of folding a missing or
+    /// corrupt file into "empty at Lsn(0)". The engine opens through this: a
+    /// store that came up empty is only safe when the WAL can refill it, and
+    /// only the engine can tell.
+    pub fn open_reporting(
+        dir: &Path,
+        schema: Schema,
+    ) -> Result<(Writer, Reader, crate::metadata::Loaded)> {
+        use crate::metadata::Loaded;
         let snap = dir.join(SNAP_FILE);
-        let decoded = match std::fs::read(&snap) {
+        let (decoded, loaded) = match std::fs::read(&snap) {
             Ok(bytes) => match decode_snapshot(&bytes) {
-                Ok(v) => Some(v),
-                Err(Error::CorruptSnapshot(why)) => {
-                    eprintln!(
-                        "flats: {} corrupt ({why}); starting empty, WAL replay rebuilds",
-                        snap.display()
-                    );
-                    None
-                }
+                Ok((inner, lsn)) => (Some(inner), Loaded::Snapshot(lsn)),
+                Err(Error::CorruptSnapshot(why)) => (None, Loaded::Corrupt(why)),
                 Err(e) => return Err(e),
             },
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (None, Loaded::Missing),
             Err(e) => return Err(e.into()),
         };
-        let (inner, last_lsn) = match decoded {
-            Some((inner, lsn)) => {
+        let inner = match decoded {
+            Some(inner) => {
                 if inner.schema != schema {
                     return Err(Error::SchemaMismatch);
                 }
-                (inner, lsn)
+                inner
             }
-            None => (TupleInner::empty(schema), Lsn(0)),
+            None => TupleInner::empty(schema),
         };
         let inner = Arc::new(Mutex::new(inner));
         Ok((
@@ -206,7 +219,7 @@ impl TupleStore {
                 dir: dir.to_path_buf(),
             },
             Reader { inner },
-            last_lsn,
+            loaded,
         ))
     }
 
@@ -271,29 +284,28 @@ impl Writer {
     pub fn checkpoint(&mut self, last_lsn: Lsn) -> Result<()> {
         let bytes = {
             let inner = self.lock();
-            Self::encode_snapshot(&inner, last_lsn)
+            Self::encode_snapshot(&inner, last_lsn)?
         };
         crate::metadata::write_snapshot_atomic(&self.dir, TMP_FILE, SNAP_FILE, &bytes)
     }
 
     /// See the layout doc at the top of the module. Explicit to_le_bytes on
     /// every integer — never host order.
-    fn encode_snapshot(inner: &TupleInner, last_lsn: Lsn) -> Vec<u8> {
+    fn encode_snapshot(inner: &TupleInner, last_lsn: Lsn) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
         buf.extend_from_slice(&VERSION.to_le_bytes());
         buf.extend_from_slice(&last_lsn.0.to_le_bytes());
 
-        // Plain data into memory — no fallible step (same reasoning as
-        // Record::encode in wal.rs).
-        let body = bincode::serialize(&(&inner.schema, &inner.slots))
-            .expect("snapshot body serialization into memory cannot fail");
+        // Plain data into memory — no fallible step today, but surfaced rather
+        // than unwrapped (same reasoning as Record::encode in wal.rs).
+        let body = bincode::serialize(&(&inner.schema, &inner.slots)).map_err(io::Error::other)?;
         buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
         buf.extend_from_slice(&body);
 
         let crc = crc32(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
-        buf
+        Ok(buf)
     }
 
     fn lock(&self) -> MutexGuard<'_, TupleInner> {
@@ -317,7 +329,10 @@ impl Reader {
         match inner.slots.get(ordinal.0 as usize) {
             None | Some(Slot::Vacant) => Ok(RowGet::Missing),
             Some(Slot::Live(values)) => Ok(RowGet::Live(
-                columns.iter().map(|&c| values[c as usize].clone()).collect(),
+                columns
+                    .iter()
+                    .map(|&c| values[c as usize].clone())
+                    .collect(),
             )),
         }
     }
@@ -349,7 +364,9 @@ fn decode_snapshot(bytes: &[u8]) -> Result<(TupleInner, Lsn)> {
     }
     let version = u32::from_le_bytes(head[4..8].try_into().map_err(|_| corrupt("truncated"))?);
     if version != VERSION {
-        return Err(Error::CorruptSnapshot(format!("unsupported version {version}")));
+        return Err(Error::CorruptSnapshot(format!(
+            "unsupported version {version}"
+        )));
     }
     let last_lsn = Lsn(u64::from_le_bytes(
         head[8..16].try_into().map_err(|_| corrupt("truncated"))?,
@@ -363,8 +380,8 @@ fn decode_snapshot(bytes: &[u8]) -> Result<(TupleInner, Lsn)> {
         return Err(corrupt("trailing bytes"));
     }
 
-    let (schema, slots): (Schema, Vec<Slot>) = bincode::deserialize(body)
-        .map_err(|e| Error::CorruptSnapshot(format!("body: {e}")))?;
+    let (schema, slots): (Schema, Vec<Slot>) =
+        bincode::deserialize(body).map_err(|e| Error::CorruptSnapshot(format!("body: {e}")))?;
 
     Ok((
         TupleInner {
@@ -379,6 +396,14 @@ fn decode_snapshot(bytes: &[u8]) -> Result<(TupleInner, Lsn)> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Fuzzing hook: decode `data` as a snapshot body that passed every framing
+/// check. Must return (`Ok` or `Err`) for any input, never panic.
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub fn fuzz_decode_snapshot(data: &[u8]) -> bool {
+    decode_snapshot(&crate::metadata::frame_for_fuzz(MAGIC, VERSION, data)).is_ok()
+}
 
 #[cfg(test)]
 mod tests {
@@ -460,7 +485,10 @@ mod tests {
             w.write_row(Ordinal(1000), &row(1000, 1000.0, "k")).unwrap();
 
             assert!(matches!(r.get(Ordinal(0), &[0]).unwrap(), RowGet::Live(_)));
-            assert!(matches!(r.get(Ordinal(1000), &[0]).unwrap(), RowGet::Live(_)));
+            assert!(matches!(
+                r.get(Ordinal(1000), &[0]).unwrap(),
+                RowGet::Live(_)
+            ));
             assert_eq!(r.get(Ordinal(500), &[0]).unwrap(), RowGet::Missing);
             assert_eq!(r.get(Ordinal(2000), &[0]).unwrap(), RowGet::Missing);
 
@@ -469,7 +497,10 @@ mod tests {
         // Vacant holes survive persistence.
         let (_w, r, lsn) = TupleStore::open(dir.path(), test_schema()).unwrap();
         assert_eq!(lsn, Lsn(3));
-        assert!(matches!(r.get(Ordinal(1000), &[2]).unwrap(), RowGet::Live(_)));
+        assert!(matches!(
+            r.get(Ordinal(1000), &[2]).unwrap(),
+            RowGet::Live(_)
+        ));
         assert_eq!(r.get(Ordinal(500), &[0]).unwrap(), RowGet::Missing);
         assert_eq!(r.get(Ordinal(2000), &[0]).unwrap(), RowGet::Missing);
     }

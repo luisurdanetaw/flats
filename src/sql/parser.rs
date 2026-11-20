@@ -29,16 +29,59 @@
 use std::fmt;
 
 use crate::sql::ast::{
-    Assignment, CollectionOption, ColumnDef, ColumnType, CompareOp, CreateStmt, DeleteStmt, Expr,
-    InsertStmt, Literal, Projection, SearchStmt, SelectStmt, Statement, UpdateStmt,
+    Assignment, CollectionOption, ColumnDef, ColumnType, CompareOp, CreateStmt, DeleteStmt,
+    DropStmt, Expr, InsertManyStmt, InsertStmt, Literal, Projection, SearchStmt, SelectStmt, Statement, UpdateStmt,
 };
 use crate::sql::lexer::{LexError, Lexer, Span, SpannedToken, Token};
+use crate::sql::params::Param;
 
 /// A recursive-descent parser over a lexed token stream. Construct via the
 /// free [`parse`] function rather than directly — it wires the lexer in.
 pub struct Parser {
     tokens: Vec<SpannedToken>,
     pos: usize,
+    /// Parentheses currently open in the expression being parsed.
+    depth: usize,
+    /// Comparisons parsed so far in this statement.
+    terms: usize,
+}
+
+/// The deepest a `WHERE` expression may nest parentheses.
+///
+/// Every stage after the parser walks an expression recursively, so depth is
+/// stack: unbounded, one query could overflow it and abort the host process.
+/// 64 is far beyond any hand-written predicate and safe on a 256 KiB stack.
+pub const MAX_EXPR_DEPTH: usize = 64;
+
+/// The most comparisons one statement may hold. Long `AND`/`OR` chains — the
+/// way V-SQL spells `IN` — are rebalanced into shallow trees (see
+/// the parser's `chain`), so this bounds work and memory, not stack.
+pub const MAX_EXPR_TERMS: usize = 4096;
+
+/// Chains of the same operator up to this long keep their left-nested shape;
+/// longer ones are rebalanced.
+const BALANCE_ABOVE: usize = 32;
+
+/// Join `parts` with `join`. Up to [`BALANCE_ABOVE`] operands fold left —
+/// the shape `a OR b OR c` always had. Beyond that the tree is built
+/// balanced, depth `log2(n)` instead of `n`: AND and OR are associative, so the
+/// meaning is identical, and the recursive stages downstream stay shallow.
+fn chain(mut parts: Vec<Expr>, join: fn(Box<Expr>, Box<Expr>) -> Expr) -> Expr {
+    if parts.len() <= BALANCE_ABOVE {
+        let mut it = parts.into_iter();
+        let first = it.next().unwrap_or(Expr::Column(String::new()));
+        return it.fold(first, |l, r| join(Box::new(l), Box::new(r)));
+    }
+    fn balanced(parts: &mut [Option<Expr>], join: fn(Box<Expr>, Box<Expr>) -> Expr) -> Expr {
+        if parts.len() == 1 {
+            return parts[0].take().unwrap_or(Expr::Column(String::new()));
+        }
+        let mid = parts.len() / 2;
+        let (l, r) = parts.split_at_mut(mid);
+        join(Box::new(balanced(l, join)), Box::new(balanced(r, join)))
+    }
+    let mut slots: Vec<Option<Expr>> = parts.drain(..).map(Some).collect();
+    balanced(&mut slots, join)
 }
 
 /// A syntax error, with the source span it was detected at. Mirrors the
@@ -73,6 +116,46 @@ pub enum ParseErrorKind {
         /// What was written, and what to reach for instead.
         what: String,
     },
+    /// A vector element that is a finite number but has no finite `f32` to
+    /// become (`3.5e38`). Vectors are stored as `f32`; narrowing would store
+    /// an infinity, which poisons every dot product it touches.
+    VectorElementOutOfRange {
+        /// The element as written, sign applied.
+        value: f64,
+    },
+    /// The statement's `?` placeholders and its parameters differ in number.
+    ParamCount {
+        /// How many `?` the statement has.
+        placeholders: usize,
+        /// How many parameters were supplied.
+        given: usize,
+    },
+    /// A parameter that no literal could spell: a non-finite float, or an
+    /// empty or non-finite vector.
+    InvalidParam {
+        /// Its position in the parameter list, from 0.
+        index: usize,
+        /// What is wrong with it.
+        reason: String,
+    },
+    /// A `LIMIT` or `OFFSET` below zero (only a parameter can be).
+    NegativeWindow {
+        /// `"LIMIT"` or `"OFFSET"`.
+        what: &'static str,
+    },
+    /// A predicate past [`MAX_EXPR_DEPTH`] or [`MAX_EXPR_TERMS`].
+    TooComplex {
+        /// Which cap, in words.
+        what: String,
+    },
+    /// The statement text is longer than the database's
+    /// `Limits::max_statement_bytes`.
+    TooLarge {
+        /// Its length.
+        bytes: usize,
+        /// The limit.
+        limit: usize,
+    },
     /// Input remained after a complete statement + its `;`.
     TrailingTokens,
     /// Input ended while a rule still expected more tokens.
@@ -97,6 +180,36 @@ impl fmt::Display for ParseError {
             ParseErrorKind::Unsupported { what } => {
                 write!(f, "{what} is not supported at byte {}", self.span.start)
             }
+            ParseErrorKind::VectorElementOutOfRange { value } => write!(
+                f,
+                "vector element {value:e} at byte {} is outside the f32 range",
+                self.span.start
+            ),
+            ParseErrorKind::ParamCount {
+                placeholders,
+                given,
+            } => write!(
+                f,
+                "the statement has {placeholders} placeholder{} but {given} parameter{} {} given",
+                if *placeholders == 1 { "" } else { "s" },
+                if *given == 1 { "" } else { "s" },
+                if *given == 1 { "was" } else { "were" },
+            ),
+            ParseErrorKind::InvalidParam { index, reason } => {
+                write!(f, "parameter {} (for `?` #{}) {reason}", index, index + 1)
+            }
+            ParseErrorKind::NegativeWindow { what } => {
+                write!(f, "{what} at byte {} must not be negative", self.span.start)
+            }
+            ParseErrorKind::TooComplex { what } => write!(
+                f,
+                "the statement is too complex at byte {}: {what}",
+                self.span.start
+            ),
+            ParseErrorKind::TooLarge { bytes, limit } => write!(
+                f,
+                "the statement is {bytes} bytes, over the {limit}-byte limit"
+            ),
             ParseErrorKind::TrailingTokens => {
                 write!(f, "unexpected trailing tokens at byte {}", self.span.start)
             }
@@ -112,6 +225,38 @@ impl std::error::Error for ParseError {}
 /// so callers never touch the lexer directly. Exactly one statement is
 /// expected; anything after its `;` is a [`ParseErrorKind::TrailingTokens`].
 pub fn parse(src: &str) -> Result<Statement, ParseError> {
+    parse_with_params(src, &[])
+}
+
+/// [`parse`], with each `?` placeholder filled from `params`, in order.
+///
+/// Substitution happens on TOKENS, between lexing and parsing: a placeholder
+/// becomes the literal tokens of its value — one string, one number, or a
+/// bracketed vector — carrying the placeholder's span. A value is therefore
+/// never source text. A string parameter arrives as an already-decoded string
+/// token, so its quotes, semicolons and keywords are characters, never syntax;
+/// and because only value tokens are produced, a parameter can stand only
+/// where a literal can — never for a name, an operator or a clause.
+///
+/// The number of placeholders must equal `params.len()`
+/// ([`ParseErrorKind::ParamCount`]); a float must be finite and a vector
+/// non-empty and finite ([`ParseErrorKind::InvalidParam`]).
+pub fn parse_with_params(src: &str, params: &[Param]) -> Result<Statement, ParseError> {
+    parse_with_limit(src, params, usize::MAX)
+}
+
+/// [`parse_with_params`], refusing text longer than `max_bytes` before
+/// lexing it ([`ParseErrorKind::TooLarge`]).
+pub fn parse_with_limit(src: &str, params: &[Param], max_bytes: usize) -> Result<Statement, ParseError> {
+    if src.len() > max_bytes {
+        return Err(ParseError {
+            kind: ParseErrorKind::TooLarge {
+                bytes: src.len(),
+                limit: max_bytes,
+            },
+            span: Span { start: 0, end: 0 },
+        });
+    }
     let tokens = Lexer::new(src).tokenize().map_err(|e| ParseError {
         span: Span {
             start: e.pos,
@@ -119,7 +264,13 @@ pub fn parse(src: &str) -> Result<Statement, ParseError> {
         },
         kind: ParseErrorKind::Lex(e),
     })?;
-    let mut parser = Parser { tokens, pos: 0 };
+    let tokens = substitute(tokens, params)?;
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        depth: 0,
+        terms: 0,
+    };
     let statement = parser.parse_statement()?;
     // `parse_statement` consumes the trailing ';' (per the grammar); only Eof
     // may remain. Any real token here is leftover input.
@@ -132,6 +283,82 @@ pub fn parse(src: &str) -> Result<Statement, ParseError> {
         });
     }
     Ok(statement)
+}
+
+/// Replace every `Token::Param` with the literal tokens of its parameter.
+fn substitute(tokens: Vec<SpannedToken>, params: &[Param]) -> Result<Vec<SpannedToken>, ParseError> {
+    let placeholders: Vec<Span> = tokens
+        .iter()
+        .filter(|t| t.token == Token::Param)
+        .map(|t| t.span)
+        .collect();
+    if placeholders.len() != params.len() {
+        // Point at the first `?` left unfilled, or — with too many
+        // parameters — at the end of the statement.
+        let span = placeholders
+            .get(params.len())
+            .copied()
+            .or_else(|| tokens.last().map(|t| t.span))
+            .unwrap_or(Span { start: 0, end: 0 });
+        return Err(ParseError {
+            kind: ParseErrorKind::ParamCount {
+                placeholders: placeholders.len(),
+                given: params.len(),
+            },
+            span,
+        });
+    }
+    if params.is_empty() {
+        return Ok(tokens);
+    }
+    let mut out = Vec::with_capacity(tokens.len() + params.len());
+    let mut next = 0;
+    for st in tokens {
+        if st.token != Token::Param {
+            out.push(st);
+            continue;
+        }
+        let index = next;
+        next += 1;
+        let span = st.span;
+        let invalid = |reason: &str| ParseError {
+            kind: ParseErrorKind::InvalidParam {
+                index,
+                reason: reason.to_string(),
+            },
+            span,
+        };
+        let at = |token| SpannedToken { token, span };
+        match &params[index] {
+            Param::Int(n) => out.push(at(Token::IntLit(*n))),
+            Param::Float(x) => {
+                if !x.is_finite() {
+                    return Err(invalid("is not a finite number"));
+                }
+                out.push(at(Token::FloatLit(*x)));
+            }
+            Param::Text(s) => out.push(at(Token::StrLit(s.clone()))),
+            Param::Vector(v) => {
+                if v.is_empty() {
+                    return Err(invalid("is an empty vector"));
+                }
+                if v.iter().any(|x| !x.is_finite()) {
+                    return Err(invalid("has a component that is not a finite number"));
+                }
+                out.push(at(Token::LBracket));
+                for (i, x) in v.iter().enumerate() {
+                    if i > 0 {
+                        out.push(at(Token::Comma));
+                    }
+                    // f32 -> f64 is exact, and the parser narrows back
+                    // exactly, so the stored bits are the given bits.
+                    out.push(at(Token::FloatLit(f64::from(*x))));
+                }
+                out.push(at(Token::RBracket));
+            }
+        }
+    }
+    Ok(out)
 }
 
 impl Parser {
@@ -235,17 +462,22 @@ impl Parser {
     /// `statement := (select | insert | create | search | delete | update) ';'`
     pub fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         let stmt = match self.peek() {
-            Token::Select => Statement::Select(self.parse_select()?),
-            Token::Insert => Statement::Insert(self.parse_insert()?),
+            Token::Select => {
+                let select = Statement::Select(self.parse_select()?);
+                self.parse_window(select)?
+            }
+            Token::Insert => self.parse_insert_statement()?,
+            Token::Upsert => self.parse_upsert()?,
             Token::Create => Statement::CreateCollection(self.parse_create()?),
             Token::Search => Statement::Search(self.parse_search()?),
             Token::Delete => Statement::Delete(self.parse_delete()?),
             Token::Update => Statement::Update(self.parse_update()?),
+            Token::Drop => Statement::DropCollection(self.parse_drop()?),
             Token::Eof => return Err(self.error(ParseErrorKind::UnexpectedEof)),
             _ => {
                 let found = format!("{:?}", self.peek());
                 return Err(self.error(ParseErrorKind::UnexpectedToken {
-                    expected: "SELECT, INSERT, CREATE, SEARCH, DELETE, or UPDATE".to_string(),
+                    expected: "SELECT, INSERT, UPSERT, CREATE, SEARCH, DELETE, UPDATE, or DROP".to_string(),
                     found,
                 }));
             }
@@ -326,6 +558,42 @@ impl Parser {
     /// `where := WHERE expr` — the whole clause, absent when the keyword is not
     /// there. Shared by every statement that takes a predicate, so `SELECT` and
     /// `SEARCH` cannot end up accepting different expression grammars.
+    /// `window := [LIMIT int] [OFFSET int]` — wraps `statement` when either is
+    /// present. LIMIT comes first, as in SQL.
+    fn parse_window(&mut self, statement: Statement) -> Result<Statement, ParseError> {
+        let limit = if *self.peek() == Token::Limit {
+            self.advance();
+            Some(self.expect_count("LIMIT")?)
+        } else {
+            None
+        };
+        let offset = if *self.peek() == Token::Offset {
+            self.advance();
+            Some(self.expect_count("OFFSET")?)
+        } else {
+            None
+        };
+        Ok(match (limit, offset) {
+            (None, None) => statement,
+            (limit, offset) => Statement::Limited {
+                statement: Box::new(statement),
+                limit,
+                offset: offset.unwrap_or(0),
+            },
+        })
+    }
+
+    /// A non-negative integer for `LIMIT`/`OFFSET`. A literal can't be
+    /// negative here (the grammar has no sign), but a parameter can.
+    fn expect_count(&mut self, what: &'static str) -> Result<u64, ParseError> {
+        let at = self.pos;
+        let n = self.expect_int()?;
+        u64::try_from(n).map_err(|_| ParseError {
+            kind: ParseErrorKind::NegativeWindow { what },
+            span: self.tokens[at].span,
+        })
+    }
+
     fn parse_where(&mut self) -> Result<Option<Expr>, ParseError> {
         if *self.peek() != Token::Where {
             return Ok(None);
@@ -346,24 +614,22 @@ impl Parser {
     /// `a = 1 OR b = 2 AND c = 3` group as `a = 1 OR (b = 2 AND c = 3)`.
     /// Left-associative, like SQL.
     fn parse_or(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_and()?;
+        let mut parts = vec![self.parse_and()?];
         while *self.peek() == Token::Or {
             self.advance();
-            let right = self.parse_and()?;
-            left = Expr::Or(Box::new(left), Box::new(right));
+            parts.push(self.parse_and()?);
         }
-        Ok(left)
+        Ok(chain(parts, Expr::Or))
     }
 
     /// `and_expr := cmp_expr (AND cmp_expr)*`
     fn parse_and(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_comparison()?;
+        let mut parts = vec![self.parse_comparison()?];
         while *self.peek() == Token::And {
             self.advance();
-            let right = self.parse_comparison()?;
-            left = Expr::And(Box::new(left), Box::new(right));
+            parts.push(self.parse_comparison()?);
         }
-        Ok(left)
+        Ok(chain(parts, Expr::And))
     }
 
     /// `cmp_expr := primary [op primary]`
@@ -373,6 +639,12 @@ impl Parser {
     /// `(a < b) < c`. One optional operator, then stop — a second one is left
     /// for the caller to choke on, which reports the error at the right token.
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
+        self.terms += 1;
+        if self.terms > MAX_EXPR_TERMS {
+            return Err(self.error(ParseErrorKind::TooComplex {
+                what: format!("more than {MAX_EXPR_TERMS} comparisons"),
+            }));
+        }
         let left = self.parse_primary()?;
         let op = match self.peek() {
             Token::Lt => CompareOp::Lt,
@@ -406,8 +678,15 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         match self.peek() {
             Token::LParen => {
+                if self.depth >= MAX_EXPR_DEPTH {
+                    return Err(self.error(ParseErrorKind::TooComplex {
+                        what: format!("parentheses nested more than {MAX_EXPR_DEPTH} deep"),
+                    }));
+                }
                 self.advance();
+                self.depth += 1;
                 let inner = self.parse_expr()?;
+                self.depth -= 1;
                 self.expect(Token::RParen)?;
                 Ok(inner)
             }
@@ -421,7 +700,10 @@ impl Parser {
             // vectors — which no predicate can usefully compare, but rejecting
             // that HERE would mean the parser knowing what a comparison means.
             // The binder says so, in terms of the column's type.
-            Token::StrLit(_) | Token::Minus | Token::IntLit(_) | Token::FloatLit(_)
+            Token::StrLit(_)
+            | Token::Minus
+            | Token::IntLit(_)
+            | Token::FloatLit(_)
             | Token::LBracket => Ok(Expr::Literal(self.parse_literal()?)),
             Token::Eof => Err(self.error(ParseErrorKind::UnexpectedEof)),
             other => {
@@ -497,6 +779,14 @@ impl Parser {
     }
 
     /// `create := CREATE COLLECTION ident '(' col_def (',' col_def)* ')' WITH '(' opt (',' opt)* ')'`
+    /// `drop := DROP COLLECTION ident`
+    fn parse_drop(&mut self) -> Result<DropStmt, ParseError> {
+        self.expect(Token::Drop)?;
+        self.expect(Token::Collection)?;
+        let name = self.expect_ident()?;
+        Ok(DropStmt { name })
+    }
+
     fn parse_create(&mut self) -> Result<CreateStmt, ParseError> {
         self.expect(Token::Create)?;
         self.expect(Token::Collection)?;
@@ -588,7 +878,71 @@ impl Parser {
         Ok(CollectionOption { name, value })
     }
 
-    /// `insert := INSERT INTO ident '(' ident (',' ident)* ')' VALUES '(' literal (',' literal)* ')'`
+    /// `insert := INSERT INTO ident '(' ident (',' ident)* ')' VALUES row (',' row)*`
+    /// with `row := '(' literal (',' literal)* ')'`.
+    ///
+    /// One row is a [`Statement::Insert`], exactly as it always was; two or
+    /// more are a [`Statement::InsertMany`].
+    fn parse_insert_statement(&mut self) -> Result<Statement, ParseError> {
+        let first = self.parse_insert()?;
+        if *self.peek() != Token::Comma {
+            return Ok(Statement::Insert(first));
+        }
+        let mut rows = vec![first.values];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            rows.push(self.parse_value_row()?);
+        }
+        Ok(Statement::InsertMany(InsertManyStmt {
+            collection: first.collection,
+            columns: first.columns,
+            rows,
+        }))
+    }
+
+    /// `row := '(' literal (',' literal)* ')'` — one parenthesized value list.
+    fn parse_value_row(&mut self) -> Result<Vec<Literal>, ParseError> {
+        self.expect(Token::LParen)?;
+        let mut values = vec![self.parse_literal()?];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            values.push(self.parse_literal()?);
+        }
+        self.expect(Token::RParen)?;
+        Ok(values)
+    }
+
+    /// `upsert := UPSERT INTO ident '(' ident (',' ident)* ')' VALUES row (',' row)*`
+    ///
+    /// The INSERT grammar under another verb, and always a
+    /// [`Statement::Upsert`], one row or many.
+    fn parse_upsert(&mut self) -> Result<Statement, ParseError> {
+        self.expect(Token::Upsert)?;
+        self.expect(Token::Into)?;
+        let collection = self.expect_ident()?;
+        self.expect(Token::LParen)?;
+        let mut columns = vec![self.expect_ident()?];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            columns.push(self.expect_ident()?);
+        }
+        self.expect(Token::RParen)?;
+        self.expect(Token::Values)?;
+        let mut rows = vec![self.parse_value_row()?];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            rows.push(self.parse_value_row()?);
+        }
+        Ok(Statement::Upsert(InsertManyStmt {
+            collection,
+            columns,
+            rows,
+        }))
+    }
+
+    /// `INSERT INTO ident '(' ident (',' ident)* ')' VALUES row` — the head and
+    /// FIRST row; [`parse_insert_statement`](Self::parse_insert_statement)
+    /// takes any rows after it.
     fn parse_insert(&mut self) -> Result<InsertStmt, ParseError> {
         self.expect(Token::Insert)?;
         self.expect(Token::Into)?;
@@ -603,13 +957,7 @@ impl Parser {
         self.expect(Token::RParen)?;
 
         self.expect(Token::Values)?;
-        self.expect(Token::LParen)?;
-        let mut values = vec![self.parse_literal()?];
-        while *self.peek() == Token::Comma {
-            self.advance();
-            values.push(self.parse_literal()?);
-        }
-        self.expect(Token::RParen)?;
+        let values = self.parse_value_row()?;
 
         // NOTE: no check that columns.len() == values.len() — a count mismatch
         // is a semantic error the planner catches, not a syntax error.
@@ -651,9 +999,28 @@ impl Parser {
 
     /// A single vector element: a `number` coerced to `f32`.
     fn parse_vector_elem(&mut self) -> Result<f32, ParseError> {
+        // Remember where the element starts: once it is consumed the cursor
+        // sits on the `,`/`]` after it, which is the wrong place to point.
+        let at = self.pos;
         match self.parse_number()? {
+            // Every i64 narrows to a finite f32 (|i64| < 2^63 < f32::MAX).
             Literal::Int(n) => Ok(n as f32),
-            Literal::Float(f) => Ok(f as f32),
+            Literal::Float(f) => {
+                let narrowed = f as f32;
+                if narrowed.is_finite() {
+                    return Ok(narrowed);
+                }
+                // Point at the digits, not a leading `-`.
+                let number = if self.tokens[at].token == Token::Minus {
+                    at + 1
+                } else {
+                    at
+                };
+                Err(ParseError {
+                    kind: ParseErrorKind::VectorElementOutOfRange { value: f },
+                    span: self.tokens[number].span,
+                })
+            }
             // parse_number only ever yields Int or Float; stay exhaustive
             // without panicking.
             Literal::Vector(_) | Literal::Str(_) => {
@@ -1207,7 +1574,8 @@ mod tests {
     #[test]
     fn search_takes_where_before_returning() {
         // Clause ORDER is fixed by the spec (CLAUDE.md §4).
-        let stmt = ok("SEARCH TOP 5 NEAREST TO [0.1, 0.2] FROM docs WHERE z < 2 RETURNING id, score;");
+        let stmt =
+            ok("SEARCH TOP 5 NEAREST TO [0.1, 0.2] FROM docs WHERE z < 2 RETURNING id, score;");
         let Statement::Search(search) = stmt else {
             panic!("expected a SEARCH");
         };
@@ -1572,5 +1940,446 @@ mod tests {
                 ],
             })
         );
+    }
+
+    // -- vector element range ----------------------------------------------
+    //
+    // Vector elements are stored as f32 but lexed as f64, so a literal can be
+    // a perfectly finite f64 and still have no f32 to become: `3.5e38` narrows
+    // to +inf. An infinite component poisons every dot product it touches, and
+    // with exponents in the grammar it is one keystroke away — refuse it here,
+    // where the element's position is still known.
+
+    #[test]
+    fn a_vector_element_beyond_f32_range_is_refused() {
+        for src in [
+            "SEARCH TOP 1 NEAREST TO [0.5, 3.5e38] FROM docs;",
+            "SEARCH TOP 1 NEAREST TO [0.5, -3.5e38] FROM docs;",
+            "INSERT INTO docs (id, vector) VALUES (1, [1e39]);",
+        ] {
+            let e = err(src);
+            assert!(
+                matches!(e.kind, ParseErrorKind::VectorElementOutOfRange { .. }),
+                "{src}: got {e:?}"
+            );
+            assert!(
+                e.to_string().contains("f32"),
+                "{src}: message names f32: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_largest_f32_is_still_a_vector_element() {
+        match ok("SEARCH TOP 1 NEAREST TO [3.4028235e38, -3.4028235e38, 1e-45] FROM docs;") {
+            Statement::Search(s) => {
+                assert_eq!(s.query, Literal::Vector(vec![f32::MAX, f32::MIN, 1e-45]))
+            }
+            other => panic!("expected a search, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_element_is_located_at_the_element() {
+        let src = "SEARCH TOP 1 NEAREST TO [0.5, 3.5e38] FROM docs;";
+        let e = err(src);
+        assert_eq!(&src[e.span.start..e.span.end], "3.5e38");
+    }
+
+    // -- multi-row INSERT ---------------------------------------------------
+    //
+    // `insert := INSERT INTO ident '(' cols ')' VALUES row (',' row)*`. A
+    // single row stays `Statement::Insert`, exactly as before; two or more
+    // become `Statement::InsertMany`, one statement and one record downstream.
+
+    #[test]
+    fn two_value_rows_parse_as_one_insert_many() {
+        assert_eq!(
+            ok("INSERT INTO docs (id, vector) VALUES (1, [0.5]), (2, [-1e-5]);"),
+            Statement::InsertMany(InsertManyStmt {
+                collection: "docs".to_string(),
+                columns: cols(&["id", "vector"]),
+                rows: vec![
+                    vec![Literal::Int(1), Literal::Vector(vec![0.5])],
+                    vec![Literal::Int(2), Literal::Vector(vec![-1e-5])],
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn one_value_row_is_still_a_plain_insert() {
+        assert!(matches!(
+            ok("INSERT INTO docs (id) VALUES (1);"),
+            Statement::Insert(_)
+        ));
+    }
+
+    #[test]
+    fn rows_of_different_lengths_still_parse() {
+        // Arity is the binder's, per row — the parser does not do semantics.
+        match ok("INSERT INTO docs (a, b) VALUES (1, 2), (3), (4, 5, 6);") {
+            Statement::InsertMany(m) => {
+                assert_eq!(
+                    m.rows.iter().map(Vec::len).collect::<Vec<_>>(),
+                    vec![2, 1, 3]
+                );
+            }
+            other => panic!("expected InsertMany, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_value_row_lists_are_errors() {
+        for src in [
+            "INSERT INTO docs (a) VALUES (1),;",
+            "INSERT INTO docs (a) VALUES (1) (2);",
+            "INSERT INTO docs (a) VALUES (1), 2;",
+            "INSERT INTO docs (a) VALUES (1), ();",
+        ] {
+            err(src);
+        }
+    }
+
+    // -- DROP COLLECTION ----------------------------------------------------
+
+    #[test]
+    fn parses_drop_collection() {
+        assert_eq!(
+            ok("DROP COLLECTION docs;"),
+            Statement::DropCollection(DropStmt {
+                name: "docs".to_string(),
+            })
+        );
+        // Keywords are case-insensitive like every other.
+        assert!(matches!(ok("drop collection docs;"), Statement::DropCollection(_)));
+    }
+
+    #[test]
+    fn malformed_drops_are_errors() {
+        for src in [
+            "DROP docs;",
+            "DROP COLLECTION;",
+            "DROP COLLECTION docs",
+            "DROP COLLECTION docs, more;",
+            "DROP COLLECTION 'docs';",
+        ] {
+            err(src);
+        }
+    }
+
+    // -- parameters -----------------------------------------------------------
+    //
+    // `?` placeholders are filled from a parameter list AFTER lexing: each one
+    // becomes the literal tokens of its value. A value is never source text, so
+    // nothing in it can be read as syntax — that is the injection guarantee.
+
+    use crate::sql::params::Param;
+
+    fn with(src: &str, params: &[Param]) -> Statement {
+        parse_with_params(src, params).expect("expected a successful parse")
+    }
+
+    fn with_err(src: &str, params: &[Param]) -> ParseError {
+        match parse_with_params(src, params) {
+            Ok(s) => panic!("expected an error, got {s:?}"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn a_placeholder_takes_the_value_of_its_parameter() {
+        let got = with(
+            "SELECT id FROM docs WHERE a = ? AND b < ?;",
+            &[Param::Text("x".into()), Param::Int(-3)],
+        );
+        assert_eq!(got, ok("SELECT id FROM docs WHERE a = 'x' AND b < -3;"));
+    }
+
+    #[test]
+    fn every_kind_of_parameter_lands_where_a_literal_would() {
+        let v = vec![0.5f32, -1e-7, 3.0];
+        assert_eq!(
+            with(
+                "INSERT INTO docs (id, vector, w, t) VALUES (?, ?, ?, ?);",
+                &[Param::Int(7), Param::Vector(v.clone()), Param::Float(-2.5), Param::Text("hi".into())],
+            ),
+            ok("INSERT INTO docs (id, vector, w, t) VALUES (7, [0.5, -1e-7, 3.0], -2.5, 'hi');")
+        );
+        // The query vector of a SEARCH, and its TOP count.
+        assert_eq!(
+            with("SEARCH TOP ? NEAREST TO ? FROM docs;", &[Param::Int(5), Param::Vector(v.clone())]),
+            ok("SEARCH TOP 5 NEAREST TO [0.5, -1e-7, 3.0] FROM docs;")
+        );
+        // SET values and a multi-row INSERT.
+        assert_eq!(
+            with("UPDATE docs SET t = ?, vector = ? WHERE id = ?;", &[
+                Param::Text("v2".into()),
+                Param::Vector(v.clone()),
+                Param::Int(1),
+            ]),
+            ok("UPDATE docs SET t = 'v2', vector = [0.5, -1e-7, 3.0] WHERE id = 1;")
+        );
+        assert_eq!(
+            with("INSERT INTO docs (id) VALUES (?), (?);", &[Param::Int(1), Param::Int(2)]),
+            ok("INSERT INTO docs (id) VALUES (1), (2);")
+        );
+    }
+
+    #[test]
+    fn a_vector_parameter_is_exact() {
+        // Not formatted and re-parsed: the f32 that goes in is the f32 that is
+        // stored, bit for bit, whatever its magnitude.
+        let v = vec![f32::MIN_POSITIVE, 1.0e-45, f32::MAX, -0.0, 0.1];
+        match with("SEARCH TOP 1 NEAREST TO ? FROM docs;", &[Param::Vector(v.clone())]) {
+            Statement::Search(s) => match s.query {
+                Literal::Vector(got) => {
+                    let bits = |x: &[f32]| x.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(bits(&got), bits(&v));
+                }
+                other => panic!("expected a vector, got {other:?}"),
+            },
+            other => panic!("expected a search, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_extreme_integers_survive() {
+        assert_eq!(
+            with("SELECT id FROM docs WHERE n = ? OR n = ?;", &[Param::Int(i64::MIN), Param::Int(i64::MAX)]),
+            {
+                let mut s = ok("SELECT id FROM docs WHERE n = 0 OR n = 0;");
+                if let Statement::Select(sel) = &mut s
+                    && let Some(Expr::Or(l, r)) = &mut sel.filter
+                    && let (Expr::Compare { right: lr, .. }, Expr::Compare { right: rr, .. }) =
+                        (l.as_mut(), r.as_mut())
+                {
+                    **lr = Expr::Literal(Literal::Int(i64::MIN));
+                    **rr = Expr::Literal(Literal::Int(i64::MAX));
+                }
+                s
+            }
+        );
+    }
+
+    #[test]
+    fn text_parameters_cannot_become_syntax() {
+        for payload in [
+            "x'; DROP COLLECTION docs; --",
+            "' OR 1=1 OR a = '",
+            "?",
+            "it's",
+            "\\'; --",
+            "\n;\n",
+        ] {
+            match with("SELECT id FROM docs WHERE a = ?;", &[Param::Text(payload.into())]) {
+                Statement::Select(s) => match s.filter {
+                    Some(Expr::Compare { right, .. }) => {
+                        assert_eq!(*right, Expr::Literal(Literal::Str(payload.into())), "{payload:?}")
+                    }
+                    other => panic!("{payload:?}: filter became {other:?}"),
+                },
+                other => panic!("{payload:?}: statement became {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_parameter_cannot_stand_for_a_name() {
+        // Identifiers stay in the statement text; a parameter is only ever a
+        // value, so `FROM ?` is a parse error whatever it holds.
+        with_err("SELECT id FROM ?;", &[Param::Text("docs".into())]);
+        with_err("SELECT ? FROM docs;", &[Param::Text("id".into())]);
+    }
+
+    #[test]
+    fn the_count_must_match() {
+        let too_few = with_err("SELECT id FROM docs WHERE a = ? AND b = ?;", &[Param::Int(1)]);
+        assert_eq!(too_few.kind, ParseErrorKind::ParamCount { placeholders: 2, given: 1 });
+        let too_many = with_err("SELECT id FROM docs WHERE a = ?;", &[Param::Int(1), Param::Int(2)]);
+        assert_eq!(too_many.kind, ParseErrorKind::ParamCount { placeholders: 1, given: 2 });
+        // Plain `parse` is `parse_with_params` with none.
+        let bare = err("SELECT id FROM docs WHERE a = ?;");
+        assert_eq!(bare.kind, ParseErrorKind::ParamCount { placeholders: 1, given: 0 });
+        assert!(bare.to_string().contains("1 placeholder"), "{bare}");
+    }
+
+    #[test]
+    fn non_finite_parameters_are_refused() {
+        for p in [
+            Param::Float(f64::NAN),
+            Param::Float(f64::INFINITY),
+            Param::Vector(vec![1.0, f32::NAN]),
+            Param::Vector(vec![f32::NEG_INFINITY]),
+            Param::Vector(vec![]),
+        ] {
+            let e = with_err("SELECT id FROM docs WHERE a = ?;", std::slice::from_ref(&p));
+            assert!(
+                matches!(e.kind, ParseErrorKind::InvalidParam { index: 0, .. }),
+                "{p:?}: {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_misplaced_parameter_is_located_at_its_placeholder() {
+        let src = "SELECT id FROM docs WHERE a = 1 ?;";
+        let e = with_err(src, &[Param::Int(1)]);
+        assert_eq!(&src[e.span.start..e.span.end], "?");
+    }
+
+    // -- LIMIT / OFFSET ---------------------------------------------------------
+    //
+    // A SELECT may end `LIMIT n [OFFSET m]` or `OFFSET m`. The statement is
+    // wrapped, not changed: `Statement::Limited` holds the plain SELECT it
+    // would have been, so everything downstream sees the shape it always did.
+
+    #[test]
+    fn limit_and_offset_wrap_the_select() {
+        let plain = ok("SELECT id FROM docs WHERE n > 1;");
+        assert_eq!(
+            ok("SELECT id FROM docs WHERE n > 1 LIMIT 10 OFFSET 20;"),
+            Statement::Limited {
+                statement: Box::new(plain.clone()),
+                limit: Some(10),
+                offset: 20,
+            }
+        );
+        assert_eq!(
+            ok("SELECT id FROM docs WHERE n > 1 LIMIT 10;"),
+            Statement::Limited {
+                statement: Box::new(plain.clone()),
+                limit: Some(10),
+                offset: 0,
+            }
+        );
+        assert_eq!(
+            ok("SELECT id FROM docs WHERE n > 1 OFFSET 5;"),
+            Statement::Limited {
+                statement: Box::new(plain),
+                limit: None,
+                offset: 5,
+            }
+        );
+        // Case-insensitive, and parameters work like any integer.
+        assert_eq!(
+            with("select * from docs limit ? offset ?;", &[Param::Int(3), Param::Int(4)]),
+            Statement::Limited {
+                statement: Box::new(ok("SELECT * FROM docs;")),
+                limit: Some(3),
+                offset: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn a_select_without_a_window_is_unchanged() {
+        assert!(matches!(ok("SELECT id FROM docs;"), Statement::Select(_)));
+    }
+
+    #[test]
+    fn malformed_windows_are_errors() {
+        for src in [
+            "SELECT id FROM docs LIMIT;",
+            "SELECT id FROM docs LIMIT 'x';",
+            "SELECT id FROM docs LIMIT 1.5;",
+            "SELECT id FROM docs LIMIT -1;",
+            "SELECT id FROM docs OFFSET 1 LIMIT 2;",
+            "SELECT id FROM docs LIMIT 1 LIMIT 2;",
+            "SELECT id FROM docs LIMIT 1 WHERE n = 1;",
+            // A SEARCH already says how many rows: TOP k.
+            "SEARCH TOP 5 NEAREST TO [1] FROM docs LIMIT 2;",
+        ] {
+            err(src);
+        }
+        // A negative count arriving as a parameter is refused by name.
+        let e = with_err("SELECT id FROM docs LIMIT ?;", &[Param::Int(-1)]);
+        assert!(matches!(e.kind, ParseErrorKind::NegativeWindow { .. }), "{e:?}");
+    }
+
+    // -- complexity caps --------------------------------------------------------
+    //
+    // Every later stage walks a predicate recursively, so an unbounded one is
+    // a stack overflow — a crash of the host process from one query. Nesting
+    // and size are capped here, before anything recurses.
+
+    #[test]
+    fn nesting_deeper_than_the_cap_is_refused_not_a_crash() {
+        let ok_depth = MAX_EXPR_DEPTH;
+        ok(&format!("SELECT id FROM t WHERE {}n = 1{};", "(".repeat(ok_depth), ")".repeat(ok_depth)));
+        for depth in [MAX_EXPR_DEPTH + 1, 100_000] {
+            let e = err(&format!("SELECT id FROM t WHERE {}n = 1{};", "(".repeat(depth), ")".repeat(depth)));
+            assert!(matches!(e.kind, ParseErrorKind::TooComplex { .. }), "depth {depth}: {e:?}");
+        }
+    }
+
+    #[test]
+    fn more_comparisons_than_the_cap_are_refused() {
+        let chain = |n: usize| (0..n).map(|i| format!("n = {i}")).collect::<Vec<_>>().join(" OR ");
+        ok(&format!("SELECT id FROM t WHERE {};", chain(MAX_EXPR_TERMS)));
+        let e = err(&format!("SELECT id FROM t WHERE {};", chain(MAX_EXPR_TERMS + 1)));
+        assert!(matches!(e.kind, ParseErrorKind::TooComplex { .. }), "{e:?}");
+        assert!(e.to_string().contains(&MAX_EXPR_TERMS.to_string()), "{e}");
+    }
+
+    /// Depth of an expression tree.
+    fn depth(e: &Expr) -> usize {
+        match e {
+            Expr::And(l, r) | Expr::Or(l, r) => 1 + depth(l).max(depth(r)),
+            Expr::Compare { left, right, .. } => 1 + depth(left).max(depth(right)),
+            _ => 1,
+        }
+    }
+
+    /// The comparisons of an expression, left to right.
+    fn leaves(e: &Expr, out: &mut Vec<Expr>) {
+        match e {
+            Expr::And(l, r) | Expr::Or(l, r) => {
+                leaves(l, out);
+                leaves(r, out);
+            }
+            other => out.push(other.clone()),
+        }
+    }
+
+    #[test]
+    fn a_long_chain_is_balanced_so_it_stays_shallow() {
+        let n = MAX_EXPR_TERMS;
+        let src = format!(
+            "SELECT id FROM t WHERE {};",
+            (0..n).map(|i| format!("n = {i}")).collect::<Vec<_>>().join(" OR ")
+        );
+        let Statement::Select(s) = ok(&src) else { panic!() };
+        let filter = s.filter.unwrap();
+        assert!(depth(&filter) <= 20, "depth {} for {n} terms", depth(&filter));
+        // Same comparisons, same order: OR is associative, so only the
+        // grouping changed.
+        let mut got = Vec::new();
+        leaves(&filter, &mut got);
+        assert_eq!(got.len(), n);
+        for (i, leaf) in got.iter().enumerate() {
+            assert_eq!(
+                leaf,
+                &Expr::Compare {
+                    left: Box::new(Expr::Column("n".into())),
+                    op: CompareOp::Eq,
+                    right: Box::new(Expr::Literal(Literal::Int(i as i64))),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_chain_keeps_its_left_nested_shape() {
+        // Chains up to the balancing threshold parse exactly as they always did.
+        let Statement::Select(s) = ok("SELECT id FROM t WHERE a = 1 OR b = 2 OR c = 3;") else { panic!() };
+        assert!(matches!(s.filter, Some(Expr::Or(ref l, _)) if matches!(**l, Expr::Or(..))));
+    }
+
+    #[test]
+    fn an_oversized_statement_is_refused_before_lexing() {
+        let e = parse_with_limit("SELECT id FROM t;", &[], 8).unwrap_err();
+        assert!(matches!(e.kind, ParseErrorKind::TooLarge { bytes: 17, limit: 8 }), "{e:?}");
+        assert!(parse_with_limit("SELECT id FROM t;", &[], 17).is_ok());
     }
 }

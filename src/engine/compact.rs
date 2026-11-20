@@ -259,11 +259,19 @@ impl Epoch {
 // Directories
 // ---------------------------------------------------------------------------
 
-fn staging_dir(dir: &Path, id: u32) -> PathBuf {
+/// A `Db::backup` request, run on the commit thread like a flip — see
+/// `IndexApplier::backup_into`. Lives beside `Flip` because the commit thread
+/// dispatches both from `run_control`.
+pub(super) struct Backup {
+    /// Where the copy goes; already created and empty.
+    pub(super) dest: PathBuf,
+}
+
+pub(super) fn staging_dir(dir: &Path, id: u32) -> PathBuf {
     dir.join(format!("collection-{id}.compact"))
 }
 
-fn retired_dir(dir: &Path, id: u32) -> PathBuf {
+pub(super) fn retired_dir(dir: &Path, id: u32) -> PathBuf {
     dir.join(format!("collection-{id}.old"))
 }
 
@@ -414,8 +422,12 @@ struct Retired {
 impl IndexApplier {
     /// Run a control job. The only kind there is: a compaction's flip.
     pub(super) fn run_control(&mut self, job: Box<dyn Any + Send>) -> io::Result<Option<u64>> {
-        match job.downcast::<Flip>() {
-            Ok(flip) => self.flip(*flip),
+        let job = match job.downcast::<Flip>() {
+            Ok(flip) => return self.flip(*flip),
+            Err(job) => job,
+        };
+        match job.downcast::<Backup>() {
+            Ok(backup) => self.backup_into(&backup.dest),
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "unknown control job",
@@ -514,6 +526,7 @@ impl IndexApplier {
         let live = collection_dir(&self.dir, id);
         let staged = staging_dir(&self.dir, id);
         let retired = retired_dir(&self.dir, id);
+        fail_point!("compact.before_flip");
 
         if let Err(e) = fs::rename(&live, &retired).and_then(|()| sync_dir(&self.dir)) {
             // If the rename itself landed, put it back; the old generation's
@@ -528,6 +541,11 @@ impl IndexApplier {
         if crash {
             let e = io::Error::other("injected crash between the renames");
             self.halt(id, "test fault point", &e);
+            return Err(e);
+        }
+        #[cfg(feature = "failpoints")]
+        if let Err(e) = crate::failpoint::hit("compact.between_renames") {
+            self.halt(id, "failpoint", &e);
             return Err(e);
         }
         if let Err(e) = fs::rename(&staged, &live) {
@@ -611,12 +629,28 @@ pub(super) struct Shared {
     pub(super) running: Mutex<()>,
     /// Set on close: a build in progress gives up.
     pub(super) stop: AtomicBool,
+    /// What `Db::stats` reports.
+    pub(super) counters: Arc<super::Counters>,
 }
 
 impl Shared {
     /// Rebuild `id` if it has anything to reclaim. `Ok(false)` when every
     /// allocated ordinal is live, so there is nothing to do.
     pub(super) fn compact(&self, wal: &WalHandle, id: u32) -> Result<bool> {
+        let outcome = self.compact_inner(wal, id);
+        match &outcome {
+            Ok(true) => {
+                self.counters.compactions.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(false) => {}
+            Err(_) => {
+                self.counters.compaction_failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        outcome
+    }
+
+    fn compact_inner(&self, wal: &WalHandle, id: u32) -> Result<bool> {
         let _one = self.running.lock().unwrap_or_else(|e| e.into_inner());
         let coll = catalog_snapshot(&self.catalog)
             .get(&id)
@@ -666,8 +700,12 @@ impl Shared {
         drop(coll);
         if fire {
             // Best-effort, like a checkpoint: a failed compaction changed
-            // nothing and the next trigger tries again.
-            let _ = self.compact(wal, id);
+            // nothing and the next trigger tries again. But say so — a
+            // compaction that keeps failing (a full disk) leaves the dead rows
+            // in place until the collection fills.
+            if let Err(e) = self.compact(wal, id) {
+                crate::diagnostics::error(&format!("background compaction of collection {id} failed: {e}"));
+            }
         }
     }
 }
@@ -681,7 +719,11 @@ pub(super) struct Compactor {
 }
 
 impl Compactor {
-    pub(super) fn spawn(shared: Arc<Shared>, wal: WalHandle, interval: Duration) -> Compactor {
+    pub(super) fn spawn(
+        shared: Arc<Shared>,
+        wal: WalHandle,
+        interval: Duration,
+    ) -> io::Result<Compactor> {
         let (nudge, rx) = mpsc::channel::<u32>();
         let opts = shared.opts;
         let join = std::thread::Builder::new()
@@ -704,9 +746,8 @@ impl Compactor {
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
                 }
-            })
-            .expect("spawn compactor thread");
-        Compactor { nudge, join, opts }
+            })?;
+        Ok(Compactor { nudge, join, opts })
     }
 
     /// Called by a write that allocated ordinals `[from, to)`: wake the
@@ -1064,8 +1105,7 @@ mod tests {
             let wal = db.wal_handle().unwrap();
             let coll = catalog_snapshot(&shared.catalog).get(&0).cloned().unwrap();
             let live_x = coll.live.resolve();
-            let (writers, collection) =
-                build(&shared.dir, &coll, &live_x, &shared.stop).unwrap();
+            let (writers, collection) = build(&shared.dir, &coll, &live_x, &shared.stop).unwrap();
             drop(coll);
             {
                 let _closed = shared.gate.close();

@@ -93,13 +93,19 @@ const F_CAPACITY: usize = 32;
 const F_SEQ: usize = 40;
 const F_CRC: usize = 48;
 
+/// A row's position within its collection, shared by the vector index and both
+/// metadata stores. Stable only until the collection is next compacted, which
+/// renumbers every row; a row's lasting identity is its primary key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Ordinal(pub u32);
 
+/// One hit of a similarity search.
 #[derive(Debug, Clone, Copy)]
 pub struct SearchResult {
+    /// The matching row.
     pub id: Ordinal,
-    pub score: f32, // dot product: higher = more similar
+    /// Its dot product with the query: higher is more similar.
+    pub score: f32,
 }
 impl PartialEq for SearchResult {
     fn eq(&self, other: &Self) -> bool {
@@ -151,10 +157,16 @@ struct FlatIndexInner {
 // the auto-derived !Send/!Sync. Sharing across threads is sound because:
 //   1. There is exactly one writer — `Writer` is `!Clone` and uniquely owned —
 //      so writes are never concurrent with each other.
-//   2. Vector slots are written only at ordinals >= the published `count` and
-//      made visible solely via the Release store on `count`; Readers Acquire-
-//      load `count` and read only ordinals below it, so no reference ever
-//      aliases a region being written.
+//   2. A slot is referenced by a Reader only ONE ROW AT A TIME (`row`), and
+//      only for a row that is fully written before the reference exists: the
+//      engine reads a row only once its collection's liveness snapshot admits
+//      it, and liveness is published (under the metadata lock) strictly after
+//      the vector is written. Slots CAN be written below the published
+//      `count` — ordinals are allocated by callers, records apply in log
+//      order, so ordinal 5 may be written after 6 has published count = 7 —
+//      which is why no reference may ever span rows: an earlier version
+//      handed out one slice over `[0, count)`, and that slice covered slots
+//      the writer was still filling (found by the unsafe audit).
 //   3. The header region is writer-exclusive and only read single-threaded at
 //      open.
 unsafe impl Send for FlatIndexInner {}
@@ -165,32 +177,30 @@ impl FlatIndexInner {
         self.count.load(AtomicOrdering::Acquire) as usize
     }
 
-    /// Committed vectors `[0, count)` as a flat `&[f32]`. Reader-side.
-    fn committed_vectors(&self) -> &[f32] {
-        let n = self.count();
-        let floats = n * self.dim.get();
+    /// Row `id`'s vector, for `id < count` (the caller's Acquire-loaded
+    /// count). ONE row: see the `Send`/`Sync` note for why no slice may span
+    /// rows. The caller must only ask for a row that is fully written — one
+    /// its liveness snapshot admits, or any row when no writer runs.
+    fn row(&self, id: usize, count: usize) -> &[f32] {
+        let dim = self.dim.get();
+        debug_assert!(id < count && count <= self.capacity, "row {id} outside the published {count}");
         // SAFETY:
         // - `base + vectors_offset` starts the f32 region; `vectors_offset` is
         //   page-aligned (=> 4-aligned), so the pointer is aligned for f32.
-        // - `floats <= capacity*dim`, and the mapping is sized for that; in
-        //   bounds.
-        // - `n` came from an Acquire load that pairs with the Writer's Release
-        //   store, so all `floats` are fully written and are never mutated again
-        //   (writes only target ordinals >= the published count). No `&mut` to
-        //   this region is ever formed, so this shared slice cannot alias one.
-        //   CAVEAT: `write_at` is positional, so WAL replay CAN rewrite an
-        //   already-published ordinal. Benign today — replay rewrites
-        //   byte-identical data and finishes before any Reader exists (recovery
-        //   runs on the caller's thread before the commit thread spawns) — and
-        //   `tests/swmr.rs::vector_at_never_torn_under_writer` assumes exactly
-        //   that. If replay ever becomes concurrent with reads, revisit here.
+        // - `id < count <= capacity`, and the mapping holds `capacity * dim`
+        //   floats past `vectors_offset`, so `[id*dim, id*dim + dim)` is in
+        //   bounds (the product cannot overflow: the mapping's size didn't).
+        // - The row is fully written and not being written: the caller reads
+        //   only rows admitted by a liveness snapshot, which happens-after the
+        //   row's write (and the writer never rewrites a live row, except WAL
+        //   replay, which rewrites identical bytes before any Reader exists).
+        //   No `&mut` to this region is ever formed.
         // - The mapping outlives `&self` (held by the Arc); no remap occurs.
         unsafe {
-            let p = self.base.add(self.vectors_offset) as *const f32;
-            std::slice::from_raw_parts(p, floats)
+            let p = (self.base.add(self.vectors_offset) as *const f32).add(id * dim);
+            std::slice::from_raw_parts(p, dim)
         }
     }
-
 }
 
 /// Geometry helpers (independent of any handle).
@@ -207,7 +217,11 @@ fn bytes_for(dim: usize, capacity: usize) -> Result<usize> {
         .ok_or(Error::CapacityOverflow { dim, capacity })
 }
 fn slot_offset(slot: usize) -> usize {
-    if slot == 0 { SLOT0_OFFSET } else { SLOT1_OFFSET }
+    if slot == 0 {
+        SLOT0_OFFSET
+    } else {
+        SLOT1_OFFSET
+    }
 }
 
 /// Factory for the `(Writer, Reader)` pair. Holds no state itself.
@@ -216,16 +230,25 @@ pub struct FlatIndex;
 impl FlatIndex {
     /// Creates a fresh index file pre-mapped for up to `capacity` vectors,
     /// overwriting any existing file. Returns the writer + a reader.
+    ///
+    /// ATOMIC: the file is built under a temporary name and renamed into
+    /// place only once its header is durable, then the directory is synced.
+    /// A crash leaves either no index (replay creates it) or a complete one;
+    /// never a sized, zero-filled file that `open` must refuse — which made a
+    /// CREATE COLLECTION killed at the wrong moment leave a database that
+    /// would not open at all.
     pub fn create(path: &Path, dim: NonZeroUsize, capacity: usize) -> Result<(Writer, Reader)> {
+        let tmp = path.with_extension("idx.tmp");
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
-            .open(path)?;
+            .open(&tmp)?;
 
         let len = bytes_for(dim.get(), capacity)?;
         file.set_len(len as u64)?; // sparse: only touched pages occupy disk
+        fail_point!("index.create.before_header");
 
         // SAFETY: the file is sized to `len`; the mapping covers exactly it.
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
@@ -241,6 +264,12 @@ impl FlatIndex {
         write_slot(&mut mmap[SLOT0_OFFSET..SLOT0_OFFSET + SLOT_BYTES], &slot);
         write_slot(&mut mmap[SLOT1_OFFSET..SLOT1_OFFSET + SLOT_BYTES], &slot);
         mmap.flush()?; // make the freshly created file valid on disk
+        file.sync_all()?; // ...and its size and metadata
+        // The mapping follows the inode, so it stays valid across the rename.
+        std::fs::rename(&tmp, path)?;
+        if let Some(dir) = path.parent() {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
 
         Ok(build(mmap, dim, capacity, 0, 0, 0, 0, 0))
     }
@@ -379,12 +408,16 @@ impl Writer {
         let byte_len = dim * F32_BYTES;
 
         // SAFETY: `[offset, offset+byte_len)` is within the mapping (ordinal <
-        // capacity). We are the unique Writer. This slot is at `ordinal`, made
-        // visible to Readers only by the Release store below, so no Reader can
-        // observe these bytes mid-write. We write through `base` (whole-mapping
-        // write provenance) with a non-overlapping copy — no `&mut` slice that
-        // could alias a Reader's `&[f32]` is ever formed. Host is assumed
-        // little-endian (the on-disk format is LE); byte-swap here for BE.
+        // capacity). We are the unique Writer. No Reader references this row
+        // while we write it: Readers take one row at a time and only rows a
+        // liveness snapshot admits, and this row's liveness is published
+        // (metadata lock) only after this write returns. NOTE the published
+        // `count` may already exceed `ordinal` — records apply in log order,
+        // ordinals are allocated in caller order — so `count` alone does NOT
+        // protect this slot; liveness does. We write through `base`
+        // (whole-mapping write provenance) with a non-overlapping copy — no
+        // `&mut` slice is ever formed. Host is assumed little-endian (the
+        // on-disk format is LE); byte-swap here for BE.
         unsafe {
             let dst = self.inner.base.add(offset);
             std::ptr::copy_nonoverlapping(vector.as_ptr() as *const u8, dst, byte_len);
@@ -474,7 +507,9 @@ impl Writer {
             Some(s) => s,
             None => return Ok(()),
         };
-        self.inner._mmap.flush_range(slot_offset(slot), SLOT_BYTES)?;
+        self.inner
+            ._mmap
+            .flush_range(slot_offset(slot), SLOT_BYTES)?;
         self.active_slot = slot;
         self.seq = seq;
         self.checkpoint_lsn = last_lsn;
@@ -532,21 +567,14 @@ impl Reader {
     /// the copy it was always going to make.
     pub fn vector_at(&self, ordinal: Ordinal) -> Option<&[f32]> {
         let id = ordinal.0 as usize;
-        // ONE Acquire load, via the same accessor `search` uses: the count is
-        // read once and the slice is derived from it, so the bound cannot shift
-        // between the check and the read.
-        let vectors = self.inner.committed_vectors();
-        let dim = self.inner.dim.get();
-        // `vectors` is exactly `count * dim` long, so this bounds-check covers
-        // the published count, the capacity, and any absurd ordinal at once —
-        // `id * dim` is computed only after it passes, and `id < count <=
-        // capacity` makes the product non-overflowing.
-        let start = id.checked_mul(dim)?;
-        let end = start.checked_add(dim)?;
-        if end > vectors.len() {
+        // ONE Acquire load: the bound cannot shift between the check and the
+        // read. Like every Reader access, this must name a row that is fully
+        // written — a live one while a writer runs (see `row`).
+        let count = self.inner.count();
+        if id >= count {
             return None;
         }
-        Some(&vectors[start..end])
+        Some(self.inner.row(id, count))
     }
 
     /// Brute-force top-`k` search over EVERY committed vector, minus this
@@ -556,7 +584,9 @@ impl Reader {
     /// rest of the engine does not consider live yet. Callers that answer user
     /// queries want [`search_filtered`](Self::search_filtered) with the
     /// collection's snapshot; this stays for tests and for index-level work
-    /// that has no snapshot to speak of.
+    /// that has no snapshot to speak of — and it reads EVERY row below the
+    /// count, so it must not run while a writer is filling slots (a row below
+    /// the count may still be mid-write; see `row`).
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
         self.search_filtered(query, k, None, None)
     }
@@ -601,17 +631,21 @@ impl Reader {
             return Err(Error::InvalidTopK { k });
         }
 
-        let vectors = self.inner.committed_vectors();
         // Reserve for the SMALLER of `k` and the rows that exist. `k` is a user
         // operand (`SEARCH TOP k`) that the binder only floors at 1, so it can
         // be `i64::MAX` — and `with_capacity` on that aborts the process with a
         // capacity overflow. The heap never grows past the number of committed
         // vectors anyway (the push below is guarded by `heap.len() < k`), so
         // clamping costs nothing and removes the panic.
-        let committed = vectors.len() / dim;
+        let committed = self.inner.count();
         let mut heap = BinaryHeap::with_capacity(k.min(committed));
 
-        for (id, v) in vectors.chunks_exact(dim).enumerate() {
+        for id in 0..committed {
+            // A long scan can be stopped — `Db::interrupt` or a statement
+            // timeout — between blocks of rows, including before the first.
+            if id % crate::cancel::KERNEL_CHECK_EVERY == 0 {
+                crate::cancel::check()?;
+            }
             // The liveness snapshot, and the ONLY liveness test: one shift and
             // one AND, in front of the dot product. A row the snapshot does not
             // admit is not this query's to return, however close it happens to
@@ -629,6 +663,8 @@ impl Reader {
             {
                 continue;
             }
+            // Only now, for a row the filters admit, is its memory touched.
+            let v = self.inner.row(id, committed);
             let hit = SearchResult {
                 id: Ordinal(id as u32),
                 score: dot(query, v),
@@ -701,13 +737,17 @@ fn crc32(bytes: &[u8]) -> u32 {
 // ---- little-endian primitives ----
 
 fn read_u32(buf: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(buf[offset..offset + 4].try_into().expect("4-byte read"))
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&buf[offset..offset + 4]);
+    u32::from_le_bytes(b)
 }
 fn write_u32(buf: &mut [u8], offset: usize, value: u32) {
     buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 fn read_u64(buf: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(buf[offset..offset + 8].try_into().expect("8-byte read"))
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&buf[offset..offset + 8]);
+    u64::from_le_bytes(b)
 }
 fn write_u64(buf: &mut [u8], offset: usize, value: u64) {
     buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
@@ -810,7 +850,11 @@ mod tests {
 
         // Refusal must not have touched the file — a failed open that resets
         // the index would destroy the only copy of the vectors.
-        assert_eq!(std::fs::read(&path).unwrap(), bytes, "open mutated the file");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "open mutated the file"
+        );
     }
 
     /// A retired row is still HERE — this index keeps the vector and has no
@@ -830,7 +874,9 @@ mod tests {
         // Retire ordinal 1 the only way it can now be retired — by leaving it
         // out of the snapshot.
         let live = bits(&[0]);
-        let hits = r.search_filtered(&[1.0, 0.0], 8, Some(&live), None).unwrap();
+        let hits = r
+            .search_filtered(&[1.0, 0.0], 8, Some(&live), None)
+            .unwrap();
         assert_eq!(ids(&hits), vec![0]);
 
         // ...and its vector is still readable, which is what lets a reader on an
@@ -904,7 +950,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = temp_path(&dir, "badmagic.bin");
         std::fs::write(&path, vec![0u8; 64]).unwrap();
-        assert!(matches!(FlatIndex::open(&path), Err(Error::BadMagic { .. })));
+        assert!(matches!(
+            FlatIndex::open(&path),
+            Err(Error::BadMagic { .. })
+        ));
     }
 
     // ---- vector_at --------------------------------------------------------
@@ -1027,7 +1076,9 @@ mod tests {
         // A snapshot that omits the two best matches. They are NOT tombstoned —
         // `search` must exclude them purely on the snapshot's say-so.
         let live = bits(&[2, 3]);
-        let filtered = r.search_filtered(&[1.0, 0.0], 4, Some(&live), None).unwrap();
+        let filtered = r
+            .search_filtered(&[1.0, 0.0], 4, Some(&live), None)
+            .unwrap();
         assert_eq!(ids(&filtered), vec![2, 3]);
         assert!(
             r.vector_at(Ordinal(0)).is_some(),
@@ -1037,7 +1088,11 @@ mod tests {
 
         // An empty snapshot admits nothing, however close the vectors are.
         let none: [u64; 0] = [];
-        assert!(r.search_filtered(&[1.0, 0.0], 4, Some(&none), None).unwrap().is_empty());
+        assert!(
+            r.search_filtered(&[1.0, 0.0], 4, Some(&none), None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The two prefilters compose: `k` counts rows that pass BOTH, and neither
@@ -1066,8 +1121,12 @@ mod tests {
         // With a snapshot covering everything, only the predicate bites — and
         // the result matches the predicate-only search exactly.
         let all_live = bits(&[0, 1, 2, 3]);
-        let a = r.search_filtered(&[1.0, 0.0], 4, Some(&all_live), Some(&allowed)).unwrap();
-        let b = r.search_filtered(&[1.0, 0.0], 4, None, Some(&allowed)).unwrap();
+        let a = r
+            .search_filtered(&[1.0, 0.0], 4, Some(&all_live), Some(&allowed))
+            .unwrap();
+        let b = r
+            .search_filtered(&[1.0, 0.0], 4, None, Some(&allowed))
+            .unwrap();
         assert_eq!(ids(&a), ids(&b));
         assert_eq!(ids(&a), vec![1, 2, 3]);
     }

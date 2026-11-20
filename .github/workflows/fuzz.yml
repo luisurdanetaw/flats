@@ -1,0 +1,294 @@
+name: Fuzz
+
+# Randomized testing, at two sizes:
+#
+#   * every pull request: a quick pass of every harness (a few minutes);
+#   * nightly, and on demand: an 8-shard matrix on FRESH seeds every night
+#     (the seed range moves with the run number), for as long as a CI job
+#     reasonably runs.
+#
+# The harnesses (see each file's header):
+#   tests/differential.rs  random workloads vs a reference model, shrunk on failure
+#   fuzz/sqlite_diff.py    the same WHERE text through Flats and SQLite (Python SDK)
+#   tests/crash_kill.rs    SIGKILL at random moments; acknowledged writes survive
+#   tests/failpoints.rs    fail and crash at every step of every durability path
+#   tests/concurrent_differential.rs  writers + readers + busy background threads
+#   tests/sync_order.rs    the fsync/rename order, from an strace, against
+#                          the rules a power cut enforces
+#   tests/fuzz.rs          hostile statement text and damaged files: never panic
+#   fuzz/run.sh            coverage-guided libFuzzer (+ASan) on the parser, the
+#                          query pipeline and every decoder
+#
+# A failure uploads target/sim-failures (each report has the seed, a minimal
+# reproduction and the replay command) and, nightly, opens an issue.
+
+on:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: "Multiplier on the nightly iteration counts"
+        default: "1"
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FLATS_SIM_OUT: ${{ github.workspace }}/target/sim-failures
+
+jobs:
+  quick:
+    name: fuzz (quick)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        run: rustup update stable --no-self-update && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      # A workflow file that isn't valid YAML never runs, so it can't report
+      # itself: every workflow checks every workflow file (ci.yml was broken
+      # by an unquoted `simd:: sql::` once, silently disabling all of CI).
+      - name: workflow files are valid YAML
+        run: python3 -c 'import glob, yaml; [yaml.safe_load(open(f)) for f in glob.glob(".github/workflows/*.yml")]'
+      - name: differential (model)
+        run: cargo test --release --locked --test differential
+        env: { FLATS_SIM_SEEDS: "20", FLATS_SIM_OPS: "300" }
+      - name: crash (kill -9)
+        run: cargo test --release --locked --test crash_kill
+        env: { FLATS_CRASH_ITERS: "20" }
+      - name: crash (fault points)
+        run: cargo test --release --locked --features failpoints --test failpoints
+        env: { FLATS_FP_SEEDS: "20" }
+      - name: concurrency
+        run: cargo test --release --locked --test concurrent_differential
+        env: { FLATS_CONC_ROUNDS: "2" }
+      - name: power-loss ordering (strace)
+        run: |
+          sudo apt-get install -y strace >/dev/null
+          cargo test --release --locked --test sync_order
+        env: { FLATS_SYNC_SEEDS: "5" }
+      - name: differential (SQLite, via the Python SDK)
+        run: |
+          cargo build --release --locked -p flats-c
+          python3 fuzz/sqlite_diff.py --seeds 20 --ops 250
+      - name: hostile input
+        run: cargo test --release --locked --test fuzz
+        env: { FLATS_FUZZ_ITERS: "2000" }
+      - name: C ABI call sequences
+        run: cargo test --release --locked -p flats-c --test abi_fuzz
+        env: { FLATS_FUZZ_ITERS: "200" }
+      - name: upload failure reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-failures-quick
+          path: target/sim-failures
+          if-no-files-found: ignore
+
+  libfuzzer-quick:
+    name: libFuzzer (quick)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly
+        run: rustup toolchain install nightly --profile minimal --no-self-update
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: fuzz every target for 30 s
+        run: fuzz/run.sh all 30
+      - name: upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-failures-libfuzzer-quick
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
+  libfuzzer-nightly:
+    name: libFuzzer (nightly, ${{ matrix.target }})
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [sql_parse, sql_execute, wal_record, metadata_snapshot, tuple_snapshot, catalog]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly
+        run: rustup toolchain install nightly --profile minimal --no-self-update
+      # The corpus is the fuzzer's memory: keep it growing across nights.
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: fuzz for 40 minutes on 2 cores
+        run: FUZZ_JOBS=2 fuzz/run.sh ${{ matrix.target }} $(( 2400 * ${{ github.event.inputs.scale || 1 }} ))
+      - name: describe the crashing inputs
+        if: failure()
+        run: |
+          mkdir -p target/sim-failures
+          for f in fuzz/artifacts/${{ matrix.target }}/*; do
+            [ -f "$f" ] || continue
+            { echo "libFuzzer target ${{ matrix.target }}: $(basename "$f")"; echo
+              echo "replay: fuzz/run.sh ${{ matrix.target }} 0 <this input>"; echo
+              echo "input (hex):"; xxd "$f" | head -64; } > "target/sim-failures/libfuzzer-${{ matrix.target }}-$(basename "$f").txt"
+          done
+      - name: upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-failures-libfuzzer-${{ matrix.target }}
+          path: |
+            target/sim-failures
+            fuzz/artifacts
+          if-no-files-found: ignore
+
+  nightly:
+    name: fuzz (nightly, shard ${{ matrix.shard }})
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      SCALE: ${{ github.event.inputs.scale || '1' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        run: rustup update stable --no-self-update && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Pick this shard's seeds
+        # Fresh seeds every night: run N, shard S covers its own range, so
+        # the matrix never repeats a seed it already ran clean.
+        run: |
+          base=$(( (${{ github.run_number }} * 8 + ${{ matrix.shard }}) * 100000 ))
+          echo "FLATS_SIM_SEED_BASE=$base" >> "$GITHUB_ENV"
+          echo "seed base $base, scale $SCALE"
+      - name: differential (model)
+        run: |
+          FLATS_SIM_SEEDS=$(( 400 * SCALE )) FLATS_SIM_OPS=500 \
+            cargo test --release --locked --test differential
+      - name: crash (kill -9)
+        run: FLATS_CRASH_ITERS=$(( 300 * SCALE )) cargo test --release --locked --test crash_kill
+      - name: crash (fault points)
+        run: |
+          FLATS_FP_SEEDS=$(( 150 * SCALE )) \
+            cargo test --release --locked --features failpoints --test failpoints
+      - name: concurrency
+        run: |
+          FLATS_CONC_ROUNDS=$(( 30 * SCALE )) \
+            cargo test --release --locked --test concurrent_differential
+      - name: power-loss ordering (strace)
+        run: |
+          sudo apt-get install -y strace >/dev/null
+          FLATS_SYNC_SEEDS=$(( 60 * SCALE )) cargo test --release --locked --test sync_order
+      - name: differential (SQLite, via the Python SDK)
+        run: |
+          cargo build --release --locked -p flats-c
+          python3 fuzz/sqlite_diff.py --seeds $(( 300 * SCALE )) --ops 400 \
+            --seed-base "$FLATS_SIM_SEED_BASE"
+      - name: hostile input
+        run: FLATS_FUZZ_ITERS=$(( 20000 * SCALE )) cargo test --release --locked --test fuzz
+      - name: C ABI call sequences
+        run: FLATS_FUZZ_ITERS=$(( 3000 * SCALE )) cargo test --release --locked -p flats-c --test abi_fuzz
+      - name: chaos and compaction models
+        run: |
+          CHAOS_ITERS=$(( 30000 * SCALE )) COMPACTION_ITERS=$(( 30000 * SCALE )) \
+            cargo test --release --locked --test chaos --test compaction
+      - name: upload failure reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-failures-shard-${{ matrix.shard }}
+          path: target/sim-failures
+          if-no-files-found: ignore
+
+  coverage:
+    name: coverage (nightly)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly with llvm-tools
+        run: |
+          rustup toolchain install nightly --profile minimal --component llvm-tools --no-self-update
+          rustup default nightly
+      - name: measure (fails below the floor)
+        run: COVERAGE_MIN=93 scripts/coverage.sh --html | tee coverage.txt
+      - name: explain a drop
+        if: failure()
+        run: |
+          mkdir -p target/sim-failures
+          { echo "Line coverage fell below the 93% floor."; echo; cat coverage.txt; } \
+            > target/sim-failures/coverage-below-floor.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-html
+          path: target/coverage/html
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: sim-failures-coverage
+          path: target/sim-failures
+          if-no-files-found: ignore
+
+  report:
+    name: open an issue for nightly failures
+    needs: [nightly, libfuzzer-nightly, coverage]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: failures
+          pattern: sim-failures-*
+      - name: File (or update) one issue per failing report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          mapfile -t files < <(find failures -name '*.txt' 2>/dev/null | sort)
+          if [ ${#files[@]} -eq 0 ]; then
+            title="Nightly fuzz failed (no report file; see the run log)"
+            gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[].number' | grep -q . \
+              || gh issue create --title "$title" --label fuzz --body "$RUN_URL" \
+              || gh issue create --title "$title" --body "$RUN_URL"
+            exit 0
+          fi
+          for f in "${files[@]}"; do
+            name=$(basename "$f" .txt)
+            title="Fuzz: $name"
+            body=$(printf 'Found by %s\n\n```\n%s\n```\n' "$RUN_URL" "$(head -c 60000 "$f")")
+            existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body "$body"
+            else
+              gh issue create --title "$title" --label fuzz --body "$body" \
+                || gh issue create --title "$title" --body "$body"
+            fi
+          done

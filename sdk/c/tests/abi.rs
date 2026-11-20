@@ -1,0 +1,946 @@
+//! The C ABI, driven from Rust exactly as a C caller would drive it: raw
+//! pointers, NUL-terminated strings, status codes, and `flats_last_error`.
+
+use std::ffi::{CStr, CString, c_char};
+use std::ptr;
+
+use flats_c::*;
+
+fn c(s: &str) -> CString {
+    CString::new(s).unwrap()
+}
+
+fn last_error() -> Option<String> {
+    // SAFETY: flats_last_error returns NULL or a NUL-terminated string that
+    // lives until the next flats_* call on this thread; it is copied at once.
+    unsafe {
+        let p = flats_last_error();
+        (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned())
+    }
+}
+
+struct Db(*mut flats_db);
+
+impl Db {
+    fn open(dir: &std::path::Path) -> Db {
+        let path = c(dir.to_str().unwrap());
+        let mut db = ptr::null_mut();
+        // SAFETY: valid C string and out-pointer.
+        let rc = unsafe { flats_open(path.as_ptr(), &mut db) };
+        assert_eq!(rc, FLATS_OK, "open: {:?}", last_error());
+        assert!(!db.is_null());
+        Db(db)
+    }
+
+    fn exec(&self, sql: &str) -> i32 {
+        let sql = c(sql);
+        // SAFETY: live handle, valid C string, NULL out discards the result.
+        unsafe { flats_execute(self.0, sql.as_ptr(), ptr::null_mut()) }
+    }
+
+    fn query(&self, sql: &str) -> Res {
+        let sql = c(sql);
+        let mut res = ptr::null_mut();
+        // SAFETY: live handle, valid C string and out-pointer.
+        let rc = unsafe { flats_execute(self.0, sql.as_ptr(), &mut res) };
+        assert_eq!(rc, FLATS_OK, "{sql:?}: {:?}", last_error());
+        Res(res)
+    }
+}
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        // SAFETY: the handle is live and released exactly once.
+        unsafe { flats_close(self.0) };
+    }
+}
+
+struct Res(*mut flats_result);
+
+#[derive(Debug, PartialEq)]
+enum Cell {
+    Int(i64),
+    Float(f64),
+    Text(String),
+    Vector(Vec<f32>),
+}
+
+impl Res {
+    fn columns(&self) -> Vec<String> {
+        // SAFETY: live result; names live as long as it does and are copied.
+        unsafe {
+            (0..flats_result_column_count(self.0))
+                .map(|i| {
+                    CStr::from_ptr(flats_result_column_name(self.0, i))
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect()
+        }
+    }
+
+    fn rows(&self) -> Vec<Vec<Cell>> {
+        // SAFETY: live result, indices in range, every pointer copied at once.
+        unsafe {
+            let cols = flats_result_column_count(self.0);
+            (0..flats_result_row_count(self.0))
+                .map(|r| {
+                    (0..cols)
+                        .map(|col| match flats_result_type(self.0, r, col) {
+                            FLATS_TYPE_INT => Cell::Int(flats_result_int(self.0, r, col)),
+                            FLATS_TYPE_FLOAT => Cell::Float(flats_result_float(self.0, r, col)),
+                            FLATS_TYPE_TEXT => {
+                                let mut len = 0;
+                                let p = flats_result_text(self.0, r, col, &mut len);
+                                let bytes = std::slice::from_raw_parts(p.cast::<u8>(), len);
+                                assert_eq!(*p.add(len), 0, "NUL-terminated");
+                                Cell::Text(String::from_utf8(bytes.to_vec()).unwrap())
+                            }
+                            FLATS_TYPE_VECTOR => {
+                                let mut len = 0;
+                                let p = flats_result_vector(self.0, r, col, &mut len);
+                                Cell::Vector(std::slice::from_raw_parts(p, len).to_vec())
+                            }
+                            other => panic!("unexpected cell type {other}"),
+                        })
+                        .collect()
+                })
+                .collect()
+        }
+    }
+}
+
+impl Drop for Res {
+    fn drop(&mut self) {
+        // SAFETY: released exactly once.
+        unsafe { flats_result_free(self.0) };
+    }
+}
+
+const SCHEMA: &str = "CREATE COLLECTION docs (id TEXT PRIMARY KEY, vector VECTOR(3), \
+                      year INT, score FLOAT) WITH (capacity = 1000);";
+
+#[test]
+fn version_is_the_engine_version() {
+    // SAFETY: static string.
+    let v = unsafe { CStr::from_ptr(flats_version()) };
+    assert_eq!(v.to_str().unwrap(), "0.1.0");
+}
+
+#[test]
+fn a_round_trip_through_execute() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    assert_eq!(db.exec(SCHEMA), FLATS_OK);
+    assert_eq!(
+        db.exec(
+            "INSERT INTO docs (id, vector, year, score) VALUES ('a', [1, 0, 1e-5], 2024, 0.5);"
+        ),
+        FLATS_OK
+    );
+    let res = db.query("SELECT id, year, score, vector FROM docs;");
+    assert_eq!(res.columns(), vec!["id", "year", "score", "vector"]);
+    assert_eq!(
+        res.rows(),
+        vec![vec![
+            Cell::Text("a".into()),
+            Cell::Int(2024),
+            Cell::Float(0.5),
+            Cell::Vector(vec![1.0, 0.0, 1e-5]),
+        ]]
+    );
+    let hits = db.query("SEARCH TOP 1 NEAREST TO [1, 0, 0] FROM docs RETURNING id, score;");
+    assert_eq!(hits.columns(), vec!["id", "score"]);
+    assert_eq!(hits.rows().len(), 1);
+}
+
+#[test]
+fn a_write_returns_an_empty_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    let res = db.query(SCHEMA);
+    assert!(res.columns().is_empty());
+    assert!(res.rows().is_empty());
+}
+
+#[test]
+fn a_bad_statement_is_a_query_error_with_a_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    assert_eq!(db.exec("SELEC nope;"), FLATS_ERR_QUERY);
+    assert!(last_error().is_some());
+    assert_eq!(db.exec("SELECT id FROM missing;"), FLATS_ERR_QUERY);
+    assert!(last_error().unwrap().contains("missing"));
+}
+
+#[test]
+fn an_engine_refusal_is_an_engine_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let ins = "INSERT INTO docs (id, vector, year, score) VALUES ('a', [1, 0, 0], 1, 1.0);";
+    assert_eq!(db.exec(ins), FLATS_OK);
+    assert_eq!(db.exec(ins), FLATS_ERR_ENGINE, "duplicate key");
+    assert!(last_error().unwrap().contains("'a'"), "{:?}", last_error());
+}
+
+#[test]
+fn null_and_invalid_arguments_are_refused_not_crashed_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    // SAFETY: every call below is passed NULL or invalid bytes ON PURPOSE —
+    // the contract is a refusal, never a dereference.
+    unsafe {
+        let mut out = ptr::null_mut();
+        assert_eq!(
+            flats_open(ptr::null(), &mut out),
+            FLATS_ERR_INVALID_ARGUMENT
+        );
+        assert!(out.is_null());
+        let p = c(dir.path().to_str().unwrap());
+        assert_eq!(
+            flats_open(p.as_ptr(), ptr::null_mut()),
+            FLATS_ERR_INVALID_ARGUMENT
+        );
+        let sql = c("SELECT id FROM docs;");
+        assert_eq!(
+            flats_execute(ptr::null_mut(), sql.as_ptr(), ptr::null_mut()),
+            FLATS_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            flats_execute(db.0, ptr::null(), ptr::null_mut()),
+            FLATS_ERR_INVALID_ARGUMENT
+        );
+        let bad_utf8 = [0xFFu8, 0xFE, 0];
+        assert_eq!(
+            flats_execute(db.0, bad_utf8.as_ptr().cast::<c_char>(), ptr::null_mut()),
+            FLATS_ERR_INVALID_ARGUMENT
+        );
+        assert!(last_error().unwrap().contains("UTF-8"));
+        // Releasing NULL is a no-op.
+        assert_eq!(flats_close(ptr::null_mut()), FLATS_OK);
+        flats_result_free(ptr::null_mut());
+        flats_batch_free(ptr::null_mut());
+    }
+}
+
+#[test]
+fn out_of_range_accessors_return_zero_or_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    db.exec("INSERT INTO docs (id, vector, year, score) VALUES ('a', [1, 0, 0], 1, 1.0);");
+    let res = db.query("SELECT id, year FROM docs;");
+    // SAFETY: live result; out-of-range indices are part of the contract.
+    unsafe {
+        assert_eq!(flats_result_type(res.0, 5, 0), 0);
+        assert_eq!(flats_result_type(res.0, 0, 9), 0);
+        assert!(flats_result_column_name(res.0, 9).is_null());
+        assert!(
+            flats_result_text(res.0, 0, 1, ptr::null_mut()).is_null(),
+            "not TEXT"
+        );
+        assert!(
+            flats_result_vector(res.0, 0, 0, ptr::null_mut()).is_null(),
+            "not VECTOR"
+        );
+        assert_eq!(flats_result_int(res.0, 0, 0), 0, "not INT");
+        assert_eq!(flats_result_int(res.0, 0, 1), 1);
+        // NULL result handles answer like an empty result.
+        assert_eq!(flats_result_row_count(ptr::null()), 0);
+        assert_eq!(flats_result_column_count(ptr::null()), 0);
+    }
+}
+
+#[test]
+fn the_last_error_belongs_to_the_thread_that_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    assert_eq!(db.exec("nonsense;"), FLATS_ERR_QUERY);
+    assert!(last_error().is_some());
+    std::thread::spawn(|| assert!(last_error().is_none(), "another thread's error leaked"))
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn one_handle_serves_many_threads() {
+    struct Shared(*mut flats_db);
+    // SAFETY: the contract says a flats_db may be shared across threads.
+    unsafe impl Sync for Shared {}
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let shared = Shared(db.0);
+    std::thread::scope(|s| {
+        for t in 0..4 {
+            let shared = &shared;
+            s.spawn(move || {
+                for i in 0..25 {
+                    let sql = c(&format!(
+                        "INSERT INTO docs (id, vector, year, score) VALUES ('t{t}-{i}', [1, 0, 0], {i}, 0.0);"
+                    ));
+                    // SAFETY: shared live handle, valid string.
+                    let rc = unsafe { flats_execute(shared.0, sql.as_ptr(), ptr::null_mut()) };
+                    assert_eq!(rc, FLATS_OK);
+                }
+            });
+        }
+    });
+    assert_eq!(db.query("SELECT id FROM docs;").rows().len(), 100);
+}
+
+// -- batch ---------------------------------------------------------------
+
+struct Batch(*mut flats_batch);
+
+impl Batch {
+    fn new(db: &Db, collection: &str) -> Result<Batch, i32> {
+        let name = c(collection);
+        let mut b = ptr::null_mut();
+        // SAFETY: live handle, valid string and out-pointer.
+        match unsafe { flats_batch_new(db.0, name.as_ptr(), &mut b) } {
+            FLATS_OK => Ok(Batch(b)),
+            rc => Err(rc),
+        }
+    }
+    fn vector(&self, v: &[f32]) -> i32 {
+        // SAFETY: live batch; `v` is valid for `v.len()` floats.
+        unsafe { flats_batch_vector(self.0, v.as_ptr(), v.len()) }
+    }
+    fn int(&self, col: &str, v: i64) -> i32 {
+        let col = c(col);
+        // SAFETY: live batch, valid string.
+        unsafe { flats_batch_int(self.0, col.as_ptr(), v) }
+    }
+    fn float(&self, col: &str, v: f64) -> i32 {
+        let col = c(col);
+        // SAFETY: live batch, valid string.
+        unsafe { flats_batch_float(self.0, col.as_ptr(), v) }
+    }
+    fn text(&self, col: &str, v: &str) -> i32 {
+        let col = c(col);
+        // SAFETY: live batch; `v` is valid for `v.len()` bytes (no NUL needed).
+        unsafe { flats_batch_text(self.0, col.as_ptr(), v.as_ptr().cast::<c_char>(), v.len()) }
+    }
+    fn end_row(&self) -> i32 {
+        // SAFETY: live batch.
+        unsafe { flats_batch_end_row(self.0) }
+    }
+    fn len(&self) -> usize {
+        // SAFETY: live batch.
+        unsafe { flats_batch_len(self.0) }
+    }
+    fn commit(&self) -> (i32, usize) {
+        let mut n = usize::MAX;
+        // SAFETY: live batch, valid out-pointer.
+        let rc = unsafe { flats_batch_commit(self.0, &mut n) };
+        (rc, n)
+    }
+    fn row(&self, id: &str, year: i64) {
+        assert_eq!(self.vector(&[year as f32, 1.0, 0.0]), FLATS_OK);
+        assert_eq!(self.text("id", id), FLATS_OK);
+        assert_eq!(self.int("year", year), FLATS_OK);
+        assert_eq!(self.float("score", year as f64 / 2.0), FLATS_OK);
+        assert_eq!(self.end_row(), FLATS_OK, "{:?}", last_error());
+    }
+}
+
+impl Drop for Batch {
+    fn drop(&mut self) {
+        // SAFETY: released exactly once.
+        unsafe { flats_batch_free(self.0) };
+    }
+}
+
+#[test]
+fn a_batch_inserts_every_row_as_one_statement() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let b = Batch::new(&db, "docs").unwrap();
+    for i in 0..100 {
+        b.row(&format!("d{i}"), i);
+    }
+    assert_eq!(b.len(), 100);
+    assert_eq!(b.commit(), (FLATS_OK, 100));
+    assert_eq!(b.len(), 0, "emptied");
+    let res = db.query("SELECT id, year, score, vector FROM docs WHERE year = 7;");
+    assert_eq!(
+        res.rows(),
+        vec![vec![
+            Cell::Text("d7".into()),
+            Cell::Int(7),
+            Cell::Float(3.5),
+            Cell::Vector(vec![7.0, 1.0, 0.0]),
+        ]]
+    );
+    // Reusable after a commit.
+    b.row("again", 1000);
+    assert_eq!(b.commit(), (FLATS_OK, 1));
+    assert_eq!(db.query("SELECT id FROM docs;").rows().len(), 101);
+}
+
+#[test]
+fn a_batch_checks_each_value_as_it_is_added() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let b = Batch::new(&db, "docs").unwrap();
+    assert_eq!(
+        b.int("nope", 1),
+        FLATS_ERR_INVALID_ARGUMENT,
+        "unknown column"
+    );
+    assert!(last_error().unwrap().contains("nope"));
+    assert_eq!(
+        b.text("year", "x"),
+        FLATS_ERR_INVALID_ARGUMENT,
+        "wrong type"
+    );
+    assert_eq!(
+        b.int("id", 1),
+        FLATS_ERR_INVALID_ARGUMENT,
+        "wrong type for the key"
+    );
+    assert_eq!(
+        b.vector(&[1.0, 2.0]),
+        FLATS_ERR_INVALID_ARGUMENT,
+        "wrong dimension"
+    );
+    assert_eq!(
+        b.float("score", f64::NAN),
+        FLATS_ERR_INVALID_ARGUMENT,
+        "NaN"
+    );
+    assert_eq!(
+        b.vector(&[1.0, f32::INFINITY, 0.0]),
+        FLATS_ERR_INVALID_ARGUMENT,
+        "inf"
+    );
+    // A row missing a column cannot be finished.
+    assert_eq!(b.vector(&[1.0, 0.0, 0.0]), FLATS_OK);
+    assert_eq!(b.text("id", "x"), FLATS_OK);
+    assert_eq!(b.end_row(), FLATS_ERR_INVALID_ARGUMENT);
+    assert!(last_error().unwrap().contains("year"), "{:?}", last_error());
+    assert_eq!(b.len(), 0);
+}
+
+#[test]
+fn a_batch_with_a_duplicate_key_lands_nothing_and_is_emptied() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let b = Batch::new(&db, "docs").unwrap();
+    b.row("a", 1);
+    b.row("b", 2);
+    b.row("a", 3);
+    let (rc, n) = b.commit();
+    assert_eq!(rc, FLATS_ERR_ENGINE);
+    assert_eq!(n, 0);
+    assert!(last_error().unwrap().contains("'a'"));
+    assert_eq!(b.len(), 0, "emptied on failure too");
+    assert!(db.query("SELECT id FROM docs;").rows().is_empty());
+}
+
+#[test]
+fn a_batch_for_an_unknown_collection_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    assert_eq!(Batch::new(&db, "missing").err(), Some(FLATS_ERR_QUERY));
+}
+
+#[test]
+fn backup_then_open_the_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let copy = dst.path().join("copy");
+    {
+        let db = Db::open(dir.path());
+        db.exec(SCHEMA);
+        db.exec("INSERT INTO docs (id, vector, year, score) VALUES ('a', [1, 0, 0], 1, 1.0);");
+        let dest = c(copy.to_str().unwrap());
+        // SAFETY: live handle, valid string.
+        assert_eq!(unsafe { flats_backup(db.0, dest.as_ptr()) }, FLATS_OK);
+        // A second backup into the now non-empty directory is refused.
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { flats_backup(db.0, dest.as_ptr()) },
+            FLATS_ERR_ENGINE
+        );
+    }
+    let restored = Db::open(&copy);
+    assert_eq!(restored.query("SELECT id FROM docs;").rows().len(), 1);
+}
+
+#[test]
+fn close_checkpoints_and_reports_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let raw = db.0;
+    std::mem::forget(db);
+    // SAFETY: released exactly once (the wrapper was forgotten).
+    assert_eq!(unsafe { flats_close(raw) }, FLATS_OK);
+    let db = Db::open(dir.path());
+    assert_eq!(db.query("SELECT id FROM docs;").rows().len(), 0);
+}
+
+#[test]
+fn a_batch_reports_each_columns_type() {
+    // Dynamic languages with one number type (JavaScript) ask the schema
+    // which setter a value needs.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let b = Batch::new(&db, "docs").unwrap();
+    let ty = |col: &str| {
+        let col = c(col);
+        // SAFETY: live batch, valid string.
+        unsafe { flats_batch_column_type(b.0, col.as_ptr()) }
+    };
+    assert_eq!(ty("id"), FLATS_TYPE_TEXT);
+    assert_eq!(ty("year"), FLATS_TYPE_INT);
+    assert_eq!(ty("score"), FLATS_TYPE_FLOAT);
+    assert_eq!(ty("vector"), FLATS_TYPE_VECTOR);
+    assert_eq!(ty("nope"), 0);
+    // SAFETY: NULLs are part of the contract.
+    assert_eq!(
+        unsafe { flats_batch_column_type(ptr::null(), ptr::null()) },
+        0
+    );
+}
+
+// -- parameters -----------------------------------------------------------
+
+fn p_int(v: i64) -> flats_param {
+    flats_param {
+        kind: FLATS_TYPE_INT,
+        int_value: v,
+        ..flats_param::default()
+    }
+}
+
+fn p_float(v: f64) -> flats_param {
+    flats_param {
+        kind: FLATS_TYPE_FLOAT,
+        float_value: v,
+        ..flats_param::default()
+    }
+}
+
+fn p_text(s: &str) -> flats_param {
+    flats_param {
+        kind: FLATS_TYPE_TEXT,
+        text: s.as_ptr().cast(),
+        text_len: s.len(),
+        ..flats_param::default()
+    }
+}
+
+fn p_vec(v: &[f32]) -> flats_param {
+    flats_param {
+        kind: FLATS_TYPE_VECTOR,
+        vector: v.as_ptr(),
+        vector_len: v.len(),
+        ..flats_param::default()
+    }
+}
+
+impl Db {
+    fn exec_params(&self, sql: &str, params: &[flats_param]) -> (i32, Option<Res>) {
+        let sql = c(sql);
+        let mut res = ptr::null_mut();
+        // SAFETY: live handle, valid string, `params` valid for its length,
+        // and every pointer inside a param outlives the call.
+        let rc = unsafe {
+            flats_execute_params(
+                self.0,
+                sql.as_ptr(),
+                params.as_ptr(),
+                params.len(),
+                &mut res,
+            )
+        };
+        (rc, (rc == FLATS_OK).then_some(Res(res)))
+    }
+}
+
+#[test]
+fn parameters_fill_placeholders_as_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let payload = "x'); DROP COLLECTION docs; --";
+    let v = [1.0f32, 1e-7, 0.0];
+    let (rc, _) = db.exec_params(
+        "INSERT INTO docs (id, vector, year, score) VALUES (?, ?, ?, ?);",
+        &[p_text(payload), p_vec(&v), p_int(2024), p_float(0.25)],
+    );
+    assert_eq!(rc, FLATS_OK, "{:?}", last_error());
+    let (rc, res) = db.exec_params(
+        "SEARCH TOP 1 NEAREST TO ? FROM docs WHERE id = ? RETURNING id, year, score, vector;",
+        &[p_vec(&[1.0, 0.0, 0.0]), p_text(payload)],
+    );
+    assert_eq!(rc, FLATS_OK, "{:?}", last_error());
+    let rows = res.unwrap().rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Cell::Text(payload.into()));
+    assert_eq!(rows[0][1], Cell::Int(2024));
+    assert_eq!(rows[0][3], Cell::Vector(v.to_vec()));
+}
+
+#[test]
+fn text_parameters_take_an_explicit_length() {
+    // Not NUL-terminated, and may contain a NUL.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let raw = b"a\0b-and-more";
+    let p = flats_param {
+        kind: FLATS_TYPE_TEXT,
+        text: raw.as_ptr().cast(),
+        text_len: 3,
+        ..flats_param::default()
+    };
+    let (rc, _) = db.exec_params(
+        "INSERT INTO docs (id, vector, year, score) VALUES (?, [1, 0, 0], 1, 1.0);",
+        &[p],
+    );
+    assert_eq!(rc, FLATS_OK, "{:?}", last_error());
+    let res = db.query("SELECT id FROM docs;");
+    assert_eq!(res.rows(), vec![vec![Cell::Text("a\0b".into())]]);
+}
+
+#[test]
+fn bad_parameters_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let sql = "SELECT id FROM docs WHERE year = ?;";
+    let bad_kind = flats_param {
+        kind: 99,
+        ..flats_param::default()
+    };
+    assert_eq!(
+        db.exec_params(sql, &[bad_kind]).0,
+        FLATS_ERR_INVALID_ARGUMENT
+    );
+    let null_text = flats_param {
+        kind: FLATS_TYPE_TEXT,
+        text_len: 4,
+        ..flats_param::default()
+    };
+    assert_eq!(
+        db.exec_params(sql, &[null_text]).0,
+        FLATS_ERR_INVALID_ARGUMENT
+    );
+    let bad_utf8 = [0xFFu8, 0xFE];
+    let p = flats_param {
+        kind: FLATS_TYPE_TEXT,
+        text: bad_utf8.as_ptr().cast(),
+        text_len: 2,
+        ..flats_param::default()
+    };
+    assert_eq!(db.exec_params(sql, &[p]).0, FLATS_ERR_INVALID_ARGUMENT);
+    assert!(last_error().unwrap().contains("UTF-8"));
+    // Count and value checks are the engine's, reported as query errors.
+    assert_eq!(db.exec_params(sql, &[]).0, FLATS_ERR_QUERY);
+    assert_eq!(
+        db.exec_params(sql, &[p_int(1), p_int(2)]).0,
+        FLATS_ERR_QUERY
+    );
+    assert_eq!(db.exec_params(sql, &[p_float(f64::NAN)]).0, FLATS_ERR_QUERY);
+    // NULL params with a nonzero count.
+    let s = c(sql);
+    // SAFETY: NULL with n > 0 is the case under test.
+    let rc = unsafe { flats_execute_params(db.0, s.as_ptr(), ptr::null(), 1, ptr::null_mut()) };
+    assert_eq!(rc, FLATS_ERR_INVALID_ARGUMENT);
+    // NULL params with n == 0 is simply no parameters.
+    let s = c("SELECT id FROM docs;");
+    // SAFETY: as above.
+    let rc = unsafe { flats_execute_params(db.0, s.as_ptr(), ptr::null(), 0, ptr::null_mut()) };
+    assert_eq!(rc, FLATS_OK);
+}
+
+#[test]
+fn a_second_open_of_the_same_directory_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let _first = Db::open(dir.path());
+    let path = c(dir.path().to_str().unwrap());
+    let mut second = ptr::null_mut();
+    // SAFETY: valid string and out-pointer.
+    let rc = unsafe { flats_open(path.as_ptr(), &mut second) };
+    assert_eq!(rc, FLATS_ERR_ENGINE);
+    assert!(second.is_null());
+    assert!(
+        last_error().unwrap().contains("locked"),
+        "{:?}",
+        last_error()
+    );
+}
+
+// -- cursors ----------------------------------------------------------------
+
+struct Cur(*mut flats_cursor);
+
+impl Cur {
+    fn next(&self, max: usize) -> (i32, Option<Res>) {
+        let mut res = ptr::null_mut();
+        // SAFETY: live cursor, valid out-pointer.
+        let rc = unsafe { flats_cursor_next(self.0, max, &mut res) };
+        (rc, (rc == FLATS_OK).then_some(Res(res)))
+    }
+}
+
+impl Drop for Cur {
+    fn drop(&mut self) {
+        // SAFETY: released exactly once.
+        unsafe { flats_cursor_free(self.0) };
+    }
+}
+
+fn query(db: *mut flats_db, sql: &str, params: &[flats_param]) -> Result<Cur, i32> {
+    let sql = c(sql);
+    let mut cur = ptr::null_mut();
+    // SAFETY: live handle, valid string, params valid for their length.
+    match unsafe { flats_query(db, sql.as_ptr(), params.as_ptr(), params.len(), &mut cur) } {
+        FLATS_OK => Ok(Cur(cur)),
+        rc => Err(rc),
+    }
+}
+
+fn load(db: &Db, n: usize) {
+    let b = Batch::new(db, "docs").unwrap();
+    for i in 0..n {
+        b.row(&format!("d{i:04}"), i as i64);
+    }
+    assert_eq!(b.commit().0, FLATS_OK);
+}
+
+#[test]
+fn a_cursor_streams_every_row_in_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    load(&db, 100);
+    let all = db.query("SELECT id FROM docs;").rows();
+    let cur = query(db.0, "SELECT id FROM docs;", &[]).unwrap();
+    let mut streamed = Vec::new();
+    let mut chunks = 0;
+    loop {
+        let (rc, res) = cur.next(7);
+        assert_eq!(rc, FLATS_OK);
+        let res = res.unwrap();
+        assert_eq!(res.columns(), vec!["id"], "every chunk carries the labels");
+        let rows = res.rows();
+        assert!(rows.len() <= 7);
+        if rows.is_empty() {
+            break;
+        }
+        chunks += 1;
+        streamed.extend(rows);
+    }
+    assert_eq!(streamed, all);
+    assert_eq!(chunks, 15);
+    // Exhausted stays exhausted.
+    assert_eq!(cur.next(7).1.unwrap().rows().len(), 0);
+}
+
+#[test]
+fn a_cursor_takes_parameters_and_a_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    load(&db, 50);
+    let cur = query(
+        db.0,
+        "SELECT id FROM docs WHERE year >= ? LIMIT ?;",
+        &[p_int(10), p_int(5)],
+    )
+    .unwrap();
+    let (_, res) = cur.next(100);
+    assert_eq!(res.unwrap().rows().len(), 5);
+}
+
+#[test]
+fn a_cursor_outlives_its_database_handle() {
+    // Like a result, a cursor holds its own handles on the stores.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    load(&db, 20);
+    let cur = query(db.0, "SELECT id FROM docs;", &[]).unwrap();
+    let raw = db.0;
+    std::mem::forget(db);
+    // SAFETY: released exactly once (the wrapper was forgotten).
+    assert_eq!(unsafe { flats_close(raw) }, FLATS_OK);
+    let (rc, res) = cur.next(100);
+    assert_eq!(rc, FLATS_OK);
+    assert_eq!(res.unwrap().rows().len(), 20);
+}
+
+#[test]
+fn a_cursor_over_a_write_is_already_exhausted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let cur = query(
+        db.0,
+        "INSERT INTO docs (id, vector, year, score) VALUES ('a', [1, 0, 0], 1, 1.0);",
+        &[],
+    )
+    .unwrap();
+    assert!(cur.next(10).1.unwrap().rows().is_empty());
+    assert_eq!(
+        db.query("SELECT id FROM docs;").rows().len(),
+        1,
+        "the write ran"
+    );
+}
+
+#[test]
+fn cursor_errors_are_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    assert_eq!(
+        query(db.0, "SELECT nope FROM docs;", &[]).err(),
+        Some(FLATS_ERR_QUERY)
+    );
+    let cur = query(db.0, "SELECT id FROM docs;", &[]).unwrap();
+    assert_eq!(
+        cur.next(0).0,
+        FLATS_ERR_INVALID_ARGUMENT,
+        "max_rows must be positive"
+    );
+    // SAFETY: NULLs are part of the contract.
+    unsafe {
+        assert_eq!(
+            flats_cursor_next(ptr::null_mut(), 1, ptr::null_mut()),
+            FLATS_ERR_INVALID_ARGUMENT
+        );
+        flats_cursor_free(ptr::null_mut());
+    }
+}
+
+// -- handle lifetimes ----------------------------------------------------------
+
+#[test]
+fn a_batch_outliving_its_database_reports_an_error_instead_of_crashing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let b = Batch::new(&db, "docs").unwrap();
+    b.row("a", 1);
+    let raw = db.0;
+    std::mem::forget(db);
+    // SAFETY: released exactly once (the wrapper was forgotten).
+    assert_eq!(unsafe { flats_close(raw) }, FLATS_OK);
+    // Every batch call after its database closed is a clean refusal.
+    let (rc, n) = b.commit();
+    assert_eq!(rc, FLATS_ERR_INVALID_ARGUMENT);
+    assert_eq!(n, 0);
+    assert!(
+        last_error().unwrap().contains("closed"),
+        "{:?}",
+        last_error()
+    );
+    // Building rows needs no database, and still works; freeing is fine.
+    b.row("b", 2);
+    assert_eq!(b.commit().0, FLATS_ERR_INVALID_ARGUMENT);
+}
+
+#[test]
+fn a_batch_keeps_working_while_other_threads_use_the_same_database() {
+    struct Shared(*mut flats_db);
+    // SAFETY: a flats_db may be shared across threads (header).
+    unsafe impl Sync for Shared {}
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let shared = Shared(db.0);
+    std::thread::scope(|s| {
+        for t in 0..4 {
+            let shared = &shared;
+            s.spawn(move || {
+                let name = c("docs");
+                let mut b = ptr::null_mut();
+                // SAFETY: live shared handle; this thread's own batch.
+                unsafe {
+                    assert_eq!(flats_batch_new(shared.0, name.as_ptr(), &mut b), FLATS_OK);
+                    let batch = Batch(b);
+                    for i in 0..50 {
+                        batch.row(&format!("t{t}-{i}"), i);
+                    }
+                    assert_eq!(batch.commit(), (FLATS_OK, 50));
+                }
+            });
+        }
+    });
+    assert_eq!(db.query("SELECT id FROM docs;").rows().len(), 200);
+}
+
+// -- limits and interruption ---------------------------------------------------
+
+#[test]
+fn a_timeout_stops_a_search_with_its_own_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    load(&db, 10);
+    // SAFETY: live handle.
+    unsafe { assert_eq!(flats_set_statement_timeout_ms(db.0, 0), FLATS_OK) };
+    let (rc, _) = db.exec_params(
+        "SEARCH TOP 1 NEAREST TO ? FROM docs;",
+        &[p_vec(&[1.0, 0.0, 0.0])],
+    );
+    assert_eq!(rc, FLATS_ERR_INTERRUPTED);
+    assert!(
+        last_error().unwrap().contains("timeout"),
+        "{:?}",
+        last_error()
+    );
+    // Negative disables it again.
+    // SAFETY: live handle.
+    unsafe { assert_eq!(flats_set_statement_timeout_ms(db.0, -1), FLATS_OK) };
+    assert_eq!(
+        db.exec_params(
+            "SEARCH TOP 1 NEAREST TO ? FROM docs;",
+            &[p_vec(&[1.0, 0.0, 0.0])]
+        )
+        .0,
+        FLATS_OK
+    );
+}
+
+#[test]
+fn interrupt_stops_a_running_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    load(&db, 50);
+    let cur = query(db.0, "SELECT id FROM docs;", &[]).unwrap();
+    assert_eq!(cur.next(1).0, FLATS_OK);
+    // SAFETY: live handle.
+    unsafe { assert_eq!(flats_interrupt(db.0), FLATS_OK) };
+    assert_eq!(cur.next(10).0, FLATS_ERR_INTERRUPTED);
+    // New statements are unaffected.
+    assert_eq!(db.query("SELECT id FROM docs;").rows().len(), 50);
+    // SAFETY: NULL is a refusal.
+    unsafe { assert_eq!(flats_interrupt(ptr::null_mut()), FLATS_ERR_INVALID_ARGUMENT) };
+}
+
+#[test]
+fn an_overly_complex_predicate_is_a_query_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path());
+    db.exec(SCHEMA);
+    let deep = format!(
+        "SELECT id FROM docs WHERE {}year = 1{};",
+        "(".repeat(10_000),
+        ")".repeat(10_000)
+    );
+    assert_eq!(db.exec(&deep), FLATS_ERR_QUERY);
+    assert!(last_error().unwrap().contains("too complex"));
+}

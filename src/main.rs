@@ -84,17 +84,24 @@
 //!
 //! Statements end with `;` and may span lines. `.help` lists the meta-commands.
 
+// The platform bindings below hold `unsafe`; be explicit about its scopes
+// exactly as the library is (CLAUDE.md §5).
+#![forbid(unsafe_op_in_unsafe_fn)]
+
 mod editor;
+// The terminal and signal bindings only the shell needs. They stay in
+// `src/platform` — one of the two `unsafe` quarantines (CLAUDE.md §5) — but are
+// compiled into this binary rather than the library, which uses neither.
+#[path = "platform/mod.rs"]
+mod platform;
 
 use std::io::{self, BufRead, ErrorKind, IsTerminal, Lines, StdinLock, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use flats::engine::{Db, DbOptions};
-use flats::metadata::common::{CollectionConfig, ColumnType};
-use flats::platform::signal;
-use flats::platform::tty::RawMode;
-use flats::vm::exec::RegValue;
+use flats::{CollectionConfig, ColumnType, Db, DbOptions, RegValue};
+use platform::signal;
+use platform::tty::RawMode;
 
 use editor::{Editor, Input, Keys};
 
@@ -509,6 +516,8 @@ statements end with `;` and may span several lines
   UPDATE docs SET author = 'bob' WHERE doc_id = 'd1';
   UPDATE docs SET vector = [0.4, 0.5, 0.6] WHERE doc_id = 'd1';
   DELETE FROM docs WHERE doc_id = 'd1';
+  INSERT INTO docs (doc_id, vector, author) VALUES ('d2', [1e-5, 0, 1], 'a'), ('d3', [0, 1, 0], 'b');
+  DROP COLLECTION docs;
 
 every collection declares one PRIMARY KEY column (TEXT or INT); it is how
 UPDATE and DELETE name a row, and SET vector requires it
@@ -909,7 +918,9 @@ mod tests {
         let mut table = Table::new(labels.iter().map(|s| s.to_string()).collect());
         for row in rows {
             let cells = row.iter().map(|s| s.to_string()).collect();
-            table.push(&mut out, cells).expect("a Vec never fails to write");
+            table
+                .push(&mut out, cells)
+                .expect("a Vec never fails to write");
         }
         table.finish(&mut out).expect("a Vec never fails to write");
         String::from_utf8(out).expect("output is utf-8")
@@ -1227,7 +1238,10 @@ mod tests {
                 .expect("a Vec never fails to write");
         }
         table
-            .push(&mut out, vec!["a much wider value".to_string(), "z".to_string()])
+            .push(
+                &mut out,
+                vec!["a much wider value".to_string(), "z".to_string()],
+            )
             .expect("a Vec never fails to write");
         table.finish(&mut out).expect("a Vec never fails to write");
 

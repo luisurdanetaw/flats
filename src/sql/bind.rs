@@ -40,8 +40,8 @@
 use std::fmt;
 
 use crate::sql::ast::{
-    ColumnType, CompareOp, CreateStmt, DeleteStmt, Expr, InsertStmt, Literal, Projection,
-    SearchStmt, SelectStmt, Statement, UpdateStmt,
+    ColumnType, CompareOp, CreateStmt, DeleteStmt, Expr, InsertManyStmt, InsertStmt, Literal,
+    Projection, SearchStmt, SelectStmt, Statement, UpdateStmt,
 };
 
 // ---------------------------------------------------------------------------
@@ -193,6 +193,10 @@ pub enum BoundStatement {
     Select(BoundSelect),
     /// A resolved `INSERT`.
     Insert(BoundInsert),
+    /// A resolved multi-row `INSERT`.
+    InsertMany(BoundInsertMany),
+    /// A resolved `UPSERT`: every row checked exactly as an INSERT's.
+    Upsert(BoundInsertMany),
     /// A resolved `CREATE COLLECTION`.
     CreateCollection(BoundCreate),
     /// A resolved `SEARCH`.
@@ -201,6 +205,15 @@ pub enum BoundStatement {
     Delete(BoundDelete),
     /// A resolved `UPDATE`.
     Update(BoundUpdate),
+    /// A resolved `DROP COLLECTION`.
+    DropCollection(BoundDrop),
+}
+
+/// A resolved `DROP COLLECTION` — the collection confirmed to exist.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundDrop {
+    /// The collection to drop.
+    pub name: String,
 }
 
 /// A resolved `UPDATE collection SET assignments WHERE filter`.
@@ -272,6 +285,18 @@ pub struct BoundInsert {
     /// `(cols) VALUES (...)` list may be in any order; the three stores want
     /// canonical order).
     pub row: Vec<TypedValue>,
+}
+
+/// A resolved multi-row `INSERT` — every row checked exactly as a one-row
+/// `INSERT`'s is, and each reordered to schema order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundInsertMany {
+    /// Target collection (confirmed to exist).
+    pub collection: String,
+    /// Its resolved schema.
+    pub schema: Schema,
+    /// One schema-ordered row per source row, in source order.
+    pub rows: Vec<Vec<TypedValue>>,
 }
 
 /// One resolved item of a `SEARCH`'s `RETURNING` list.
@@ -622,12 +647,23 @@ pub fn analyze(stmt: Statement, catalog: &impl Catalog) -> Result<BoundStatement
     match stmt {
         Statement::Select(s) => bind_select(s, catalog).map(BoundStatement::Select),
         Statement::Insert(i) => bind_insert(i, catalog).map(BoundStatement::Insert),
+        Statement::InsertMany(m) => bind_insert_many(m, catalog).map(BoundStatement::InsertMany),
+        Statement::Upsert(m) => bind_insert_many(m, catalog).map(BoundStatement::Upsert),
         Statement::CreateCollection(c) => {
             bind_create(c, catalog).map(BoundStatement::CreateCollection)
         }
         Statement::Search(s) => bind_search(s, catalog).map(BoundStatement::Search),
         Statement::Delete(d) => bind_delete(d, catalog).map(BoundStatement::Delete),
         Statement::Update(u) => bind_update(u, catalog).map(BoundStatement::Update),
+        // The query layer unwraps a window before binding and applies it to
+        // the result stream; binding sees the statement inside it.
+        Statement::Limited { statement, .. } => analyze(*statement, catalog),
+        Statement::DropCollection(d) => {
+            if catalog.get_collection(&d.name).is_none() {
+                return Err(BindError::CollectionNotFound(d.name));
+            }
+            Ok(BoundStatement::DropCollection(BoundDrop { name: d.name }))
+        }
     }
 }
 
@@ -982,6 +1018,44 @@ fn bind_insert(stmt: InsertStmt, catalog: &impl Catalog) -> Result<BoundInsert, 
     })
 }
 
+/// `INSERT … VALUES (…), (…), …`. Each row goes through [`bind_insert`] —
+/// the same arity, column, duplicate, type and coverage checks a one-row
+/// INSERT gets — so the two spellings accept exactly the same rows. The first
+/// row to fail fails the statement; nothing is half-bound.
+fn bind_insert_many(
+    stmt: InsertManyStmt,
+    catalog: &impl Catalog,
+) -> Result<BoundInsertMany, BindError> {
+    let mut schema = None;
+    let mut rows = Vec::with_capacity(stmt.rows.len());
+    for values in stmt.rows {
+        let bound = bind_insert(
+            InsertStmt {
+                collection: stmt.collection.clone(),
+                columns: stmt.columns.clone(),
+                values,
+            },
+            catalog,
+        )?;
+        schema.get_or_insert(bound.schema);
+        rows.push(bound.row);
+    }
+    // The parser only builds an InsertMany from two or more rows, so the loop
+    // ran and `schema` is set; resolved again rather than unwrapped, because
+    // library code does not panic on an invariant it can state.
+    let schema = match schema {
+        Some(schema) => schema,
+        None => catalog
+            .get_collection(&stmt.collection)
+            .ok_or_else(|| BindError::CollectionNotFound(stmt.collection.clone()))?,
+    };
+    Ok(BoundInsertMany {
+        collection: stmt.collection,
+        schema,
+        rows,
+    })
+}
+
 /// `CREATE COLLECTION name (cols) WITH (opts)`. Checks the name is free, builds
 /// the resolved schema, enforces exactly-one-vector, and reads the capacity.
 fn bind_create(stmt: CreateStmt, catalog: &impl Catalog) -> Result<BoundCreate, BindError> {
@@ -1190,7 +1264,14 @@ fn bind_comparison(
     // Pseudo-columns are checked FIRST, exactly as in a projection, so `id`
     // means the same thing everywhere regardless of what a collection calls its
     // own columns.
-    if let Some(pseudo) = Pseudo::from_name(&name) {
+    //
+    // Except when the collection has a REAL column of that name: no
+    // pseudo-column can be filtered on (they are computed by the ranking), so
+    // in a predicate the name can only mean the column — a `score` rating,
+    // say. (In a SEARCH's RETURNING, `score` still means the similarity.)
+    if let Some(pseudo) = Pseudo::from_name(&name)
+        && schema.column(&name).is_none()
+    {
         return bind_pseudo_comparison(pseudo, op, literal);
     }
 

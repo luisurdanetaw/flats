@@ -1,0 +1,6 @@
+# The Python package bundles the C library (libflats_c.so) next to its
+# modules, so a wheel is PLATFORM-specific. Build one with
+# sdk/python/build_wheel.sh, which compiles the library first.
+[build-system]
+requires = ["setuptools>=59", "wheel"]
+build-backend = "setuptools.build_meta"

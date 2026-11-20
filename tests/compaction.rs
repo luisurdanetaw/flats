@@ -88,7 +88,11 @@ fn vector_sql(v: &[f32]) -> String {
 }
 
 fn verify(db: &Db, model: &Model, step: u64, op: &str) {
-    assert_eq!(rows(db), model.rows, "rows diverged at step {step} after {op}");
+    assert_eq!(
+        rows(db),
+        model.rows,
+        "rows diverged at step {step} after {op}"
+    );
     assert_eq!(
         db.reader(0).expect("docs").len() as u64,
         model.allocated,
@@ -107,8 +111,10 @@ fn run(seed: u64, iters: u64) {
              WITH (capacity = {CAPACITY});"
         ))
         .expect("create docs");
-        db.execute("CREATE COLLECTION idle (id INT PRIMARY KEY, vector VECTOR(2)) WITH (capacity = 4);")
-            .expect("create idle");
+        db.execute(
+            "CREATE COLLECTION idle (id INT PRIMARY KEY, vector VECTOR(2)) WITH (capacity = 4);",
+        )
+        .expect("create idle");
     }
     let mut model = Model {
         rows: BTreeMap::new(),
@@ -135,7 +141,10 @@ fn run(seed: u64, iters: u64) {
                 model.rows.insert(key, (n, v));
                 model.allocated += 1;
             } else {
-                assert!(res.is_err(), "insert past capacity succeeded at step {step}");
+                assert!(
+                    res.is_err(),
+                    "insert past capacity succeeded at step {step}"
+                );
             }
         } else if roll < 43 {
             op = "duplicate insert";
@@ -162,14 +171,21 @@ fn run(seed: u64, iters: u64) {
                     model.rows.get_mut(&key).unwrap().0 = n;
                     model.allocated += 1;
                 } else {
-                    assert!(res.is_err(), "update past capacity succeeded at step {step}");
+                    assert!(
+                        res.is_err(),
+                        "update past capacity succeeded at step {step}"
+                    );
                 }
             }
         } else if roll < 86 {
             op = "compact";
             let did = d.compact_now(0).expect("compact");
             let live = model.rows.len() as u64;
-            assert_eq!(did, model.allocated > live, "compact verdict at step {step}");
+            assert_eq!(
+                did,
+                model.allocated > live,
+                "compact verdict at step {step}"
+            );
             model.allocated = live;
         } else if roll < 91 {
             op = "checkpoint";
