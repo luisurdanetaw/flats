@@ -2745,6 +2745,12 @@ impl Db {
             .ok_or_else(|| Error::UnknownCollectionName { name: name.into() })
     }
 
+    /// How many live rows `collection` holds right now (as of one snapshot).
+    pub fn row_count(&self, collection: u32) -> Result<u64> {
+        let coll = self.collection(collection)?;
+        Ok(coll.live.resolve().len())
+    }
+
     /// Every registered collection's config, sorted by id — exactly what the
     /// persisted catalog holds.
     pub fn collections(&self) -> Vec<CollectionConfig> {

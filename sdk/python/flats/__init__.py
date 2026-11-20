@@ -191,6 +191,9 @@ def _declare(lib):
         "flats_batch_end_row": (c_int, [batch_p]),
         "flats_batch_len": (c_size, [batch_p]),
         "flats_batch_commit": (c_int, [batch_p, size_p]),
+        "flats_batch_upsert": (c_int, [batch_p, size_p]),
+        "flats_collections": (c_int, [db_p, ctypes.POINTER(res_p)]),
+        "flats_describe": (c_int, [db_p, c_char_p, ctypes.POINTER(res_p)]),
         "flats_batch_free": (None, [batch_p]),
     }
     for name, (restype, argtypes) in sigs.items():
@@ -566,6 +569,17 @@ class Database:
         or ``array.array``); every other column takes ``int``, ``float`` or
         ``str``. Rows go in batches of :attr:`BATCH_ROWS`, each all-or-nothing.
         """
+        return self._write_rows(collection, rows, _lib.flats_batch_commit)
+
+    def upsert(self, collection, rows):
+        """Like :meth:`insert`, but a row whose primary key a live row already
+        holds REPLACES that row — every column and the vector — instead of
+        being refused. Returns the count. Each batch of :attr:`BATCH_ROWS` is
+        all-or-nothing; a key repeated within one batch is refused.
+        """
+        return self._write_rows(collection, rows, _lib.flats_batch_upsert)
+
+    def _write_rows(self, collection, rows, commit):
         _ident(collection, "collection")
         with self._use() as db:
             batch = ctypes.POINTER(_Batch)()
@@ -575,12 +589,58 @@ class Database:
                 for row in rows:
                     self._add_row(batch, row)
                     if _lib.flats_batch_len(batch) >= self.BATCH_ROWS:
-                        total += self._commit(batch)
+                        total += self._commit(batch, commit)
                 if _lib.flats_batch_len(batch):
-                    total += self._commit(batch)
+                    total += self._commit(batch, commit)
             finally:
                 _lib.flats_batch_free(batch)
         return total
+
+    def get(self, collection, key):
+        """The row whose primary key is ``key``, as a dict with every column
+        (the vector included), or ``None`` if there is none."""
+        info = self.describe(collection)
+        cols = ", ".join(c["name"] for c in info["columns"])
+        res = self.execute(
+            f"SELECT {cols} FROM {collection} WHERE {info['primary_key']} = ?;", [key]
+        ).dicts()
+        return res[0] if res else None
+
+    def delete(self, collection, key):
+        """Delete the row whose primary key is ``key``, if there is one."""
+        pk = self.describe(collection)["primary_key"]
+        self.execute(f"DELETE FROM {collection} WHERE {pk} = ?;", [key])
+
+    def collections(self):
+        """Every collection, as dicts: ``name``, ``dimension``, ``capacity``,
+        ``rows`` (live rows now) and ``primary_key`` (the key column)."""
+        res = ctypes.POINTER(_Result)()
+        with self._use() as db:
+            _check(_lib.flats_collections(db, ctypes.byref(res)))
+        try:
+            return _collect(res).dicts()
+        finally:
+            _lib.flats_result_free(res)
+
+    def describe(self, collection):
+        """One collection's shape: what :meth:`collections` says about it,
+        plus ``columns`` — each column's ``name``, ``type`` (``"INT"``,
+        ``"FLOAT"``, ``"TEXT"`` or ``"VECTOR(n)"``) and ``primary_key``, in
+        declaration order. Raises :class:`QueryError` for an unknown name."""
+        _ident(collection, "collection")
+        res = ctypes.POINTER(_Result)()
+        with self._use() as db:
+            _check(_lib.flats_describe(db, _utf8(collection, "collection"), ctypes.byref(res)))
+        try:
+            columns = [
+                {"name": c["column"], "type": c["type"], "primary_key": bool(c["primary_key"])}
+                for c in _collect(res).dicts()
+            ]
+        finally:
+            _lib.flats_result_free(res)
+        info = next(c for c in self.collections() if c["name"] == collection)
+        info["columns"] = columns
+        return info
 
     def interrupt(self):
         """Stop every statement running on this database right now — on any
@@ -632,7 +692,7 @@ class Database:
         _check(lib.flats_batch_end_row(batch))
 
     @staticmethod
-    def _commit(batch):
+    def _commit(batch, commit=None):
         n = ctypes.c_size_t()
-        _check(_lib.flats_batch_commit(batch, ctypes.byref(n)))
+        _check((commit or _lib.flats_batch_commit)(batch, ctypes.byref(n)))
         return n.value

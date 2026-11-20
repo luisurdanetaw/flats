@@ -97,6 +97,15 @@ int flats_open(const char *path, flats_db **out);
  * same as flats_open. */
 int flats_open_salvage(const char *path, flats_db **out);
 
+/* One row per collection: name (TEXT), dimension (INT), capacity (INT), rows
+ * (INT, live rows now), primary_key (TEXT, the key column's name). */
+int flats_collections(flats_db *db, flats_result **out);
+
+/* One row per column of `collection`, in declaration order: column (TEXT),
+ * type (TEXT: "INT", "FLOAT", "TEXT" or "VECTOR(n)"), primary_key (INT, 1
+ * or 0). An unknown collection is FLATS_ERR_QUERY. */
+int flats_describe(flats_db *db, const char *collection, flats_result **out);
+
 /* Checkpoint and close. Returns the checkpoint's status; the handle is
  * released either way. NULL is a no-op returning FLATS_OK. */
 int flats_close(flats_db *db);
@@ -251,6 +260,10 @@ size_t flats_batch_len(const flats_batch *b);
 /* Insert every finished row as one statement. *inserted (if not NULL)
  * receives the count. The batch is emptied on success AND on failure. */
 int flats_batch_commit(flats_batch *b, size_t *inserted);
+/* flats_batch_commit as an UPSERT: each row is inserted, or replaces the live
+ * row holding its primary key (every value and the vector). One statement:
+ * every row or none. A key repeated within the batch is refused. */
+int flats_batch_upsert(flats_batch *b, size_t *written);
 void flats_batch_free(flats_batch *b);
 
 #ifdef __cplusplus

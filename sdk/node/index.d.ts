@@ -37,9 +37,28 @@ export interface OpenOptions {
   salvage?: boolean;
 }
 
+export interface CollectionInfo {
+  name: string;
+  dimension: number;
+  capacity: number;
+  /** Live rows when asked. */
+  rows: number;
+  primaryKey: string;
+}
+
+export interface CollectionDescription extends CollectionInfo {
+  /** In declaration order. `type` is "INT", "FLOAT", "TEXT" or "VECTOR(n)". */
+  columns: { name: string; type: string; primaryKey: boolean }[];
+}
+
 export class Database {
   constructor(path: string, options?: OpenOptions);
   readonly closed: boolean;
+  upsert(collection: string, rows: Iterable<Record<string, unknown>>): number;
+  get(collection: string, key: string | number | bigint): Record<string, Cell> | null;
+  delete(collection: string, key: string | number | bigint): void;
+  collections(): CollectionInfo[];
+  describe(collection: string): CollectionDescription;
   close(): void;
   execute(sql: string, params?: Param[]): Result;
   iterate(sql: string, params?: Param[], options?: { chunkRows?: number }): RowIterator;
@@ -66,6 +85,11 @@ export class AsyncRowIterator implements AsyncIterableIterator<Cell[]> {
 export class AsyncDatabase {
   readonly closed: boolean;
   /** Waits for calls in flight, then checkpoints and closes. */
+  upsert(collection: string, rows: Iterable<Record<string, unknown>>): Promise<number>;
+  get(collection: string, key: string | number | bigint): Promise<Record<string, Cell> | null>;
+  delete(collection: string, key: string | number | bigint): Promise<void>;
+  collections(): Promise<CollectionInfo[]>;
+  describe(collection: string): Promise<CollectionDescription>;
   close(): Promise<void>;
   execute(sql: string, params?: Param[]): Promise<Result>;
   query(sql: string, params?: Param[], options?: { chunkRows?: number }): Promise<AsyncRowIterator>;

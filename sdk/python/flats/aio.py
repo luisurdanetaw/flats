@@ -103,6 +103,21 @@ class AsyncDatabase:
     async def insert(self, collection, rows):
         return await _in_thread(self._db.insert, collection, rows)
 
+    async def upsert(self, collection, rows):
+        return await _in_thread(self._db.upsert, collection, rows)
+
+    async def get(self, collection, key):
+        return await _in_thread(self._db.get, collection, key)
+
+    async def delete(self, collection, key):
+        return await _in_thread(self._db.delete, collection, key)
+
+    async def collections(self):
+        return await _in_thread(self._db.collections)
+
+    async def describe(self, collection):
+        return await _in_thread(self._db.describe, collection)
+
     async def backup(self, dest):
         return await _in_thread(self._db.backup, dest)
 

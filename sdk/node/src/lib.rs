@@ -1126,6 +1126,50 @@ unsafe extern "C" fn js_batch_commit(env: napi_env, info: napi_callback_info) ->
     }
 }
 
+/// `batchUpsert(batch) -> number` — see `flats_batch_upsert`.
+unsafe extern "C" fn js_batch_upsert(env: napi_env, info: napi_callback_info) -> napi_value {
+    // SAFETY: see the section note.
+    unsafe {
+        run(env, || {
+            let [b] = args::<1>(env, info)?;
+            let mut n = 0;
+            check(flats_batch_upsert(batch_of(env, b)?, &mut n))?;
+            number(env, n as f64)
+        })
+    }
+}
+
+/// `collections(handle) -> [columns, rows]` — see `flats_collections`.
+unsafe extern "C" fn js_collections(env: napi_env, info: napi_callback_info) -> napi_value {
+    // SAFETY: see the section note.
+    unsafe {
+        run(env, || {
+            let [h] = args::<1>(env, info)?;
+            let mut res = ptr::null_mut();
+            check(flats_collections(db_of(env, h)?, &mut res))?;
+            let out = result_to_js(env, res);
+            flats_result_free(res);
+            out
+        })
+    }
+}
+
+/// `describe(handle, name) -> [columns, rows]` — see `flats_describe`.
+unsafe extern "C" fn js_describe(env: napi_env, info: napi_callback_info) -> napi_value {
+    // SAFETY: see the section note.
+    unsafe {
+        run(env, || {
+            let [h, name] = args::<2>(env, info)?;
+            let name = get_cstring(env, name, "collection")?;
+            let mut res = ptr::null_mut();
+            check(flats_describe(db_of(env, h)?, name.as_ptr(), &mut res))?;
+            let out = result_to_js(env, res);
+            flats_result_free(res);
+            out
+        })
+    }
+}
+
 /// `batchFree(batch)` — idempotent.
 unsafe extern "C" fn js_batch_free(env: napi_env, info: napi_callback_info) -> napi_value {
     // SAFETY: see the section note.
@@ -1506,6 +1550,27 @@ unsafe extern "C" fn js_batch_commit_async(env: napi_env, info: napi_callback_in
     }
 }
 
+/// `batchUpsertAsync(batch) -> Promise<number>`
+unsafe extern "C" fn js_batch_upsert_async(env: napi_env, info: napi_callback_info) -> napi_value {
+    // SAFETY: see the section note.
+    unsafe {
+        run(env, || {
+            let [b] = args::<1>(env, info)?;
+            let batch = SendPtr(batch_of(env, b)?);
+            spawn(
+                env,
+                &[b],
+                Box::new(move || {
+                    let batch = batch;
+                    let mut n = 0;
+                    check(flats_batch_upsert(batch.0, &mut n))?;
+                    Ok(Done::Count(n))
+                }),
+            )
+        })
+    }
+}
+
 /// `backupAsync(handle, dest) -> Promise<void>`
 unsafe extern "C" fn js_backup_async(env: napi_env, info: napi_callback_info) -> napi_value {
     // SAFETY: see the section note.
@@ -1533,7 +1598,7 @@ unsafe extern "C" fn js_backup_async(env: napi_env, info: napi_callback_info) ->
 /// Called by Node with a live `env` and the module's `exports` object.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn napi_register_module_v1(env: napi_env, exports: napi_value) -> napi_value {
-    let functions: [(&str, napi_callback); 25] = [
+    let functions: [(&str, napi_callback); 29] = [
         ("interrupt", js_interrupt),
         ("setStatementTimeout", js_set_statement_timeout),
         ("openAsync", js_open_async),
@@ -1558,6 +1623,10 @@ pub unsafe extern "C" fn napi_register_module_v1(env: napi_env, exports: napi_va
         ("batchEndRow", js_batch_end_row),
         ("batchLen", js_batch_len),
         ("batchCommit", js_batch_commit),
+        ("batchUpsert", js_batch_upsert),
+        ("batchUpsertAsync", js_batch_upsert_async),
+        ("collections", js_collections),
+        ("describe", js_describe),
         ("batchFree", js_batch_free),
     ];
     // SAFETY: live env and exports, per this function's contract.

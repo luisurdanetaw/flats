@@ -120,6 +120,16 @@ statement, refuses the whole statement.
 INSERT INTO docs (id, vector, title) VALUES (1, [...], 'one'), (2, [...], 'two');
 ```
 
+**Upsert** — the same shape as INSERT, but a row whose key is already taken
+REPLACES that row (every column and the vector) instead of being refused.
+The statement is still all-or-nothing, and a key repeated within it is
+still refused. Concurrent upserts of one key never conflict: they apply in
+order, and the last one wins.
+
+```sql
+UPSERT INTO docs (id, vector, title) VALUES (1, [...], 'one, edited'), (3, [...], 'three');
+```
+
 **Search** — the core query.
 
 ```sql

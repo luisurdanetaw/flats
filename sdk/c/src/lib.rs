@@ -1102,6 +1102,171 @@ pub unsafe extern "C" fn flats_batch_commit(b: *mut flats_batch, inserted: *mut 
     })
 }
 
+/// `int flats_batch_upsert(flats_batch *b, size_t *written)`
+///
+/// `flats_batch_commit`, but each row is inserted OR replaces the live row
+/// holding its primary key (`UPSERT`). One statement: every row or none.
+///
+/// # Safety
+/// As `flats_batch_commit`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flats_batch_upsert(b: *mut flats_batch, written: *mut usize) -> i32 {
+    if !written.is_null() {
+        // SAFETY: non-NULL and writable by contract.
+        unsafe { *written = 0 };
+    }
+    guard(|| {
+        // SAFETY: forwarded from this function's own contract.
+        let batch = unsafe { arg_mut(b, "batch") }?;
+        let rows = std::mem::take(&mut batch.rows);
+        let count = rows.len();
+        let collection = batch.collection;
+        with_db(&batch.db, |db| {
+            db.upsert_many(collection, rows).map_err(Fail::engine)
+        })?;
+        if !written.is_null() {
+            // SAFETY: non-NULL and writable by contract.
+            unsafe { *written = count };
+        }
+        Ok(())
+    })
+}
+
+/// A result built directly from rows of cells.
+fn table(columns: &[&str], rows: Vec<Vec<Cell>>) -> Result<flats_result, Fail> {
+    let columns = columns
+        .iter()
+        .map(|c| CString::new(*c).map_err(|_| Fail::invalid("label holds a NUL")))
+        .collect::<Result<_, _>>()?;
+    Ok(flats_result { columns, rows })
+}
+
+fn text_cell(s: &str) -> Cell {
+    let mut bytes = s.as_bytes().to_vec();
+    bytes.push(0);
+    Cell::Text(bytes)
+}
+
+/// # Safety
+/// `out` is NULL or writable.
+unsafe fn hand_out(out: *mut *mut flats_result, result: flats_result) -> Result<(), Fail> {
+    if out.is_null() {
+        return Err(Fail::invalid("out is NULL"));
+    }
+    // SAFETY: non-NULL and writable by contract.
+    unsafe { *out = Box::into_raw(Box::new(result)) };
+    Ok(())
+}
+
+/// `int flats_collections(flats_db *db, flats_result **out)`
+///
+/// One row per collection: `name`, `dimension`, `capacity`, `rows` (live
+/// rows now), `primary_key` (the key column's name).
+///
+/// # Safety
+/// `db` is NULL or live; `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flats_collections(
+    db: *const flats_db,
+    out: *mut *mut flats_result,
+) -> i32 {
+    guard(|| {
+        // SAFETY: forwarded from this function's own contract.
+        let handle = unsafe { arg_ref(db, "db") }?;
+        let rows = with_db(&handle.db, |db| {
+            let mut rows = Vec::new();
+            for c in db.collections() {
+                let key = c
+                    .schema
+                    .primary_key
+                    .and_then(|k| c.schema.columns.get(k as usize))
+                    .map_or("", |col| col.name.as_str());
+                rows.push(vec![
+                    text_cell(&c.name),
+                    Cell::Int(c.schema.vector().dim.get() as i64),
+                    Cell::Int(c.capacity as i64),
+                    Cell::Int(db.row_count(c.id).map_err(Fail::engine)? as i64),
+                    text_cell(key),
+                ]);
+            }
+            Ok(rows)
+        })?;
+        let result = table(
+            &["name", "dimension", "capacity", "rows", "primary_key"],
+            rows,
+        )?;
+        // SAFETY: forwarded from this function's own contract.
+        unsafe { hand_out(out, result) }
+    })
+}
+
+/// `int flats_describe(flats_db *db, const char *collection, flats_result **out)`
+///
+/// One row per column, in declaration order: `column`, `type` (`INT`,
+/// `FLOAT`, `TEXT` or `VECTOR(n)`), `primary_key` (1 or 0). An unknown
+/// collection is `FLATS_ERR_QUERY`.
+///
+/// # Safety
+/// `db` is NULL or live; `collection` is NULL or a NUL-terminated string;
+/// `out` is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flats_describe(
+    db: *const flats_db,
+    collection: *const c_char,
+    out: *mut *mut flats_result,
+) -> i32 {
+    guard(|| {
+        // SAFETY: forwarded from this function's own contract.
+        let handle = unsafe { arg_ref(db, "db") }?;
+        // SAFETY: as above.
+        let name = unsafe { arg_str(collection, "collection") }?;
+        let config = with_db(&handle.db, |db| {
+            db.collections()
+                .into_iter()
+                .find(|c| c.name == name)
+                .ok_or_else(|| {
+                    Fail::engine(flats::Error::UnknownCollectionName {
+                        name: name.to_string(),
+                    })
+                })
+        })?;
+        let schema = &config.schema;
+        // Declaration order: the vector and the scalars interleave by ordinal.
+        let mut cols: Vec<(usize, Vec<Cell>)> = schema
+            .columns
+            .iter()
+            .map(|c| {
+                let ty = match c.ty {
+                    ColumnType::Int => "INT",
+                    ColumnType::Float => "FLOAT",
+                    ColumnType::Text => "TEXT",
+                };
+                let pk = schema.primary_key == Some(c.id);
+                (
+                    c.ordinal.get(),
+                    vec![text_cell(&c.name), text_cell(ty), Cell::Int(pk as i64)],
+                )
+            })
+            .collect();
+        let v = schema.vector();
+        cols.push((
+            v.ordinal.get(),
+            vec![
+                text_cell(&v.name),
+                text_cell(&format!("VECTOR({})", v.dim)),
+                Cell::Int(0),
+            ],
+        ));
+        cols.sort_by_key(|(ordinal, _)| *ordinal);
+        let result = table(
+            &["column", "type", "primary_key"],
+            cols.into_iter().map(|(_, r)| r).collect(),
+        )?;
+        // SAFETY: forwarded from this function's own contract.
+        unsafe { hand_out(out, result) }
+    })
+}
+
 /// `void flats_batch_free(flats_batch *b)`
 ///
 /// # Safety

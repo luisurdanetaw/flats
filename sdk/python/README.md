@@ -218,6 +218,21 @@ comparands, `INSERT` values, `SET` values, `NEAREST TO ?`, `TOP ?`.
 column name; `search` and `insert` check the names you pass and refuse
 anything that isn't a plain identifier.
 
+## Upsert, get and delete by key
+
+```python
+db.upsert("docs", rows)            # insert, or replace the row holding each key
+row = db.get("docs", "d17")        # a dict with every column (vector too), or None
+db.delete("docs", "d17")           # deletes it if it exists
+db.collections()                   # [{"name", "dimension", "capacity", "rows", "primary_key"}, ...]
+db.describe("docs")                # that, plus "columns": [{"name", "type", "primary_key"}, ...]
+```
+
+`upsert` takes the same rows as `insert` and batches the same way. A key a
+live row holds replaces that row entirely; a key repeated within one batch
+is refused. The key in `get` and `delete` is passed as a parameter, never
+pasted into SQL. `flats.aio` has all five.
+
 ## Updating and deleting
 
 V-SQL through `execute`, with values as parameters:

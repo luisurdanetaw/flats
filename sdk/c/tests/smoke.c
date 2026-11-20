@@ -87,6 +87,33 @@ int main(int argc, char **argv) {
     CHECK(flats_result_row_count(res) == 1 && flats_result_int(res, 0, 0) == 9, "exactly doc 9");
     flats_result_free(res);
 
+    /* Upsert: replace doc 9 in place; the count stays 10. */
+    {
+        flats_batch *u;
+        CHECK(flats_batch_new(db, "docs", &u) == FLATS_OK, "upsert batch");
+        float v[4] = {0.0f, 0.0f, 1.0f, 0.0f};
+        CHECK(flats_batch_vector(u, v, 4) == FLATS_OK, "upsert vector");
+        CHECK(flats_batch_int(u, "id", 9) == FLATS_OK, "upsert id");
+        CHECK(flats_batch_text(u, "title", "nine", 4) == FLATS_OK, "upsert title");
+        CHECK(flats_batch_end_row(u) == FLATS_OK, "upsert row");
+        size_t written = 0;
+        CHECK(flats_batch_upsert(u, &written) == FLATS_OK && written == 1, "upsert");
+        flats_batch_free(u);
+    }
+    CHECK(flats_execute(db, "SELECT title FROM docs WHERE id = 9;", &res) == FLATS_OK, "read it back");
+    CHECK(flats_result_row_count(res) == 1, "still one doc 9");
+    {
+        size_t len;
+        CHECK(strcmp(flats_result_text(res, 0, 0, &len), "nine") == 0, "replaced");
+    }
+    flats_result_free(res);
+    CHECK(flats_collections(db, &res) == FLATS_OK, "collections");
+    CHECK(flats_result_row_count(res) == 1 && flats_result_int(res, 0, 3) == 10, "one collection, 10 rows");
+    flats_result_free(res);
+    CHECK(flats_describe(db, "docs", &res) == FLATS_OK, "describe");
+    CHECK(flats_result_row_count(res) == 3, "three columns");
+    flats_result_free(res);
+
     CHECK(flats_backup(db, argv[2]) == FLATS_OK, "backup");
     CHECK(flats_close(db) == FLATS_OK, "close");
 

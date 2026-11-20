@@ -216,6 +216,21 @@ Booleans, `null`, `undefined` and objects are refused. A parameter can't
 stand for a collection or column name; `search` and `insert` check the names
 you pass and refuse anything that isn't a plain identifier.
 
+## Upsert, get and delete by key
+
+```js
+db.upsert('docs', rows);           // insert, or replace the row holding each key
+const row = db.get('docs', 'd17'); // an object with every column (vector too), or null
+db.delete('docs', 'd17');          // deletes it if it exists
+db.collections();                  // [{ name, dimension, capacity, rows, primaryKey }, ...]
+db.describe('docs');               // that, plus columns: [{ name, type, primaryKey }, ...]
+```
+
+`upsert` takes the same rows as `insert` and batches the same way. A key a
+live row holds replaces that row entirely; a key repeated within one batch
+is refused. The key in `get` and `delete` is passed as a parameter, never
+pasted into SQL. `AsyncDatabase` has all five, returning Promises.
+
 ## Updating and deleting
 
 V-SQL through `execute`, with values as parameters:

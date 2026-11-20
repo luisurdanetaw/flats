@@ -164,6 +164,24 @@ const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** A collection or column name, checked: names are statement text, so they
  * must be plain identifiers — values go in parameters. */
+function collectionsOf([columns, rows]) {
+  return new Result(columns, rows)
+    .toObjects()
+    .map((c) => ({ name: c.name, dimension: c.dimension, capacity: c.capacity, rows: c.rows, primaryKey: c.primary_key }));
+}
+
+function describeOf(name, [columns, rows], all) {
+  const info = all.find((c) => c.name === name);
+  info.columns = new Result(columns, rows)
+    .toObjects()
+    .map((c) => ({ name: c.column, type: c.type, primaryKey: c.primary_key === 1 }));
+  return info;
+}
+
+const getSql = (info) =>
+  `SELECT ${info.columns.map((c) => c.name).join(', ')} FROM ${info.name} WHERE ${info.primaryKey} = ?;`;
+const deleteSql = (info) => `DELETE FROM ${info.name} WHERE ${info.primaryKey} = ?;`;
+
 function ident(name, what) {
   if (typeof name !== 'string' || !IDENT.test(name)) {
     throw new TypeError(`${what} must be a plain identifier, got ${JSON.stringify(name)}`);
@@ -287,18 +305,55 @@ class Database {
    * in batches of BATCH_ROWS, each all-or-nothing.
    */
   insert(collection, rows) {
+    return this._writeRows(collection, rows, native.batchCommit);
+  }
+
+  /**
+   * Like insert(), but a row whose primary key a live row already holds
+   * REPLACES that row — every column and the vector — instead of being
+   * refused. Returns the count. Each batch is all-or-nothing; a key repeated
+   * within one batch is refused.
+   */
+  upsert(collection, rows) {
+    return this._writeRows(collection, rows, native.batchUpsert);
+  }
+
+  _writeRows(collection, rows, commit) {
     const batch = call(native.batchNew, this._handle(), ident(collection, 'collection'));
     let total = 0;
     try {
       for (const row of rows) {
         addRow(batch, row);
-        if (call(native.batchLen, batch) >= BATCH_ROWS) total += call(native.batchCommit, batch);
+        if (call(native.batchLen, batch) >= BATCH_ROWS) total += call(commit, batch);
       }
-      if (call(native.batchLen, batch) > 0) total += call(native.batchCommit, batch);
+      if (call(native.batchLen, batch) > 0) total += call(commit, batch);
     } finally {
       native.batchFree(batch);
     }
     return total;
+  }
+
+  /** The row whose primary key is `key`, as an object with every column (the vector included), or null. */
+  get(collection, key) {
+    const info = this.describe(collection);
+    const rows = this.execute(getSql(info), [key]).toObjects();
+    return rows.length ? rows[0] : null;
+  }
+
+  /** Delete the row whose primary key is `key`, if there is one. */
+  delete(collection, key) {
+    this.execute(deleteSql(this.describe(collection)), [key]);
+  }
+
+  /** Every collection: { name, dimension, capacity, rows, primaryKey }. */
+  collections() {
+    return collectionsOf(call(native.collections, this._handle()));
+  }
+
+  /** One collection's shape: collections()'s entry plus `columns` ({ name, type, primaryKey }) in declaration order. */
+  describe(collection) {
+    const name = ident(collection, 'collection');
+    return describeOf(name, call(native.describe, this._handle(), name), this.collections());
   }
 
   /**
@@ -496,6 +551,59 @@ class AsyncDatabase {
       }
       return total;
     });
+  }
+
+  /** Like insert(), replacing rows whose key is already held; resolves to the count. */
+  upsert(collection, rows) {
+    try {
+      ident(collection, 'collection');
+    } catch (e) {
+      return Promise.reject(e);
+    }
+    return this._run(async (db) => {
+      const batch = call(native.batchNew, db, collection);
+      let total = 0;
+      try {
+        for (const row of rows) {
+          addRow(batch, row);
+          if (call(native.batchLen, batch) >= BATCH_ROWS) {
+            total += await callAsync(native.batchUpsertAsync, batch);
+          }
+        }
+        if (call(native.batchLen, batch) > 0) total += await callAsync(native.batchUpsertAsync, batch);
+      } finally {
+        native.batchFree(batch);
+      }
+      return total;
+    });
+  }
+
+  /** Resolves to the row whose primary key is `key`, or null. */
+  async get(collection, key) {
+    const info = await this.describe(collection);
+    const rows = (await this.execute(getSql(info), [key])).toObjects();
+    return rows.length ? rows[0] : null;
+  }
+
+  /** Delete the row whose primary key is `key`, if there is one. */
+  async delete(collection, key) {
+    await this.execute(deleteSql(await this.describe(collection)), [key]);
+  }
+
+  /** Resolves to every collection (see Database.collections()). Reads only the catalog. */
+  collections() {
+    return this._run(async (db) => collectionsOf(call(native.collections, db)));
+  }
+
+  /** Resolves to one collection's shape (see Database.describe()). */
+  describe(collection) {
+    let name;
+    try {
+      name = ident(collection, 'collection');
+    } catch (e) {
+      return Promise.reject(e);
+    }
+    return this._run(async (db) => describeOf(name, call(native.describe, db, name), collectionsOf(call(native.collections, db))));
   }
 
   /** Stop every statement running now (synchronous: it never waits). */

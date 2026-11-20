@@ -228,6 +228,18 @@ A stopped statement returns `FLATS_ERR_INTERRUPTED`, and nothing it would
 have written is written. `flats_interrupt` is safe from any thread, for
 example a watchdog thread, and only reaches statements already running.
 
+## Upsert and schema introspection
+
+`flats_batch_upsert(b, &n)` commits a batch like `flats_batch_commit`, but a
+row whose primary key a live row holds replaces that row (every value and
+the vector) instead of being refused.
+
+`flats_collections(db, &res)` returns one row per collection (`name`,
+`dimension`, `capacity`, `rows`, `primary_key`). `flats_describe(db, "docs",
+&res)` returns one row per column in declaration order (`column`, `type`,
+`primary_key`). Both are ordinary `flats_result`s: read them with the usual
+accessors and free them with `flats_result_free`.
+
 ## Damaged files
 
 If a collection's files are damaged (disk corruption, a bad copy) and the log
