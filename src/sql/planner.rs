@@ -40,6 +40,11 @@ pub fn plan(bound: BoundStatement) -> LogicalPlan {
             schema: m.schema,
             rows: m.rows,
         }),
+        BoundStatement::Upsert(m) => LogicalPlan::Upsert(InsertMany {
+            collection: m.collection,
+            schema: m.schema,
+            rows: m.rows,
+        }),
         BoundStatement::CreateCollection(c) => plan_create(c),
         BoundStatement::Search(s) => plan_search(s),
         BoundStatement::Delete(d) => plan_delete(d),

@@ -580,7 +580,8 @@ fn data_collection(record: &Record) -> Option<u32> {
     match record {
         Record::Insert { collection, .. }
         | Record::Delete { collection, .. }
-        | Record::Mutate { collection, .. } => Some(*collection),
+        | Record::Mutate { collection, .. }
+        | Record::Upsert { collection, .. } => Some(*collection),
         Record::CreateCollection { .. } | Record::DropCollection { .. } => None,
     }
 }
@@ -743,42 +744,22 @@ impl Apply for IndexApplier {
                     return Ok(Outcome::Conflicted);
                 }
 
-                // UNIQUENESS, decided here for the same reason an `Insert`'s
-                // is: this thread is the only place where "no live row holds
-                // this key" cannot change between asking and acting. Two bulk
-                // inserts can both pass their callers' checks; only one gets
-                // past this. A refusal is a verdict, not an apply failure, and
-                // it is deterministic — replay reaches it again — so the
-                // watermarks advance exactly as for a conflict.
-                if let Some(reason) = self.install_conflict(*collection, &retire.0, install)? {
-                    let w = self.writers(*collection)?;
-                    w.flat.advance_applied_lsn(lsn.0);
-                    w.meta.advance_applied_lsn(lsn);
-                    w.tuple.advance_applied_lsn(lsn);
-                    self.last_applied = self.last_applied.max(lsn.0);
-                    return Ok(Outcome::Rejected(reason));
+                if let Some(refused) = self.install_rows(lsn, *collection, &retire.0, install)? {
+                    return Ok(refused);
                 }
-                let w = self.writers(*collection)?;
-
-                // DATA FIRST, LIVENESS LAST — the same rule as `Insert`, but
-                // now spanning a whole statement. Every installed row must be
-                // readable in both stores before anything publishes it, or a
-                // snapshot could admit a row the tuple store has never seen.
-                for row in install {
-                    let ord32 = ordinal32(row.ordinal)?;
-                    w.flat.write_at(row.ordinal, &row.vector).map_err(to_io)?;
-                    w.tuple.write_row(ord32, &row.metadata).map_err(to_io)?;
+            }
+            Record::Upsert {
+                collection,
+                install,
+            } => {
+                // What to replace is decided HERE, against the state this
+                // record applies to: the live holders of its keys. A key
+                // repeated inside the record is refused (the logging side
+                // already refuses it; this keeps the verdict local).
+                let retire = self.upsert_targets(*collection, install)?;
+                if let Some(refused) = self.install_rows(lsn, *collection, &retire, install)? {
+                    return Ok(refused);
                 }
-                // ONE publish for the whole statement. `apply_mutation` holds
-                // the metadata lock across every retire and install precisely
-                // so no reader can materialize a snapshot mid-statement — see
-                // its doc. A loop of insert_row/remove_row here would be
-                // correct on disk and wrong in memory.
-                w.meta.apply_mutation(&retire.0, &rows).map_err(to_io)?;
-                w.live.bump();
-                w.flat.advance_applied_lsn(lsn.0);
-                w.meta.advance_applied_lsn(lsn);
-                w.tuple.advance_applied_lsn(lsn);
             }
         }
         // The catalog watermark advances only on success — a `?` above skips
@@ -954,6 +935,74 @@ impl IndexApplier {
             return Ok(Some(RejectReason::DuplicateKey));
         }
         Ok(None)
+    }
+
+    /// Install `install` and retire `retire` as one statement — the shared
+    /// tail of `Record::Mutate` and `Record::Upsert`. `Some(outcome)` when the
+    /// record is refused (its watermarks advanced: a refusal is a verdict, and
+    /// replay reaches it again); `None` when it applied.
+    fn install_rows(
+        &mut self,
+        lsn: Lsn,
+        collection: u32,
+        retire: &RoaringBitmap,
+        install: &[Install],
+    ) -> io::Result<Option<Outcome>> {
+        // UNIQUENESS, decided here for the same reason an `Insert`'s is: this
+        // thread is the only place where "no live row holds this key" cannot
+        // change between asking and acting. Two bulk inserts can both pass
+        // their callers' checks; only one gets past this.
+        if let Some(reason) = self.install_conflict(collection, retire, install)? {
+            let w = self.writers(collection)?;
+            w.flat.advance_applied_lsn(lsn.0);
+            w.meta.advance_applied_lsn(lsn);
+            w.tuple.advance_applied_lsn(lsn);
+            self.last_applied = self.last_applied.max(lsn.0);
+            return Ok(Some(Outcome::Rejected(reason)));
+        }
+        let w = self.writers(collection)?;
+        let rows: Vec<(Ordinal, &Row)> = install
+            .iter()
+            .map(|r| ordinal32(r.ordinal).map(|o| (o, &r.metadata)))
+            .collect::<io::Result<_>>()?;
+
+        // DATA FIRST, LIVENESS LAST — the same rule as `Insert`, but now
+        // spanning a whole statement. Every installed row must be readable in
+        // both stores before anything publishes it, or a snapshot could admit
+        // a row the tuple store has never seen.
+        for row in install {
+            let ord32 = ordinal32(row.ordinal)?;
+            w.flat.write_at(row.ordinal, &row.vector).map_err(to_io)?;
+            w.tuple.write_row(ord32, &row.metadata).map_err(to_io)?;
+        }
+        // ONE publish for the whole statement. `apply_mutation` holds the
+        // metadata lock across every retire and install precisely so no reader
+        // can materialize a snapshot mid-statement — see its doc.
+        w.meta.apply_mutation(retire, &rows).map_err(to_io)?;
+        w.live.bump();
+        w.flat.advance_applied_lsn(lsn.0);
+        w.meta.advance_applied_lsn(lsn);
+        w.tuple.advance_applied_lsn(lsn);
+        Ok(None)
+    }
+
+    /// What an upsert replaces: the live rows holding its rows' keys, as the
+    /// metadata index stands when the record applies.
+    fn upsert_targets(&mut self, collection: u32, install: &[Install]) -> io::Result<RoaringBitmap> {
+        let Some(key) = self
+            .registry
+            .iter()
+            .find(|c| c.id == collection)
+            .and_then(|c| c.schema.primary_key)
+        else {
+            return Ok(RoaringBitmap::new());
+        };
+        let values: Vec<&Value> = install
+            .iter()
+            .filter_map(|r| r.metadata.iter().find(|(id, _)| *id == key).map(|(_, v)| v))
+            .collect();
+        let w = self.writers(collection)?;
+        w.meta.live_holders(key, &values).map_err(to_io)
     }
 
     /// Whether `id` names a collection that existed and was dropped: issued
@@ -1965,6 +2014,105 @@ impl Db {
                         |k| Self::key_name(&coll.config.schema, k),
                     ),
                     value: "<taken concurrently>".to_string(),
+                })
+            }
+        }
+    }
+
+    /// Insert each row, or REPLACE the live row holding its primary key —
+    /// every value and the vector — as ONE statement: one durable record,
+    /// every row or none. Returns each row's (new) ordinal, in input order.
+    ///
+    /// The same validation as [`insert_many`](Self::insert_many), except that
+    /// a key some live row holds is the point rather than an error; a key
+    /// repeated INSIDE the batch is still refused ([`Error::DuplicateKey`]):
+    /// two rows cannot both be the one that row becomes. The collection must
+    /// declare a primary key.
+    ///
+    /// Which live rows it replaces is decided by the commit thread when the
+    /// record applies (`Record::Upsert`), so an upsert never conflicts with a
+    /// concurrent writer and never retries: racing upserts of one key simply
+    /// apply in log order, and the last one wins.
+    pub fn upsert_many(&self, collection: u32, rows: Vec<(Vec<f32>, Row)>) -> Result<Vec<Ordinal>> {
+        let _gate = self.gate.enter();
+        let coll = self.collection(collection)?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(key) = coll.config.schema.primary_key else {
+            return Err(Error::PrimaryKeyCount { found: 0 });
+        };
+
+        // 1. VALIDATE, as insert_many does, and refuse a key repeated within
+        //    the batch.
+        let dim = coll.config.schema.vector().dim.get();
+        let mut seen = std::collections::HashSet::with_capacity(rows.len());
+        let mut keys = Vec::with_capacity(rows.len());
+        for (vector, row) in &rows {
+            if vector.len() != dim {
+                return Err(Error::DimensionMismatch {
+                    expected: dim,
+                    got: vector.len(),
+                });
+            }
+            coll.config.schema.validate_row(row)?;
+            if let Some((_, value)) = row.iter().find(|(id, _)| *id == key) {
+                if !seen.insert(render_key(value)) {
+                    return Err(Error::DuplicateKey {
+                        column: Self::key_name(&coll.config.schema, key),
+                        value: render_key(value),
+                    });
+                }
+                keys.push(value.clone());
+            }
+        }
+        self.check_poison()?;
+
+        let template: Vec<Install> = rows
+            .into_iter()
+            .map(|(vector, metadata)| Install {
+                ordinal: 0,
+                vector,
+                metadata,
+            })
+            .collect();
+        let bytes = bincode::serialized_size(&template)
+            .map_err(|e| Error::Io(io::Error::new(io::ErrorKind::InvalidData, e.to_string())))?
+            as usize;
+        if bytes > MAX_INSTALL_BYTES {
+            return Err(Error::StatementTooLarge {
+                bytes,
+                cap: MAX_INSTALL_BYTES,
+            });
+        }
+
+        // 2. Fresh ordinals for every row (a replacement is a new row, as an
+        //    UPDATE's copy is), then ONE record. Which live rows it replaces
+        //    is the commit thread's decision (`Record::Upsert`), so there is
+        //    nothing a concurrent writer can invalidate in between.
+        let count = template.len() as u64;
+        let start = coll.alloc_ordinals(count)?;
+        self.allocated(&coll, start, start + count);
+        let mut install = template;
+        for (i, row) in install.iter_mut().enumerate() {
+            row.ordinal = start + i as u64;
+        }
+        let committed = self
+            .wal_handle()?
+            .append(Record::Upsert { collection, install })
+            .map_err(|e| self.wal_err(e))?;
+        match committed.outcome {
+            Outcome::Applied => Ok((start..start + count).map(|o| Ordinal(o as u32)).collect()),
+            Outcome::Rejected(RejectReason::CollectionDropped) => {
+                Err(Error::UnknownCollection { id: collection })
+            }
+            // Unreachable from here (repeats were refused above, and the
+            // commit thread retires every other holder), but a verdict is a
+            // verdict.
+            Outcome::Rejected(RejectReason::DuplicateKey) | Outcome::Conflicted => {
+                Err(Error::DuplicateKey {
+                    column: Self::key_name(&coll.config.schema, key),
+                    value: "<repeated in the statement>".to_string(),
                 })
             }
         }

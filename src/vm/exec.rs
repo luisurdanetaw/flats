@@ -207,6 +207,7 @@ fn needs_db(op: &Op) -> bool {
             | Op::KnnScan { .. }
             | Op::Insert { .. }
             | Op::InsertMany { .. }
+            | Op::Upsert { .. }
             | Op::Mutate { .. }
             | Op::CreateCollection { .. }
             | Op::DropCollection { .. }
@@ -234,6 +235,7 @@ fn mnemonic(op: &Op) -> &'static str {
         Op::MakeRecord { .. } => "MakeRecord",
         Op::Insert { .. } => "Insert",
         Op::InsertMany { .. } => "InsertMany",
+        Op::Upsert { .. } => "Upsert",
         Op::KnnScan { .. } => "KnnScan",
         Op::RowId { .. } => "RowId",
         Op::Score { .. } => "Score",
@@ -824,7 +826,8 @@ impl Vm {
                     db.insert(collection, &vector, row)
                         .map_err(ExecError::Engine)?;
                 }
-                Op::InsertMany { cur, start, count } => {
+                Op::InsertMany { cur, start, count } | Op::Upsert { cur, start, count } => {
+                    let upsert = matches!(op, Op::Upsert { .. });
                     let (cur, start, count) = (*cur, *start, *count);
                     let db = db.ok_or(ExecError::Detached { op: "InsertMany" })?;
                     let (collection, schema) = match self.slot(cur)? {
@@ -841,8 +844,11 @@ impl Vm {
                         };
                         rows.push(split_record(record, &schema).map_err(ExecError::Split)?);
                     }
-                    db.insert_many(collection, rows)
-                        .map_err(ExecError::Engine)?;
+                    if upsert {
+                        db.upsert_many(collection, rows).map_err(ExecError::Engine)?;
+                    } else {
+                        db.insert_many(collection, rows).map_err(ExecError::Engine)?;
+                    }
                 }
 
                 // -- DELETE: one statement, one record --------------------------

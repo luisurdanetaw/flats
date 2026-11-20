@@ -467,6 +467,7 @@ impl Parser {
                 self.parse_window(select)?
             }
             Token::Insert => self.parse_insert_statement()?,
+            Token::Upsert => self.parse_upsert()?,
             Token::Create => Statement::CreateCollection(self.parse_create()?),
             Token::Search => Statement::Search(self.parse_search()?),
             Token::Delete => Statement::Delete(self.parse_delete()?),
@@ -476,7 +477,7 @@ impl Parser {
             _ => {
                 let found = format!("{:?}", self.peek());
                 return Err(self.error(ParseErrorKind::UnexpectedToken {
-                    expected: "SELECT, INSERT, CREATE, SEARCH, DELETE, UPDATE, or DROP".to_string(),
+                    expected: "SELECT, INSERT, UPSERT, CREATE, SEARCH, DELETE, UPDATE, or DROP".to_string(),
                     found,
                 }));
             }
@@ -909,6 +910,34 @@ impl Parser {
         }
         self.expect(Token::RParen)?;
         Ok(values)
+    }
+
+    /// `upsert := UPSERT INTO ident '(' ident (',' ident)* ')' VALUES row (',' row)*`
+    ///
+    /// The INSERT grammar under another verb, and always a
+    /// [`Statement::Upsert`], one row or many.
+    fn parse_upsert(&mut self) -> Result<Statement, ParseError> {
+        self.expect(Token::Upsert)?;
+        self.expect(Token::Into)?;
+        let collection = self.expect_ident()?;
+        self.expect(Token::LParen)?;
+        let mut columns = vec![self.expect_ident()?];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            columns.push(self.expect_ident()?);
+        }
+        self.expect(Token::RParen)?;
+        self.expect(Token::Values)?;
+        let mut rows = vec![self.parse_value_row()?];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            rows.push(self.parse_value_row()?);
+        }
+        Ok(Statement::Upsert(InsertManyStmt {
+            collection,
+            columns,
+            rows,
+        }))
     }
 
     /// `INSERT INTO ident '(' ident (',' ident)* ')' VALUES row` — the head and

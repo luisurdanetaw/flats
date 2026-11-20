@@ -388,6 +388,13 @@ pub enum Op {
         sets: Vec<(String, Lit)>,
         pred: Pred,
     },
+    /// Same shape as an insert: each row inserted, or replacing the live row
+    /// holding its key.
+    Upsert {
+        coll: String,
+        cols: Vec<String>,
+        rows: Vec<Vec<Lit>>,
+    },
     Delete {
         coll: String,
         pred: Pred,
@@ -417,7 +424,12 @@ impl Op {
     pub fn is_write(&self) -> bool {
         matches!(
             self,
-            Op::Create(_) | Op::Drop(_) | Op::Insert { .. } | Op::Update { .. } | Op::Delete { .. }
+            Op::Create(_)
+                | Op::Drop(_)
+                | Op::Insert { .. }
+                | Op::Upsert { .. }
+                | Op::Update { .. }
+                | Op::Delete { .. }
         )
     }
 }
@@ -561,8 +573,13 @@ pub fn render(op: &Op, rng: Rng, param_pct: u64) -> Option<(String, Vec<Param>)>
         Op::Drop(name) => {
             let _ = write!(s.text, "DROP COLLECTION {name};");
         }
-        Op::Insert { coll, cols, rows } => {
-            let _ = write!(s.text, "INSERT INTO {coll} ({}) VALUES ", cols.join(", "));
+        Op::Insert { coll, cols, rows } | Op::Upsert { coll, cols, rows } => {
+            let verb = if matches!(op, Op::Upsert { .. }) {
+                "UPSERT"
+            } else {
+                "INSERT"
+            };
+            let _ = write!(s.text, "{verb} INTO {coll} ({}) VALUES ", cols.join(", "));
             for (r, row) in rows.iter().enumerate() {
                 if r > 0 {
                     s.push(", ");
@@ -719,7 +736,8 @@ impl Model {
                     Expect::Error
                 }
             }
-            Op::Insert { coll, cols, rows } => {
+            Op::Insert { coll, cols, rows } | Op::Upsert { coll, cols, rows } => {
+                let upsert = matches!(op, Op::Upsert { .. });
                 let Some(c) = self.colls.get_mut(coll) else {
                     return Expect::Error;
                 };
@@ -753,7 +771,9 @@ impl Model {
                 let mut keys = BTreeSet::new();
                 for row in &new_rows {
                     let k = key_of(&row[pk]);
-                    if c.rows.contains_key(&k) || !keys.insert(k) {
+                    // A repeat inside the statement is refused either way; a
+                    // live key is refused by INSERT and replaced by UPSERT.
+                    if (!upsert && c.rows.contains_key(&k)) || !keys.insert(k) {
                         return Expect::Error;
                     }
                 }
@@ -1269,6 +1289,40 @@ fn gen_insert(rng: &mut Rng, c: &Coll, noisy: bool) -> Op {
     }
 }
 
+fn gen_upsert(rng: &mut Rng, c: &Coll, noisy: bool) -> Op {
+    // An insert's shape, with most keys taken from live rows so the
+    // replacement path runs; a noisy one may repeat a key in the batch.
+    let Op::Insert {
+        coll,
+        cols,
+        mut rows,
+    } = gen_insert(rng, c, noisy)
+    else {
+        unreachable!()
+    };
+    if let Some(pk_at) = cols
+        .iter()
+        .position(|n| n == &c.schema.cols[c.schema.pk()].name)
+    {
+        let mut used = BTreeSet::new();
+        for row in &mut rows {
+            if rng.chance(60)
+                && let Some(v) = existing_value(rng, c, c.schema.pk())
+                && used.insert(key_of(&v))
+            {
+                row[pk_at] = v;
+            } else if let Lit::Int(_) | Lit::Text(_) = &row[pk_at] {
+                used.insert(key_of(&row[pk_at]));
+            }
+        }
+        if noisy && rows.len() > 1 && rng.chance(30) {
+            let v = rows[0][pk_at].clone();
+            rows[1][pk_at] = v;
+        }
+    }
+    Op::Upsert { coll, cols, rows }
+}
+
 fn gen_update(rng: &mut Rng, c: &Coll, noisy: bool) -> Op {
     let schema = &c.schema;
     let pk = schema.pk();
@@ -1411,7 +1465,8 @@ pub fn gen_op(rng: &mut Rng, model: &Model) -> Op {
     // all the way down, so long predicates and big batches really run.
     let noisy = rng.chance(20);
     let mut op = match rng.below(1000) {
-        0..=299 => gen_insert(rng, c, noisy),
+        0..=219 => gen_insert(rng, c, noisy),
+        220..=299 => gen_upsert(rng, c, noisy),
         300..=419 => gen_update(rng, c, noisy),
         420..=489 => Op::Delete {
             coll: c.schema.name.clone(),
@@ -1430,6 +1485,7 @@ pub fn gen_op(rng: &mut Rng, model: &Model) -> Op {
     if noisy && rng.chance(5) {
         match &mut op {
             Op::Insert { coll, .. }
+            | Op::Upsert { coll, .. }
             | Op::Update { coll, .. }
             | Op::Delete { coll, .. }
             | Op::Search { coll, .. }

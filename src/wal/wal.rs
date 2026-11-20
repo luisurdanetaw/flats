@@ -188,6 +188,19 @@ pub enum Record {
     /// earlier variant keeps its tag and a v5 log is a strict subset of a v6
     /// one.
     DropCollection { id: u32 },
+    /// UPSERT (WAL v7): install every row, and retire whichever live rows
+    /// hold their primary keys — decided by the COMMIT THREAD when it applies
+    /// the record, not by the caller when it logs it. That is what makes an
+    /// upsert immune to conflicts: there is no read on the caller's side that
+    /// another writer could invalidate, so no retry and no starvation. Replay
+    /// reaches the same decision because the metadata index it reads is never
+    /// checkpointed ahead of the other stores (see the checkpoint order).
+    ///
+    /// APPENDED, like `DropCollection`: a v5 or v6 log is a strict subset.
+    Upsert {
+        collection: u32,
+        install: Vec<Install>,
+    },
 }
 
 impl Record {
@@ -350,8 +363,8 @@ pub trait Apply {
 const WAL_MAGIC: &[u8; 4] = b"FWAL";
 /// Version written to new logs. 2 = metadata-carrying Insert (Phase 4c);
 /// 3 = + CreateCollection (Phase 6); 4 = + Mutate (Phase 7); 5 = `Schema`
-/// carries a PRIMARY KEY; 6 = + DropCollection.
-const WAL_VERSION: u32 = 6;
+/// carries a PRIMARY KEY; 6 = + DropCollection; 7 = + Upsert.
+const WAL_VERSION: u32 = 7;
 /// Oldest version this build still reads.
 ///
 /// THE 5 BUMP IS THE FIRST THAT IS NOT AN APPEND. Every earlier one only added
@@ -363,8 +376,8 @@ const WAL_VERSION: u32 = 6;
 /// fields rather than fail. Nothing below 5 may be replayed, and recovery says
 /// so plainly instead of guessing.
 ///
-/// Version 6 is an append again (`DropCollection`), so a v5 log still replays:
-/// the floor stays at 5.
+/// Versions 6 and 7 are appends again (`DropCollection`, `Upsert`), so a v5
+/// log still replays: the floor stays at 5.
 const WAL_MIN_VERSION: u32 = 5;
 const WAL_HEADER_BYTES: usize = 8;
 
@@ -1701,8 +1714,8 @@ mod tests {
         // tell it to (CLAUDE.md §6). Pinned as a literal so appending a variant
         // without bumping fails here rather than in production.
         assert_eq!(
-            WAL_VERSION, 6,
-            "DropCollection was appended; the written version must bump with it"
+            WAL_VERSION, 7,
+            "Upsert was appended; the written version must bump with it"
         );
         // The 5 bump, unlike every earlier one, was NOT backward-readable:
         // `Schema` sits inside `Record::CreateCollection`, so adding a field to

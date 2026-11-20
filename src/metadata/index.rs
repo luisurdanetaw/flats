@@ -537,6 +537,21 @@ impl Writer {
         Ok(!(holders & inner.live.clone()).is_empty())
     }
 
+    /// Every LIVE row holding any of `values` in `col` — what an UPSERT
+    /// replaces. One lock hold, so the answer is about one state of `live`.
+    pub fn live_holders(&self, col: ColumnId, values: &[&Value]) -> Result<RoaringBitmap> {
+        let inner = self.lock();
+        let store = inner
+            .columns
+            .get(col as usize)
+            .ok_or(Error::UnknownColumn { column: col })?;
+        let mut out = RoaringBitmap::new();
+        for value in values {
+            out |= store.lookup_eq(col, value)? & &inner.live;
+        }
+        Ok(out)
+    }
+
     /// Whether ANY of `values` is held in `col` by a live row that `retire`
     /// does not free — the uniqueness check for a whole `Record::Mutate`.
     ///

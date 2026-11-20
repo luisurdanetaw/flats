@@ -195,6 +195,8 @@ pub enum BoundStatement {
     Insert(BoundInsert),
     /// A resolved multi-row `INSERT`.
     InsertMany(BoundInsertMany),
+    /// A resolved `UPSERT`: every row checked exactly as an INSERT's.
+    Upsert(BoundInsertMany),
     /// A resolved `CREATE COLLECTION`.
     CreateCollection(BoundCreate),
     /// A resolved `SEARCH`.
@@ -646,6 +648,7 @@ pub fn analyze(stmt: Statement, catalog: &impl Catalog) -> Result<BoundStatement
         Statement::Select(s) => bind_select(s, catalog).map(BoundStatement::Select),
         Statement::Insert(i) => bind_insert(i, catalog).map(BoundStatement::Insert),
         Statement::InsertMany(m) => bind_insert_many(m, catalog).map(BoundStatement::InsertMany),
+        Statement::Upsert(m) => bind_insert_many(m, catalog).map(BoundStatement::Upsert),
         Statement::CreateCollection(c) => {
             bind_create(c, catalog).map(BoundStatement::CreateCollection)
         }

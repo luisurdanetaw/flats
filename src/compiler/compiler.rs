@@ -240,6 +240,32 @@ impl<'a> Compiler<'a> {
     /// instruction carries the handle; small scalars load inline. Shared by
     /// `INSERT`'s value list and `WHERE`'s comparands so a literal reaches a
     /// register by exactly one route.
+    /// The records of a multi-row write, packed into a contiguous run of
+    /// registers behind a write cursor: `(cursor, first register, count)`.
+    /// (`InsertMany` emits the same sequence inline.)
+    fn emit_records(&mut self, many: &crate::sql::plan::InsertMany) -> (Cursor, Reg, u32) {
+        let cur = self.alloc_cursor();
+        self.emit(Op::OpenWrite {
+            cur,
+            collection: many.collection.clone(),
+        });
+        let count = many.rows.len() as u32;
+        let records = self.next_reg;
+        self.next_reg += count;
+        for (i, row) in many.rows.iter().enumerate() {
+            let base = self.next_reg;
+            for value in row {
+                self.emit_literal(&value.value);
+            }
+            self.emit(Op::MakeRecord {
+                start: Reg(base),
+                count: self.next_reg - base,
+                dst: Reg(records + i as u32),
+            });
+        }
+        (cur, Reg(records), count)
+    }
+
     fn emit_literal(&mut self, lit: &Literal) -> Reg {
         let dst = self.alloc_reg();
         let op = match lit {
@@ -557,6 +583,12 @@ impl<'a> Compiler<'a> {
                     dst: rec,
                 });
                 self.emit(Op::Insert { cur, rec });
+            }
+
+            LogicalPlan::Upsert(many) => {
+                // Exactly an InsertMany's code, ending in the other write op.
+                let (cur, start, count) = self.emit_records(many);
+                self.emit(Op::Upsert { cur, start, count });
             }
 
             LogicalPlan::InsertMany(many) => {

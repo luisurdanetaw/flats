@@ -57,6 +57,8 @@ pub enum Token {
     From,
     /// `INSERT`
     Insert,
+    /// `UPSERT`
+    Upsert,
     /// `INTO`
     Into,
     /// `VALUES`
@@ -254,6 +256,7 @@ fn keyword(word: &str) -> Option<Token> {
         "select" => Some(Token::Select),
         "from" => Some(Token::From),
         "insert" => Some(Token::Insert),
+        "upsert" => Some(Token::Upsert),
         "into" => Some(Token::Into),
         "values" => Some(Token::Values),
         "search" => Some(Token::Search),

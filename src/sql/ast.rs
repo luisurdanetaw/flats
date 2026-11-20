@@ -46,6 +46,10 @@ pub enum Statement {
     /// one-row statement every existing stage and test speaks keeps its exact
     /// shape; a multi-row statement binds each row through the same routine.
     InsertMany(InsertManyStmt),
+    /// `UPSERT INTO … VALUES (…), …` — one row or many. Each row is inserted,
+    /// or REPLACES the live row holding its primary key (every column and the
+    /// vector), and the whole statement is one record: all rows or none.
+    Upsert(InsertManyStmt),
     /// `CREATE COLLECTION …`
     CreateCollection(CreateStmt),
     /// `SEARCH TOP … NEAREST TO … FROM …`

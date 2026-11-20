@@ -38,6 +38,9 @@ pub enum LogicalPlan {
     Insert(Insert),
     /// Many resolved rows, inserted as one statement.
     InsertMany(InsertMany),
+    /// Resolved rows, each inserted or replacing the live row holding its key,
+    /// as one statement.
+    Upsert(InsertMany),
     /// Provision a new collection.
     CreateCollection(CreateCollection),
     /// Rank a collection's rows by similarity to a query vector (leaf of a

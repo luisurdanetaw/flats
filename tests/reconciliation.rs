@@ -81,7 +81,8 @@ impl Apply for WriterApplier {
             Record::Delete { .. } => {}
             Record::CreateCollection { .. }
             | Record::Mutate { .. }
-            | Record::DropCollection { .. } => {
+            | Record::DropCollection { .. }
+            | Record::Upsert { .. } => {
                 unreachable!("this test only logs Insert and Delete records")
             }
         }
@@ -104,7 +105,10 @@ fn log_and_apply(h: &WalHandle, w: &mut Writer, rec: Record) {
             ordinal, vector, ..
         } => w.write_at(*ordinal, vector).expect("write_at"),
         Record::Delete { .. } => {}
-        Record::CreateCollection { .. } | Record::Mutate { .. } | Record::DropCollection { .. } => {
+        Record::CreateCollection { .. }
+        | Record::Mutate { .. }
+        | Record::DropCollection { .. }
+        | Record::Upsert { .. } => {
             unreachable!("this test only logs Insert and Delete records")
         }
     }
