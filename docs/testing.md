@@ -13,6 +13,7 @@ failure names its seed, and the seed replays it exactly.
 | `tests/failpoints.rs` | Fails, then crashes or carries on, at every step of every durability path | Crash-safety and error-handling bugs at exact points |
 | `tests/concurrent_differential.rs` | Writer and reader threads, with the checkpointer and compactor busy | Torn or mixed-version reads, lost writes under races |
 | `tests/sync_order.rs` | Runs a workload under `strace` and checks the fsync/rename order against what a power cut needs | Missing or misplaced syncs |
+| `sdk/c/tests/abi_fuzz.rs` | Random sequences of C ABI calls with in-contract hostile arguments, handles freed in random order (under ASan in CI) | Memory errors, crashes, undocumented statuses at the FFI boundary |
 | `tests/fuzz.rs` | Hostile statement text, damaged and forged files | Panics, poisoning, silent misreads |
 | `fuzz/run.sh` | Coverage-guided libFuzzer with AddressSanitizer: parser, full query pipeline, every decoder | Panics, memory errors, unbounded allocation or time |
 

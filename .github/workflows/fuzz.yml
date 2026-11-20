@@ -55,6 +55,11 @@ jobs:
       - name: Install stable toolchain
         run: rustup update stable --no-self-update && rustup default stable
       - uses: Swatinem/rust-cache@v2
+      # A workflow file that isn't valid YAML never runs, so it can't report
+      # itself: every workflow checks every workflow file (ci.yml was broken
+      # by an unquoted `simd:: sql::` once, silently disabling all of CI).
+      - name: workflow files are valid YAML
+        run: python3 -c 'import glob, yaml; [yaml.safe_load(open(f)) for f in glob.glob(".github/workflows/*.yml")]'
       - name: differential (model)
         run: cargo test --release --locked --test differential
         env: { FLATS_SIM_SEEDS: "20", FLATS_SIM_OPS: "300" }
@@ -79,6 +84,9 @@ jobs:
       - name: hostile input
         run: cargo test --release --locked --test fuzz
         env: { FLATS_FUZZ_ITERS: "2000" }
+      - name: C ABI call sequences
+        run: cargo test --release --locked -p flats-c --test abi_fuzz
+        env: { FLATS_FUZZ_ITERS: "200" }
       - name: upload failure reports
         if: failure()
         uses: actions/upload-artifact@v4
@@ -200,6 +208,8 @@ jobs:
             --seed-base "$FLATS_SIM_SEED_BASE"
       - name: hostile input
         run: FLATS_FUZZ_ITERS=$(( 20000 * SCALE )) cargo test --release --locked --test fuzz
+      - name: C ABI call sequences
+        run: FLATS_FUZZ_ITERS=$(( 3000 * SCALE )) cargo test --release --locked -p flats-c --test abi_fuzz
       - name: chaos and compaction models
         run: |
           CHAOS_ITERS=$(( 30000 * SCALE )) COMPACTION_ITERS=$(( 30000 * SCALE )) \

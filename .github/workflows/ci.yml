@@ -32,6 +32,11 @@ jobs:
           rustup component add rustfmt clippy
           rustc --version && cargo --version
       - uses: Swatinem/rust-cache@v2
+      # A workflow file that isn't valid YAML never runs, so it can't report
+      # itself: every workflow checks every workflow file (ci.yml was broken
+      # by an unquoted `simd:: sql::` once, silently disabling all of CI).
+      - name: workflow files are valid YAML
+        run: python3 -c 'import glob, yaml; [yaml.safe_load(open(f)) for f in glob.glob(".github/workflows/*.yml")]'
       - name: rustfmt
         run: cargo fmt --all --check
       - name: clippy
@@ -168,10 +173,17 @@ jobs:
       - run: rustup toolchain install nightly --component rust-src && rustup default nightly
       - run: cargo test --target x86_64-unknown-linux-gnu --lib
       - run: cargo test --target x86_64-unknown-linux-gnu --test simd_parity --test swmr --test concurrent_stores --test index --test lock --test limits --test fuzz
-      - run: cargo test --target x86_64-unknown-linux-gnu -p flats-c --test abi
+      - run: cargo test --target x86_64-unknown-linux-gnu -p flats-c --test abi --test abi_fuzz
+        env: { FLATS_FUZZ_ITERS: "300" }
 
-  # ── Miri over the pure-Rust unit tests (no mmap / FFI) ───────────────────
-  # Not yet verified locally; non-blocking until it has run green once.
+  # ── Miri: undefined-behaviour checking of the unit tests it can run ──────
+  # Miri interprets the program and flags UB the compiler can't see. It can't
+  # run mmap or FFI calls (the vector index, the platform layer: those run
+  # under AddressSanitizer in `sanitizers`) or SIMD intrinsics (the AVX2/NEON
+  # kernels: `simd_parity` pins them to the scalar one, which Miri does run).
+  # `sql::` is left out: it holds no unsafe code, and interpreting its tests
+  # takes most of an hour for no UB it could find. Verified green locally
+  # (2026-11-20): simd:: 5 tests, metadata::common 14 tests.
   miri:
     name: Miri (non-blocking)
     runs-on: ubuntu-latest
@@ -180,5 +192,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install nightly --component miri && rustup default nightly
-      - run: cargo miri test --lib -- simd:: sql:: metadata::common
+      - run: "cargo miri test --lib -- simd:: metadata::common"
 
