@@ -4,3 +4,10 @@ __pycache__/
 # SDK build products copied next to their wrappers
 /sdk/node/flats.node
 /sdk/python/flats/libflats_c.so
+
+# Packaging outputs
+sdk/node/prebuilds/
+sdk/python/dist/
+sdk/python/build/
+sdk/python/*.egg-info/
+sdk/python/flats/libflats_c.so

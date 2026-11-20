@@ -14,7 +14,8 @@
 // for its duration (a brute-force scan — milliseconds at 100k vectors).
 //
 // Finding the addon: FLATS_NODE_ADDON wins; otherwise flats.node next to this
-// file, then a Flats checkout's target/release and target/debug.
+// file, then prebuilds/<platform>-<arch>/flats.node (a published package),
+// then a Flats checkout's target/release and target/debug.
 
 'use strict';
 
@@ -26,6 +27,8 @@ function locate() {
   const root = path.resolve(__dirname, '..', '..');
   return [
     path.join(__dirname, 'flats.node'),
+    // A published package carries one prebuilt addon per platform.
+    path.join(__dirname, 'prebuilds', `${process.platform}-${process.arch}`, 'flats.node'),
     path.join(root, 'target', 'release', 'libflats_node.so'),
     path.join(root, 'target', 'debug', 'libflats_node.so'),
   ];
