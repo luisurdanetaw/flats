@@ -547,3 +547,67 @@ fn a_create_whose_files_cannot_be_made_fails_cleanly() {
     assert_eq!(ids(&db, "other"), vec![1]);
     db.close().unwrap();
 }
+
+/// A background checkpoint that fails used to be dropped in silence — and a
+/// checkpoint that keeps failing (a full disk) lets the log grow without
+/// bound. Now the first failure is reported as an Error, once (not every
+/// tick), and the recovery as a Warn; `Db::stats` counts both.
+#[test]
+fn a_failing_background_checkpoint_is_reported_once_and_its_recovery_too() {
+    use flats::diagnostics::{self, Level};
+    use std::sync::{Arc, Mutex as StdMutex};
+    let _g = serial();
+    let seen = Arc::new(StdMutex::new(Vec::<(Level, String)>::new()));
+    let sink = seen.clone();
+    diagnostics::set_log_hook(move |l, m| sink.lock().unwrap().push((l, m.to_string())));
+
+    let dir = tempfile::tempdir().unwrap();
+    let busy = flats::DbOptions {
+        checkpoint_interval: std::time::Duration::from_millis(5),
+        ..opts()
+    };
+    let db = Db::open(dir.path(), &[], busy).unwrap();
+    db.execute("CREATE COLLECTION t (id INT PRIMARY KEY, vector VECTOR(2), s TEXT) WITH (capacity = 1000);")
+        .unwrap();
+    // Every checkpoint fails for a while: re-arm the moment the point fires
+    // (well inside the 5 ms interval), so no checkpoint slips through.
+    insert(&db, 1).unwrap();
+    let start = std::time::Instant::now();
+    let base = failpoint::fired();
+    failpoint::arm("checkpoint.before_tuples", 0);
+    let mut armed_at = base;
+    while failpoint::fired() < base + 5 && start.elapsed() < std::time::Duration::from_secs(10) {
+        if failpoint::fired() > armed_at {
+            armed_at = failpoint::fired();
+            failpoint::arm("checkpoint.before_tuples", 0);
+        }
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+    failpoint::disarm();
+    assert!(
+        failpoint::fired() >= base + 5,
+        "the flusher ran into the fault repeatedly"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(60)); // checkpoints succeed again
+    let stats = db.stats();
+    db.close().unwrap();
+    diagnostics::reset_log_hook();
+
+    let seen = seen.lock().unwrap();
+    let errors = seen
+        .iter()
+        .filter(|(l, m)| *l == Level::Error && m.contains("checkpoint"))
+        .count();
+    let recovered = seen
+        .iter()
+        .filter(|(l, m)| *l == Level::Warn && m.contains("succeeding again"))
+        .count();
+    assert!(stats.checkpoint_failures >= 2, "{stats:?}");
+    assert!(errors >= 1, "the failure was reported: {seen:?}");
+    assert!(
+        errors < stats.checkpoint_failures as usize,
+        "reported on the transition, not every tick: {errors} reports for {} failures",
+        stats.checkpoint_failures
+    );
+    assert!(recovered >= 1, "the recovery was reported: {seen:?}");
+}

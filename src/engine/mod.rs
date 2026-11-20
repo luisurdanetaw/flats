@@ -386,6 +386,18 @@ fn open_collection_with(
         let watermark = flat_lsn.min(meta_loaded.lsn().0).min(tuple_loaded.lsn().0);
         (meta_w, meta_r, tuple_w, tuple_r, watermark)
     } else if fresh || evidence == 0 {
+        if !fresh {
+            for (file, loaded) in [(METADATA_FILE, &meta_loaded), (TUPLES_FILE, &tuple_loaded)] {
+                if lost(loaded) {
+                    crate::diagnostics::warn(&format!(
+                        "collection '{}' (id {}): {file} was {}; rebuilt from the write-ahead log",
+                        cfg.name,
+                        cfg.id,
+                        if matches!(loaded, Loaded::Missing) { "missing" } else { "damaged" }
+                    ));
+                }
+            }
+        }
         // Rebuildable: the log holds everything. Write the empty snapshot now
         // (as `create` always has) so the next open finds a file, and let the
         // 0 drag the floor down: the full-tail replay refills this store while
@@ -407,7 +419,7 @@ fn open_collection_with(
                 std::fs::rename(cdir.join(file), cdir.join(format!("{file}.damaged")))?;
             }
             if lost(loaded) {
-                eprintln!("flats: salvage: {}", lost_store(cfg, file, loaded, true));
+                crate::diagnostics::warn(&format!("salvage: {}", lost_store(cfg, file, loaded, true)));
             }
         }
         let (meta_w, meta_r) = MetadataIndex::create(&cdir, cfg.schema.clone())?;
@@ -423,10 +435,10 @@ fn open_collection_with(
     };
 
     let watermark = if lost_dir {
-        eprintln!(
-            "flats: salvage: collection '{}' (id {}): its directory was missing; recreated empty",
+        crate::diagnostics::warn(&format!(
+            "salvage: collection '{}' (id {}): its directory was missing; recreated empty",
             cfg.name, cfg.id
-        );
+        ));
         RECREATED
     } else {
         watermark
@@ -1083,7 +1095,9 @@ impl IndexApplier {
         // go now is a leftover the next open clears — not a reason to halt a
         // healthy database.
         if let Err(e) = remove_collection_files(&self.dir, id) {
-            eprintln!("flats: dropped collection {id}: files left for the next open to clear: {e}");
+            crate::diagnostics::warn(&format!(
+                "dropped collection {id}: files left for the next open to clear: {e}"
+            ));
         }
         Ok(())
     }
@@ -1164,11 +1178,11 @@ impl IndexApplier {
             // collision that can only come from mixing open()-registration
             // with an unreplayed WAL create. Surface it, but stay a no-op.
             if !self.registry.contains(config) {
-                eprintln!(
-                    "flats: CreateCollection (lsn {}, id {}, name {:?}) collides with an \
+                crate::diagnostics::warn(&format!(
+                    "CreateCollection (lsn {}, id {}, name {:?}) collides with an \
                      existing collection; skipped",
                     lsn.0, config.id, config.name
-                );
+                ));
             }
             return Ok(());
         }
@@ -1230,13 +1244,60 @@ fn ordinal32(ordinal: u64) -> io::Result<Ordinal> {
 // Background flusher
 // ---------------------------------------------------------------------------
 
+/// What [`Db::stats`] reports. Fields may be added; construct none yourself.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Stats {
+    /// Every collection, by id.
+    pub collections: Vec<CollectionStats>,
+    /// The write-ahead log's size in bytes (8, its header, when fully
+    /// checkpointed).
+    pub wal_bytes: u64,
+    /// Checkpoints completed since open, background and explicit.
+    pub checkpoints: u64,
+    /// Checkpoints that failed since open.
+    pub checkpoint_failures: u64,
+    /// Compactions that reclaimed space since open.
+    pub compactions: u64,
+    /// Compactions that failed since open.
+    pub compaction_failures: u64,
+    /// `Some(why)` if the database has halted and needs a reopen.
+    pub halted: Option<String>,
+}
+
+/// One collection in [`Stats`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct CollectionStats {
+    /// Its id.
+    pub id: u32,
+    /// Its name.
+    pub name: String,
+    /// Live rows now.
+    pub rows: u64,
+    /// Ordinals in use, live or dead: compaction brings this back down to
+    /// `rows`. When it reaches `capacity`, inserts are refused.
+    pub allocated: u64,
+    /// The most rows it can hold.
+    pub capacity: usize,
+}
+
+/// Counts of background and explicit maintenance, for `Db::stats`.
+#[derive(Default)]
+pub(crate) struct Counters {
+    pub(crate) checkpoints: AtomicU64,
+    pub(crate) checkpoint_failures: AtomicU64,
+    pub(crate) compactions: AtomicU64,
+    pub(crate) compaction_failures: AtomicU64,
+}
+
 struct Flusher {
     stop: Sender<()>,
     join: JoinHandle<()>,
 }
 
 impl Flusher {
-    fn spawn(wal: WalHandle, interval: Duration) -> io::Result<Flusher> {
+    fn spawn(wal: WalHandle, interval: Duration, counters: Arc<Counters>) -> io::Result<Flusher> {
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let join = std::thread::Builder::new()
             .name("flats-flusher".into())
@@ -1248,12 +1309,32 @@ impl Flusher {
                 // source of truth). The final checkpoint, if any, is driven by
                 // `Db::close`.
                 //
-                // A halted log refuses every checkpoint until reopen, so this
-                // then ticks along doing nothing. That is the intended
-                // behaviour and the reason the error is dropped rather than
-                // logged per tick — the write path already told the caller.
+                // A failing checkpoint is reported on the TRANSITION — the
+                // first failure after a success, and the recovery — not per
+                // tick: a halted log refuses every checkpoint until reopen,
+                // and a full disk would otherwise log every few seconds. It
+                // matters to report at all: checkpoints failing in silence
+                // let the WAL grow without bound.
+                let mut failing = false;
                 while let Err(RecvTimeoutError::Timeout) = stop_rx.recv_timeout(interval) {
-                    let _ = wal.checkpoint();
+                    match wal.checkpoint() {
+                        Ok(()) => {
+                            counters.checkpoints.fetch_add(1, Ordering::Relaxed);
+                            if failing {
+                                crate::diagnostics::warn("background checkpoints are succeeding again");
+                                failing = false;
+                            }
+                        }
+                        Err(e) => {
+                            counters.checkpoint_failures.fetch_add(1, Ordering::Relaxed);
+                            if !failing {
+                                crate::diagnostics::error(&format!(
+                                    "background checkpoint failed (the log keeps growing until one succeeds): {e}"
+                                ));
+                                failing = true;
+                            }
+                        }
+                    }
                 }
             })?;
         Ok(Flusher {
@@ -1825,7 +1906,8 @@ impl Db {
         // 5. Background checkpoints (the flusher just pokes the commit thread).
         //    A failed spawn must not leave the commit thread running detached
         //    (`Wal` has no Drop), so tear down what has started, like `Drop`.
-        let flusher = match Flusher::spawn(wal.handle(), opts.checkpoint_interval) {
+        let counters = Arc::new(Counters::default());
+        let flusher = match Flusher::spawn(wal.handle(), opts.checkpoint_interval, Arc::clone(&counters)) {
             Ok(flusher) => flusher,
             Err(e) => {
                 wal.shutdown();
@@ -1842,6 +1924,7 @@ impl Db {
             opts: opts.compaction,
             running: Mutex::new(()),
             stop: std::sync::atomic::AtomicBool::new(false),
+            counters: Arc::clone(&counters),
         });
         let compactor = if opts.compaction.enabled {
             match Compactor::spawn(
@@ -2865,10 +2948,42 @@ impl Db {
         // A halted log refuses this: checkpointing would stamp a durable
         // watermark over the record the index never absorbed and then truncate
         // that record away. See `Error::Poisoned`.
-        self.wal_handle()?
-            .checkpoint()
-            .map_err(|e| self.wal_err(e))?;
-        Ok(())
+        let outcome = self.wal_handle()?.checkpoint().map_err(|e| self.wal_err(e));
+        let counters = &self.compaction.counters;
+        match outcome {
+            Ok(()) => counters.checkpoints.fetch_add(1, Ordering::Relaxed),
+            Err(_) => counters.checkpoint_failures.fetch_add(1, Ordering::Relaxed),
+        };
+        outcome
+    }
+
+    /// A snapshot of what the database is doing: per collection, its live
+    /// rows, allocated ordinals (live + dead, until compaction reclaims them)
+    /// and capacity; the write-ahead log's size; how many checkpoints and
+    /// compactions have run or failed since open; and, if the database has
+    /// halted, why. Cheap: no I/O beyond one `stat` of the log.
+    pub fn stats(&self) -> Stats {
+        let mut collections = catalog_snapshot(&self.catalog)
+            .values()
+            .map(|c| CollectionStats {
+                id: c.config.id,
+                name: c.config.name.clone(),
+                rows: c.live.resolve().len(),
+                allocated: c.next_ordinal.load(Ordering::Acquire),
+                capacity: c.config.capacity,
+            })
+            .collect::<Vec<_>>();
+        collections.sort_by_key(|c| c.id);
+        let counters = &self.compaction.counters;
+        Stats {
+            collections,
+            wal_bytes: std::fs::metadata(Self::wal_path(&self.compaction.dir)).map_or(0, |m| m.len()),
+            checkpoints: counters.checkpoints.load(Ordering::Relaxed),
+            checkpoint_failures: counters.checkpoint_failures.load(Ordering::Relaxed),
+            compactions: counters.compactions.load(Ordering::Relaxed),
+            compaction_failures: counters.compaction_failures.load(Ordering::Relaxed),
+            halted: self.check_poison().err().map(|e| e.to_string()),
+        }
     }
 
     /// Graceful shutdown: stop the flusher, take one final checkpoint so reopen

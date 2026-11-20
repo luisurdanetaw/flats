@@ -392,12 +392,10 @@ impl MetadataIndex {
     pub fn open(dir: &Path, schema: Schema) -> Result<(Writer, Reader, Lsn)> {
         let (writer, reader, loaded) = Self::open_reporting(dir, schema)?;
         if let crate::metadata::Loaded::Corrupt(why) = &loaded {
-            // No logger yet — but losing this signal silently makes
-            // "my checkpoint never sticks" undebuggable.
-            eprintln!(
-                "flats: {} corrupt ({why}); starting empty, WAL replay rebuilds",
+            crate::diagnostics::warn(&format!(
+                "{} corrupt ({why}); starting empty, WAL replay rebuilds",
                 dir.join(SNAP_FILE).display()
-            );
+            ));
         }
         Ok((writer, reader, loaded.lsn()))
     }

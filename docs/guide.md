@@ -258,6 +258,21 @@ it as `<name>.damaged`, and the database is healthy again from then on, so go
 back to a normal open afterwards. Copy the directory first if what's left
 matters.
 
+**Monitoring.** `Db::stats()` (Rust) reports, per collection:
+- live rows;
+- allocated ordinals, live plus dead (compaction brings this back down);
+- capacity.
+
+Database-wide, it reports the WAL's size, checkpoints and compactions run or
+failed since open, and whether the database has halted.
+
+The engine reports a few things nothing else surfaces, for example a store
+rebuilt from the log, a salvage, or a background checkpoint or compaction
+failing. By default these go to stderr as `flats: …` lines. Route them to
+your logger with `flats::diagnostics::set_log_hook(|level, msg| …)`.
+Checkpoint failures are reported when they start and when they stop, not on
+every tick, so a full disk shows up without flooding the log.
+
 **Concurrency.** One database handle can be shared by many threads. Reads run
 in parallel and never block; writes are serialized. Each statement sees one
 consistent snapshot. There are no multi-statement transactions. Async apps

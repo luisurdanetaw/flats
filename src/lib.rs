@@ -112,6 +112,8 @@ macro_rules! pause_point {
 #[doc(hidden)]
 pub mod failpoint;
 
+pub mod diagnostics;
+
 macro_rules! internal_modules {
     ($($name:ident),* $(,)?) => {$(
         #[cfg(feature = "internals")]
@@ -133,8 +135,8 @@ internal_modules!(
 // The database and its options.
 pub use crate::engine::cursor::Cursor;
 pub use crate::engine::{
-    CollectionConfig, CollectionId, CompactionOptions, Db, DbOptions, Limits, MAX_COLLECTION_BYTES,
-    MAX_DIM, MAX_INSTALL_BYTES,
+    CollectionConfig, CollectionId, CollectionStats, CompactionOptions, Db, DbOptions, Limits,
+    MAX_COLLECTION_BYTES, MAX_DIM, MAX_INSTALL_BYTES, Stats,
 };
 // The caps on a `WHERE` predicate's shape.
 pub use crate::error::{Error, Result};

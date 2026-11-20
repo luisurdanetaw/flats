@@ -629,12 +629,28 @@ pub(super) struct Shared {
     pub(super) running: Mutex<()>,
     /// Set on close: a build in progress gives up.
     pub(super) stop: AtomicBool,
+    /// What `Db::stats` reports.
+    pub(super) counters: Arc<super::Counters>,
 }
 
 impl Shared {
     /// Rebuild `id` if it has anything to reclaim. `Ok(false)` when every
     /// allocated ordinal is live, so there is nothing to do.
     pub(super) fn compact(&self, wal: &WalHandle, id: u32) -> Result<bool> {
+        let outcome = self.compact_inner(wal, id);
+        match &outcome {
+            Ok(true) => {
+                self.counters.compactions.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(false) => {}
+            Err(_) => {
+                self.counters.compaction_failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        outcome
+    }
+
+    fn compact_inner(&self, wal: &WalHandle, id: u32) -> Result<bool> {
         let _one = self.running.lock().unwrap_or_else(|e| e.into_inner());
         let coll = catalog_snapshot(&self.catalog)
             .get(&id)
@@ -684,8 +700,12 @@ impl Shared {
         drop(coll);
         if fire {
             // Best-effort, like a checkpoint: a failed compaction changed
-            // nothing and the next trigger tries again.
-            let _ = self.compact(wal, id);
+            // nothing and the next trigger tries again. But say so — a
+            // compaction that keeps failing (a full disk) leaves the dead rows
+            // in place until the collection fills.
+            if let Err(e) = self.compact(wal, id) {
+                crate::diagnostics::error(&format!("background compaction of collection {id} failed: {e}"));
+            }
         }
     }
 }
