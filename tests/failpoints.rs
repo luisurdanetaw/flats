@@ -448,8 +448,11 @@ fn a_crash_while_creating_a_collection_leaves_the_database_openable() {
     }
     failpoint::disarm();
     let db = Db::open(dir.path(), &[], opts()).expect("the database opens");
-    // The CREATE was committed before it failed to materialize, so replay
-    // finishes it: the collection exists, empty, and works.
+    // The files are made before the CREATE is logged, so it failed cleanly:
+    // the collection doesn't exist, and creating it again works.
+    assert!(db.collections().is_empty());
+    db.execute("CREATE COLLECTION t (id INT PRIMARY KEY, vector VECTOR(2), s TEXT) WITH (capacity = 1000);")
+        .unwrap();
     insert(&db, 1).expect("the collection works");
     assert_eq!(ids(&db, "t"), vec![1]);
     db.close().unwrap();
@@ -505,4 +508,42 @@ fn a_crash_between_creating_a_collection_and_registering_it_is_harmless() {
         }
         db.close().unwrap();
     }
+}
+
+/// A CREATE COLLECTION whose files can't be made (a full disk, say) used to
+/// poison the whole database: the record was committed first and the files
+/// made after, so an apply failure meant a committed record the commit thread
+/// couldn't absorb — every later write refused until a reopen, which then
+/// retried the same failing create. Now the files are made BEFORE the record
+/// is logged: the CREATE fails cleanly, nothing is logged, nothing halts.
+#[test]
+fn a_create_whose_files_cannot_be_made_fails_cleanly() {
+    let _g = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh(dir.path());
+    insert(&db, 1).unwrap();
+    failpoint::arm("index.create.before_header", 0);
+    let err = db
+        .execute(
+            "CREATE COLLECTION other (id INT PRIMARY KEY, vector VECTOR(2)) WITH (capacity = 10);",
+        )
+        .err()
+        .expect("the create fails");
+    assert!(!err.to_string().contains("halted"), "not a halt: {err}");
+    failpoint::disarm();
+    // The database carries on: writes work, the failed collection doesn't exist…
+    insert(&db, 2).expect("writes still work");
+    assert_eq!(db.collections().len(), 1);
+    // …and the same CREATE succeeds when retried.
+    db.execute(
+        "CREATE COLLECTION other (id INT PRIMARY KEY, vector VECTOR(2)) WITH (capacity = 10);",
+    )
+    .expect("the retry succeeds");
+    db.execute("INSERT INTO other (id, vector) VALUES (1, [1, 0]);")
+        .unwrap();
+    drop(db);
+    let db = Db::open(dir.path(), &[], opts()).unwrap();
+    assert_eq!(ids(&db, "t"), vec![1, 2]);
+    assert_eq!(ids(&db, "other"), vec![1]);
+    db.close().unwrap();
 }

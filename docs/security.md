@@ -29,8 +29,11 @@ attack surface is the input the embedding application hands it.
   (that is how a torn header write is survived). Combined with a damaged
   snapshot in the same collection, that older watermark could wrongly pass
   the "the log still has everything" test.
-- A CREATE whose files fail to materialize for reasons other than the caps
-  (for example, a full disk) still poisons the log.
+- A full disk while a CREATE or DROP writes `catalog.snap` (after the record
+  is committed) still halts the database until reopen. Making a new
+  collection's files, the step that needs real space, now happens before the
+  CREATE is logged and fails cleanly. A failed checkpoint never halts: it is
+  retried.
 - A column named `score` can be filtered on and SELECTed, but a SEARCH's
   `RETURNING score` always means the similarity, so a SEARCH can't return
   that column (SELECT it instead).

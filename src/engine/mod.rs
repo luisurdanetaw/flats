@@ -1469,6 +1469,20 @@ fn persist_catalog(
     )
 }
 
+/// Make the files of a collection about to be registered, from scratch.
+///
+/// Anything already at its id is a leftover of a create that never got
+/// registered (a crash, or a failed append) — possibly with a DIFFERENT
+/// schema, so it is removed rather than reused. Callers guarantee the id is
+/// not registered: CREATE holds the create lock and picks an unused id;
+/// open()-registration only materializes ids the catalog doesn't list.
+fn materialize_fresh(dir: &Path, cfg: &CollectionConfig) -> Result<()> {
+    remove_collection_files(dir, cfg.id)?;
+    drop(open_collection(dir, cfg, false, false)?);
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
 /// Delete everything of collection `id` from `dir`: its canonical directory
 /// and any compaction staging or retired copy. Missing ones are fine.
 fn remove_collection_files(dir: &Path, id: u32) -> io::Result<()> {
@@ -1527,6 +1541,10 @@ pub struct Db {
     compactor: Option<Compactor>,
     /// One past the highest collection id ever issued; shared with the
     /// applier, which advances it as creates land. Ids are never reused.
+    /// Serializes CREATE COLLECTION's "make the files, then log" so two
+    /// concurrent creates can't pick the same id and make files in one
+    /// directory.
+    create_lock: Mutex<()>,
     next_id: Arc<AtomicU32>,
     /// See [`Limits`]; read at the start of every statement.
     limits: RwLock<Limits>,
@@ -1684,7 +1702,7 @@ impl Db {
         // directory, which the next open passes over or reuses.
         for cfg in collections {
             if !previously.contains(&cfg.id) {
-                drop(open_collection(dir, cfg, false, false)?);
+                materialize_fresh(dir, cfg)?;
             }
         }
         if dirty {
@@ -1851,6 +1869,7 @@ impl Db {
             epoch,
             compaction,
             compactor,
+            create_lock: Mutex::new(()),
             next_id,
             limits: RwLock::new(Limits::default()),
             interrupts: Arc::new(AtomicU64::new(0)),
@@ -2533,6 +2552,7 @@ impl Db {
         if snapshot.values().any(|c| c.config.name == name) {
             return Err(Error::CollectionExists { name: name.into() });
         }
+        let _creating = self.create_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Assign the id on the logging side (like ordinals). Never reused: a
         // dropped collection's id stays retired, because the log may still
         // hold its records and they must never apply to a newcomer.
@@ -2548,6 +2568,13 @@ impl Db {
             schema,
         };
         self.check_poison()?;
+        // FILES FIRST. Make the collection's files now, on the caller's side:
+        // this is the step that needs disk space (a full disk is the likely
+        // failure), and failing HERE is a plain error — nothing is logged and
+        // nothing halts. Failing during apply, after the record committed,
+        // poisoned the whole database. If the append below fails, the files
+        // are an unregistered leftover the next CREATE of this id reuses.
+        materialize_fresh(&self.compaction.dir, &config)?;
         self.wal_handle()?
             .append(Record::CreateCollection { config })
             .map_err(|e| self.wal_err(e))?;
