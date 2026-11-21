@@ -248,7 +248,8 @@ damaged or missing (disk corruption, a bad copy), Flats rebuilds it from the
 log when the log provably still holds all of it. Otherwise opening fails
 with an error naming the collection and the file ("corrupt snapshot:
 collection 'docs' (id 0): tuples.snap is damaged ...") and changes nothing on
-disk. Restore your latest backup. If there is none, open it once in salvage
+disk. The same goes for a collection whose whole directory is gone. Restore
+your latest backup. If there is none, open it once in salvage
 mode: `flats.Database(path, salvage=True)` in Python, `new
 flats.Database(path, { salvage: true })` in Node.js, `flats_open_salvage` in
 C, `Db::open_salvage` in Rust. Each damaged collection comes back with only

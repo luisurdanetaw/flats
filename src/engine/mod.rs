@@ -268,12 +268,18 @@ fn open_collection(
     dir: &Path,
     cfg: &CollectionConfig,
     salvage: bool,
+    must_exist: bool,
 ) -> Result<(CollectionWriters, Collection, u64)> {
     // An interrupted compaction can leave the directory mid-swap; resolve that
     // first. A no-op otherwise.
     compact::settle(dir, cfg.id)?;
-    open_collection_with(&collection_dir(dir, cfg.id), cfg, salvage)
+    open_collection_with(&collection_dir(dir, cfg.id), cfg, salvage, must_exist)
 }
+
+/// The watermark `open_collection` reports for a collection salvage had to
+/// recreate from nothing: "skip every record the log already holds for it".
+/// `Db::open` swaps it for the log's real last LSN.
+const RECREATED: u64 = u64::MAX;
 
 /// `open_collection` against an explicit directory — the canonical one, or a
 /// compaction's staging copy. Never salvages: both of its other callers open
@@ -282,7 +288,7 @@ fn open_collection_in(
     cdir: &Path,
     cfg: &CollectionConfig,
 ) -> Result<(CollectionWriters, Collection, u64)> {
-    open_collection_with(cdir, cfg, false)
+    open_collection_with(cdir, cfg, false, false)
 }
 
 /// The store file names, for `open_collection_with`'s refusals.
@@ -320,14 +326,29 @@ const TUPLES_FILE: &str = "tuples.snap";
 ///   vectors there's nothing to salvage onto.
 ///
 /// All three files missing is a collection being materialized for the first
-/// time (open()-registration persists the catalog before the stores exist),
-/// and opens empty as it always has.
+/// time — unless `must_exist`: `Db::open` passes it for every collection the
+/// catalog lists, because a collection's files are created BEFORE it is
+/// registered (both by CREATE COLLECTION and by open()-registration). For one
+/// of those, no files at all means the directory was lost, which is refused
+/// like any other lost store; salvage recreates it empty and has it skip
+/// every record the log already holds for it ([`RECREATED`]), since replaying
+/// a lost generation's records into fresh files could place them on the wrong
+/// rows.
 fn open_collection_with(
     cdir: &Path,
     cfg: &CollectionConfig,
     salvage: bool,
+    must_exist: bool,
 ) -> Result<(CollectionWriters, Collection, u64)> {
     use crate::metadata::Loaded;
+
+    let lost_dir = must_exist && !cdir.join(VECTORS_FILE).exists()
+        && !cdir.join(METADATA_FILE).exists()
+        && !cdir.join(TUPLES_FILE).exists();
+    if lost_dir && !salvage {
+        let file = format!("{}/", cdir.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()));
+        return Err(lost_store(cfg, &file, &Loaded::Missing, false));
+    }
 
     let cdir = cdir.to_path_buf();
     std::fs::create_dir_all(&cdir)?;
@@ -399,6 +420,16 @@ fn open_collection_with(
             (TUPLES_FILE, &tuple_loaded)
         };
         return Err(lost_store(cfg, file, loaded, false));
+    };
+
+    let watermark = if lost_dir {
+        eprintln!(
+            "flats: salvage: collection '{}' (id {}): its directory was missing; recreated empty",
+            cfg.name, cfg.id
+        );
+        RECREATED
+    } else {
+        watermark
     };
 
     // ONE handle, shared by both sides. The applier could reach the read-side
@@ -1143,7 +1174,7 @@ impl IndexApplier {
         }
 
         let materialized = (|| -> Result<(CollectionWriters, Collection)> {
-            let (writers, collection, watermark) = open_collection(&self.dir, config, false)?;
+            let (writers, collection, watermark) = open_collection(&self.dir, config, false, false)?;
             self.floors.insert(config.id, watermark);
             // The new collection-{id}/ entry itself must survive a crash: the
             // stores fsync'd their own files, but the parent dir entry is
@@ -1269,7 +1300,15 @@ const CATALOG_MAGIC: &[u8; 4] = b"CAT0";
 /// remember the highest it ever issued even after that collection is gone).
 /// Version 3 files still read: nothing was ever dropped under them, so their
 /// `next_id` is one past the highest registered id.
-const CATALOG_VERSION: u32 = 4;
+///
+/// 5 = the same bytes as 4, plus a PROMISE: every collection it lists had its
+/// files created before it was listed. That is what lets `Db::open` treat a
+/// listed collection with no files as LOST rather than new. Builds that wrote
+/// v3/v4 catalogs registered first and created files after, so for those a
+/// missing directory may be a crash's leftover and is still created fresh;
+/// the next catalog write upgrades the file to 5.
+const CATALOG_VERSION: u32 = 5;
+const CATALOG_V4: u32 = 4;
 const CATALOG_V3: u32 = 3;
 const CATALOG_FILE: &str = "catalog.snap";
 const CATALOG_TMP: &str = "catalog.snap.tmp";
@@ -1298,6 +1337,9 @@ struct LoadedCatalog {
     registry: Vec<CollectionConfig>,
     last_lsn: u64,
     next_id: u32,
+    /// Written under the files-before-registration rule (v5, or no catalog
+    /// yet): a listed collection with no files is lost, not new.
+    files_first: bool,
 }
 
 /// One past the highest id in `registry`: the `next_id` of a catalog that
@@ -1337,14 +1379,14 @@ fn decode_catalog(bytes: &[u8]) -> Result<LoadedCatalog> {
         return Err(corrupt("bad magic"));
     }
     let version = u32_at(4)?;
-    if version != CATALOG_VERSION && version != CATALOG_V3 {
+    if version != CATALOG_VERSION && version != CATALOG_V4 && version != CATALOG_V3 {
         return Err(Error::CorruptSnapshot(format!(
             "catalog: unsupported version {version}"
         )));
     }
     let last_lsn = u64::from_le_bytes(head[8..16].try_into().map_err(|_| corrupt("truncated"))?);
-    // v4 carries next_id between the stamp and the body length.
-    let (stored_next_id, body_at) = if version == CATALOG_VERSION {
+    // v4 and v5 carry next_id between the stamp and the body length.
+    let (stored_next_id, body_at) = if version >= CATALOG_V4 {
         (Some(u32_at(16)?), 20)
     } else {
         (None, 16)
@@ -1365,6 +1407,7 @@ fn decode_catalog(bytes: &[u8]) -> Result<LoadedCatalog> {
         .unwrap_or(0)
         .max(next_id_after(&registry));
     Ok(LoadedCatalog {
+        files_first: version >= CATALOG_VERSION,
         registry,
         last_lsn,
         next_id,
@@ -1380,13 +1423,12 @@ fn load_catalog(dir: &Path) -> Result<LoadedCatalog> {
             registry: Vec::new(),
             last_lsn: 0,
             next_id: 0,
+            files_first: true,
         }),
         Err(e) => Err(e.into()),
     }
 }
 
-/// Persist the registry with the shared tmp → fsync → rename → dir-fsync
-/// dance (a leftover garbage .tmp from a crash is overwritten, never read).
 /// `create_dir_all`, then fsync the parent of every directory it created,
 /// deepest first. A new directory entry is durable only once its parent is
 /// synced: without this, a power cut after the first acknowledged write could
@@ -1410,6 +1452,8 @@ fn create_dir_durably(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Persist the registry with the shared tmp → fsync → rename → dir-fsync
+/// dance (a leftover garbage .tmp from a crash is overwritten, never read).
 fn persist_catalog(
     dir: &Path,
     registry: &[CollectionConfig],
@@ -1606,8 +1650,10 @@ impl Db {
             mut registry,
             last_lsn: cat_lsn,
             mut next_id,
+            files_first,
         } = load_catalog(dir)?;
         let mut dirty = !dir.join(CATALOG_FILE).exists();
+        let previously: std::collections::HashSet<u32> = registry.iter().map(|c| c.id).collect();
         for cfg in collections {
             match registry.iter().find(|c| c.id == cfg.id) {
                 Some(existing) if existing == cfg => {}
@@ -1631,7 +1677,18 @@ impl Db {
             }
         }
         registry.sort_by_key(|c| c.id);
+        // Create the files of every collection registered by THIS open before
+        // the catalog names it: once a collection is listed, its files exist,
+        // so a listed collection with no files is a lost one (see
+        // `open_collection_with`). A crash in between leaves an unregistered
+        // directory, which the next open passes over or reuses.
+        for cfg in collections {
+            if !previously.contains(&cfg.id) {
+                drop(open_collection(dir, cfg, false, false)?);
+            }
+        }
         if dirty {
+            std::fs::File::open(dir)?.sync_all()?;
             persist_catalog(dir, &registry, cat_lsn, next_id)?;
         }
 
@@ -1671,9 +1728,21 @@ impl Db {
         let mut floors: HashMap<u32, u64> = HashMap::with_capacity(registry.len());
         for cfg in &registry {
             let (collection_writers, collection, watermark) =
-                open_collection(dir, cfg, salvage)?;
-            min_watermark = min_watermark.min(watermark);
-            floors.insert(cfg.id, watermark);
+                open_collection(dir, cfg, salvage, files_first)?;
+            let watermark = if watermark == RECREATED {
+                // Salvage recreated it from nothing: none of the records the
+                // log already holds for it belongs in the new files. Its floor
+                // is the end of the log; it stays out of the global minimum.
+                let end = crate::wal::wal::last_lsn(&Self::wal_path(dir))?;
+                floors.insert(cfg.id, end);
+                None
+            } else {
+                Some(watermark)
+            };
+            if let Some(watermark) = watermark {
+                min_watermark = min_watermark.min(watermark);
+                floors.insert(cfg.id, watermark);
+            }
             map.insert(cfg.id, Arc::new(collection));
             writers.insert(cfg.id, collection_writers);
         }
@@ -4748,7 +4817,7 @@ mod tests {
         assert_eq!(decode_catalog(&bytes).unwrap().next_id, 51);
         // An unknown future version is refused, not guessed at.
         let mut future = encode_catalog(&[], 0, 0).unwrap();
-        future[4..8].copy_from_slice(&5u32.to_le_bytes());
+        future[4..8].copy_from_slice(&6u32.to_le_bytes());
         let n = future.len();
         let crc = crc32(&future[..n - 4]);
         future[n - 4..].copy_from_slice(&crc.to_le_bytes());

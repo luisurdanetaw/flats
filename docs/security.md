@@ -25,8 +25,6 @@ attack surface is the input the embedding application hands it.
 - Power loss: the order of every fsync and rename is checked from a syscall
   trace (`tests/sync_order.rs`), but recovery from a simulated power cut is
   not tested yet (`docs/deterministic-simulation.md`).
-- A collection whose whole directory was deleted opens empty: with no files
-  left, it looks like one being created for the first time.
 - A damaged active header slot in `vectors.idx` falls back to the older slot
   (that is how a torn header write is survived). Combined with a damaged
   snapshot in the same collection, that older watermark could wrongly pass

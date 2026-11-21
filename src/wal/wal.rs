@@ -1215,6 +1215,46 @@ fn recover<A: Apply>(path: &Path, applier: &mut A, skip_through: u64) -> io::Res
     Ok(next_lsn)
 }
 
+/// The highest LSN of any valid frame in the log at `path` (0 if there is
+/// none, or no log): where everything already logged ends. Stops at the first
+/// torn or corrupt frame, exactly as recovery does, and applies nothing.
+pub(crate) fn last_lsn(path: &Path) -> io::Result<u64> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut reader = BufReader::new(file);
+    let mut file_header = [0u8; WAL_HEADER_BYTES];
+    if !matches!(read_exact_or_eof(&mut reader, &mut file_header)?, ReadOutcome::Full) {
+        return Ok(0);
+    }
+    let mut last = 0;
+    loop {
+        let mut header = [0u8; HEADER_BYTES];
+        if !matches!(read_exact_or_eof(&mut reader, &mut header)?, ReadOutcome::Full) {
+            return Ok(last);
+        }
+        let len = le_u32(&header, 0) as usize;
+        let crc = le_u32(&header, 4);
+        let lsn = le_u64(&header, 8);
+        if len > MAX_FRAME_BYTES {
+            return Ok(last);
+        }
+        let mut payload = vec![0u8; len];
+        if !matches!(read_exact_or_eof(&mut reader, &mut payload)?, ReadOutcome::Full) {
+            return Ok(last);
+        }
+        let mut crc_input = Vec::with_capacity(LSN_BYTES + len);
+        crc_input.extend_from_slice(&lsn.to_le_bytes());
+        crc_input.extend_from_slice(&payload);
+        if crc32(&crc_input) != crc {
+            return Ok(last);
+        }
+        last = last.max(lsn);
+    }
+}
+
 enum ReadOutcome {
     Full,
     Torn, // some bytes but not all — partial frame at the tail

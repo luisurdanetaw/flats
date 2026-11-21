@@ -454,3 +454,55 @@ fn a_crash_while_creating_a_collection_leaves_the_database_openable() {
     assert_eq!(ids(&db, "t"), vec![1]);
     db.close().unwrap();
 }
+
+/// A collection's files are created BEFORE the catalog names it (so a listed
+/// collection with no files can be recognized as lost). A crash between the
+/// two must leave a database that opens: the orphaned files are passed over,
+/// or reused when the collection is registered again.
+#[test]
+fn a_crash_between_creating_a_collection_and_registering_it_is_harmless() {
+    use flats::{CollectionConfig, ColumnSpec, ColumnType, Schema};
+    let _g = serial();
+    let schema = Schema::from_columns(vec![
+        ColumnSpec::Key {
+            name: "id".into(),
+            ty: ColumnType::Int,
+        },
+        ColumnSpec::Vector {
+            name: "vector".into(),
+            dim: std::num::NonZeroUsize::new(2).unwrap(),
+        },
+    ])
+    .unwrap();
+    let cfg = CollectionConfig {
+        id: 0,
+        name: "pre".into(),
+        capacity: 10,
+        schema,
+    };
+    for reregister in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        failpoint::arm("catalog.before_write", 0);
+        assert!(
+            Db::open(dir.path(), std::slice::from_ref(&cfg), opts()).is_err(),
+            "the failpoint fired"
+        );
+        failpoint::disarm();
+        assert!(
+            dir.path().join("collection-0").exists(),
+            "the files came first"
+        );
+        let with: &[CollectionConfig] = if reregister {
+            std::slice::from_ref(&cfg)
+        } else {
+            &[]
+        };
+        let db = Db::open(dir.path(), with, opts()).expect("the database opens");
+        assert_eq!(db.collections().len(), usize::from(reregister));
+        if reregister {
+            db.execute("INSERT INTO pre (id, vector) VALUES (1, [1, 0]);")
+                .unwrap();
+        }
+        db.close().unwrap();
+    }
+}
